@@ -66,6 +66,14 @@ set(KM_AIDL ${SEC}/keymint/aidl)
 set(SC_AIDL ${SEC}/secureclock/aidl)
 set(SS_AIDL ${SEC}/sharedsecret/aidl)
 set(AIDL_GEN ${CMAKE_BINARY_DIR}/aidl-gen)
+set(KM_AIDL_ARG ${KM_AIDL})
+set(SC_AIDL_ARG ${SC_AIDL})
+set(SS_AIDL_ARG ${SS_AIDL})
+if(CMAKE_HOST_WIN32)
+  file(TO_NATIVE_PATH "${KM_AIDL}" KM_AIDL_ARG)
+  file(TO_NATIVE_PATH "${SC_AIDL}" SC_AIDL_ARG)
+  file(TO_NATIVE_PATH "${SS_AIDL}" SS_AIDL_ARG)
+endif()
 
 if(NOT EXISTS ${AIDL_GEN}/.done)
   file(MAKE_DIRECTORY ${AIDL_GEN}/src ${AIDL_GEN}/include)
@@ -83,7 +91,7 @@ if(NOT EXISTS ${AIDL_GEN}/.done)
     endif()
     execute_process(
       COMMAND ${AIDL_BIN} --lang=ndk --structured --stability=vintf --min_sdk_version=29
-              -I ${KM_AIDL} -I ${SC_AIDL} -I ${SS_AIDL}
+              -I ${KM_AIDL_ARG} -I ${SC_AIDL_ARG} -I ${SS_AIDL_ARG}
               -o ${AIDL_GEN}/src -h ${AIDL_GEN}/include ${_aidl_inputs}
       RESULT_VARIABLE _rc)
     if(NOT _rc EQUAL 0)
