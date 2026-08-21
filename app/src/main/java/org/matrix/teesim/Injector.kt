@@ -20,19 +20,29 @@ class Injector(private val moduleDir: File) {
 
     private val injectBin = File(moduleDir, "$abi/inject")
     private val libFile = File(moduleDir, "$abi/$libName")
+    private val suBin = File("/system/bin/su")
+    private val exactInjectMarker = File(moduleDir, ".apatch_exact_inject_v1")
+    private val exactInject = exactInjectMarker.isFile
 
     @Volatile private var running = false
     @Volatile private var lastPid = -1
 
     fun start() {
         if (running) return
-        running = true
         if (!injectBin.exists() || !libFile.exists()) {
             SystemLogger.error(
                 "injector: missing artifacts (inject=${injectBin.exists()} lib=${libFile.exists()}) " +
                     "under ${moduleDir.absolutePath}/$abi"
             )
         }
+        if (exactInject && !apatchInjectCapable()) {
+            SystemLogger.error(
+                "injector: ${exactInjectMarker.name} is present but APatch exact injection is " +
+                    "unavailable; refusing legacy injection without sepolicy.rule"
+            )
+            return
+        }
+        running = true
         injectBin.setExecutable(true, false)
         Thread({ loop() }, "teesim-injector").apply {
             isDaemon = true
@@ -41,7 +51,10 @@ class Injector(private val moduleDir: File) {
     }
 
     private fun loop() {
-        SystemLogger.info("injector: watching $procName (abi=$abi lib=$libName)")
+        SystemLogger.info(
+            "injector: watching $procName (abi=$abi lib=$libName mode=" +
+                if (exactInject) "apatch-exact)" else "legacy)"
+        )
         var failures = 0
         while (running) {
             val pid = findPid(procName)
@@ -100,13 +113,39 @@ class Injector(private val moduleDir: File) {
 
     private fun inject(pid: Int): Boolean {
         return try {
-            val proc =
-                ProcessBuilder(
+            if (exactInject && !apatchInjectCapable()) {
+                SystemLogger.error(
+                    "injector: APatch exact injection capability disappeared at runtime; " +
+                        "refusing legacy fallback"
+                )
+                return false
+            }
+            val command =
+                if (exactInject) {
+                    listOf(
+                        suBin.absolutePath,
+                        "--no-pty",
+                        "-p",
+                        "--inject-target",
+                        pid.toString(),
+                        "--inject-library",
+                        libFile.absolutePath,
+                        "--",
                         injectBin.absolutePath,
                         pid.toString(),
                         libFile.absolutePath,
                         "entry",
                     )
+                } else {
+                    listOf(
+                        injectBin.absolutePath,
+                        pid.toString(),
+                        libFile.absolutePath,
+                        "entry",
+                    )
+                }
+            val proc =
+                ProcessBuilder(command)
                     .redirectErrorStream(true)
                     .start()
             val output = proc.inputStream.bufferedReader().readText()
@@ -115,6 +154,20 @@ class Injector(private val moduleDir: File) {
             code == 0
         } catch (e: Exception) {
             SystemLogger.error("injector: failed to run inject binary", e)
+            false
+        }
+    }
+
+    private fun apatchInjectCapable(): Boolean {
+        if (!suBin.canExecute()) return false
+        return try {
+            val proc =
+                ProcessBuilder(suBin.absolutePath, "--no-pty", "--inject-capable")
+                    .redirectErrorStream(true)
+                    .start()
+            proc.inputStream.bufferedReader().readText()
+            proc.waitFor() == 0
+        } catch (e: Exception) {
             false
         }
     }

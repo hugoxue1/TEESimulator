@@ -15,6 +15,8 @@
 #include <unistd.h>
 
 #include <climits>
+#include <cstddef>
+#include <cstdint>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -225,7 +227,8 @@ private:
  * @return An optional integer containing the transferred file descriptor in the
  *  remote process, or std::nullopt if the transfer fails.
  */
-static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, struct user_regs_struct &regs,
+static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, int inherited_lib_fd,
+                                                struct user_regs_struct &regs,
                                                 const std::vector<lsplt::MapInfo> &local_map,
                                                 const std::vector<lsplt::MapInfo> &remote_map,
                                                 uintptr_t libc_return_addr) {
@@ -238,11 +241,17 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
         return std::nullopt;
     }
 
-    // Open the local library file to get a file descriptor.
-    UniqueFd local_lib_fd = open(lib_path, O_RDONLY | O_CLOEXEC);
-    if (local_lib_fd == -1) {
-        PLOGE("Failed to open library file: %s", lib_path);
-        return std::nullopt;
+    // APatch exact injection supplies an already validated descriptor across
+    // exec.  Legacy managers still open the path here.
+    UniqueFd owned_lib_fd;
+    int local_lib_fd = inherited_lib_fd;
+    if (local_lib_fd < 0) {
+        owned_lib_fd = open(lib_path, O_RDONLY | O_CLOEXEC);
+        if (owned_lib_fd == -1) {
+            PLOGE("Failed to open library file: %s", lib_path);
+            return std::nullopt;
+        }
+        local_lib_fd = owned_lib_fd;
     }
 
     // Struct to hold addresses of remote libc functions needed for socket operations.
@@ -391,7 +400,7 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
         close_remote(remote_fd);
         return std::nullopt;
     }
-    LOGD("Local FD %d sent to remote process.", local_lib_fd.operator const int &());
+    LOGD("Local FD %d sent to remote process.", local_lib_fd);
 
     // Complete the remote recvmsg call. This will retrieve the return value.
     auto recvmsg_result =
@@ -422,7 +431,7 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
     }
 
     int transferred_fd = *reinterpret_cast<int *>(CMSG_DATA(cmsg));
-    LOGI("Successfully transferred FD %d to remote process, new remote FD: %d", local_lib_fd.operator const int &(),
+    LOGI("Successfully transferred FD %d to remote process, new remote FD: %d", local_lib_fd,
          transferred_fd);
 
     // Close the remote socket.
@@ -500,14 +509,19 @@ static std::string get_remote_dlerror(int pid, struct user_regs_struct &regs,
  * @return An optional uintptr_t containing the handle to the loaded library, or std::nullopt if loading fails.
  */
 static std::optional<uintptr_t> remote_dlopen(int pid, struct user_regs_struct &regs,
-                                              const std::vector<lsplt::MapInfo> &local_map,
-                                              const std::vector<lsplt::MapInfo> &remote_map, int lib_fd,
-                                              const char *lib_path, uintptr_t libc_return_addr) {
+                                               const std::vector<lsplt::MapInfo> &local_map,
+                                               const std::vector<lsplt::MapInfo> &remote_map, int lib_fd,
+                                               const char *lib_path, uintptr_t libc_return_addr,
+                                               bool allow_path_fallback) {
     LOGD("Attempting remote dlopen for library: %s with FD: %d", lib_path, lib_fd);
 
     auto dlopen_addr = find_func_addr(local_map, remote_map, constants::kLibdlModule, "android_dlopen_ext");
     if (!dlopen_addr) {
         LOGE("Failed to find 'android_dlopen_ext' in remote '%s'.", constants::kLibdlModule);
+        if (!allow_path_fallback) {
+            LOGE("APatch exact injection requires the inherited-FD loader; path fallback is forbidden.");
+            return std::nullopt;
+        }
         // Fallback to 'dlopen' if 'android_dlopen_ext' is not found.
         // This is a common pattern for broader compatibility.
         dlopen_addr = find_func_addr(local_map, remote_map, constants::kLibdlModule, "dlopen");
@@ -526,9 +540,13 @@ static std::optional<uintptr_t> remote_dlopen(int pid, struct user_regs_struct &
     dlext_info.flags = ANDROID_DLEXT_USE_LIBRARY_FD;
     dlext_info.library_fd = lib_fd;
 
-    // Push the dlext_info structure and library path string to the remote stack.
+    // The exact APatch path's argv library path is display-only.  Give bionic a
+    // stable logical name while ANDROID_DLEXT_USE_LIBRARY_FD supplies all bytes.
+    const char *load_name = allow_path_fallback ? lib_path : "libteesim-apatch-inherited.so";
+
+    // Push the dlext_info structure and logical library name to the remote stack.
     uintptr_t remote_info = push_memory(pid, regs, &dlext_info, sizeof(dlext_info));
-    uintptr_t remote_path = push_string(pid, regs, lib_path);
+    uintptr_t remote_path = push_string(pid, regs, load_name);
 
     if (remote_info == 0 || remote_path == 0) {
         LOGE("Failed to push dlopen arguments to remote memory.");
@@ -836,7 +854,7 @@ private:
  *  (Currently hardcoded to 'entry' internally but kept as param for future flexibility)
  * @return True if injection was successful, false otherwise.
  */
-bool inject_library(int pid, const char *lib_path, const char *entry_name) {
+bool inject_library(int pid, const char *lib_path, const char *entry_name, int inherited_lib_fd) {
     LOGI("Starting injection of library '%s' (entry: '%s') into process %d.", lib_path, entry_name, pid);
 
     // 1. Ptrace attachment using RAII.
@@ -899,7 +917,7 @@ bool inject_library(int pid, const char *lib_path, const char *entry_name) {
 
         // 6. Attempt to transfer the library's file descriptor to the remote process.
         int remote_fd = -1;
-        auto lib_fd_opt = transfer_fd_to_remote(pid, lib_path, current_regs, local_map, remote_map,
+        auto lib_fd_opt = transfer_fd_to_remote(pid, lib_path, inherited_lib_fd, current_regs, local_map, remote_map,
                                                 reinterpret_cast<uintptr_t>(libc_return_addr));
         std::optional<RemoteLibraryHandle> remote_lib_guard;
         std::optional<uintptr_t> handle_opt;
@@ -911,15 +929,18 @@ bool inject_library(int pid, const char *lib_path, const char *entry_name) {
 
             LOGD("FD Transfer successful (FD: %d). Attempting android_dlopen_ext...", remote_fd);
             handle_opt = remote_dlopen(pid, current_regs, local_map, remote_map, remote_fd, lib_path,
-                                       reinterpret_cast<uintptr_t>(libc_return_addr));
+                                       reinterpret_cast<uintptr_t>(libc_return_addr), inherited_lib_fd < 0);
         } else {
             LOGW("Failed to transfer library file descriptor for '%s' to target process %d.", lib_path, pid);
         }
 
-        // 7. Staging Fallback (Copy-Inject-Delete) if FD transfer failed.
-        if (!handle_opt) {
+        // APatch exact injection is descriptor-only: reopening/staging the
+        // display path would escape the APD-validated file identity.
+        if (!handle_opt && inherited_lib_fd < 0) {
             handle_opt = inject_via_staging(pid, current_regs, local_map, remote_map,
                                             lib_path, reinterpret_cast<uintptr_t>(libc_return_addr));
+        } else if (!handle_opt) {
+            LOGE("APatch exact injection failed; legacy staging fallback is forbidden.");
         }
         if (!handle_opt || *handle_opt == 0) {
             LOGE("Failed to load library '%s' in remote process %d.", lib_path, pid);
@@ -984,16 +1005,50 @@ int main(int argc, char **argv) {
     }
     int pid = static_cast<int>(pid_long);
 
-    // Resolve and validate library path.
+    // APatch exact injection passes a validated regular ELF descriptor in the
+    // environment.  In that mode argv[2] is display-only and must never be
+    // resolved, opened, or used for a staging fallback.
+    int inherited_lib_fd = -1;
+    const char *inherited_fd_env = getenv("APATCH_INJECT_LIBRARY_FD");
     char resolved_path[inject::constants::kMaxPathLength];
-    if (realpath(argv[2], resolved_path) == nullptr) {
-        fprintf(stderr, "Error: Failed to resolve library path '%s': %s\n", argv[2], strerror(errno));
-        return EXIT_FAILURE;
-    }
-
-    if (access(resolved_path, R_OK) != 0) {
-        fprintf(stderr, "Error: Library file '%s' is not readable: %s\n", resolved_path, strerror(errno));
-        return EXIT_FAILURE;
+    const char *library_path = nullptr;
+    if (inherited_fd_env) {
+        errno = 0;
+        char *fd_end = nullptr;
+        long parsed_fd = strtol(inherited_fd_env, &fd_end, 10);
+        if (errno || !fd_end || *fd_end != '\0' || parsed_fd < 0 || parsed_fd > INT_MAX) {
+            fprintf(stderr, "Error: Invalid APATCH_INJECT_LIBRARY_FD.\n");
+            return EXIT_FAILURE;
+        }
+        inherited_lib_fd = static_cast<int>(parsed_fd);
+        int fd_flags = fcntl(inherited_lib_fd, F_GETFD);
+        struct stat st{};
+        unsigned char ident[EI_NIDENT]{};
+        uint16_t elf_type = 0;
+        const off_t type_offset = static_cast<off_t>(
+            sizeof(void *) == 8 ? offsetof(Elf64_Ehdr, e_type) : offsetof(Elf32_Ehdr, e_type));
+        if (fd_flags < 0 || (fd_flags & FD_CLOEXEC) || fstat(inherited_lib_fd, &st) != 0 ||
+            !S_ISREG(st.st_mode) || st.st_size < static_cast<off_t>(EI_NIDENT) ||
+            pread(inherited_lib_fd, ident, sizeof(ident), 0) != static_cast<ssize_t>(sizeof(ident)) ||
+            memcmp(ident, ELFMAG, SELFMAG) != 0 || ident[EI_DATA] != ELFDATA2LSB ||
+            ident[EI_CLASS] != (sizeof(void *) == 8 ? ELFCLASS64 : ELFCLASS32) ||
+            pread(inherited_lib_fd, &elf_type, sizeof(elf_type), type_offset) !=
+                static_cast<ssize_t>(sizeof(elf_type)) ||
+            elf_type != ET_DYN) {
+            fprintf(stderr, "Error: APatch inherited library FD is not a valid regular ELF DSO.\n");
+            return EXIT_FAILURE;
+        }
+        library_path = argv[2];
+    } else {
+        if (realpath(argv[2], resolved_path) == nullptr) {
+            fprintf(stderr, "Error: Failed to resolve library path '%s': %s\n", argv[2], strerror(errno));
+            return EXIT_FAILURE;
+        }
+        if (access(resolved_path, R_OK) != 0) {
+            fprintf(stderr, "Error: Library file '%s' is not readable: %s\n", resolved_path, strerror(errno));
+            return EXIT_FAILURE;
+        }
+        library_path = resolved_path;
     }
 
     // Validate entry name.
@@ -1004,7 +1059,7 @@ int main(int argc, char **argv) {
     }
 
     LOGI("TEESimulator injector starting...");
-    bool success = inject::inject_library(pid, resolved_path, entry_name);
+    bool success = inject::inject_library(pid, library_path, entry_name, inherited_lib_fd);
 
     if (success) {
         LOGI("Injection completed successfully.");
