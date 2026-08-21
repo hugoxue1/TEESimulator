@@ -119,6 +119,18 @@ elseif(ANDROID_ABI STREQUAL "x86")
 endif()
 
 set(RUST_A ${CMAKE_SOURCE_DIR}/rust/target/${RUST_TRIPLE}/release/libteesim_km.a)
+# Windows ships a WSL launcher as system32/bash.exe, but it cannot open the E:/ path passed by the
+# native CMake process. Use Git for Windows Bash explicitly; Unix hosts keep normal PATH discovery.
+if(CMAKE_HOST_WIN32)
+  find_program(BASH_EXECUTABLE NAMES bash.exe
+      PATHS "$ENV{ProgramFiles}/Git/bin" "$ENV{LOCALAPPDATA}/Programs/Git/bin"
+      NO_DEFAULT_PATH NO_CACHE)
+else()
+  find_program(BASH_EXECUTABLE NAMES bash NO_CACHE)
+endif()
+if(NOT BASH_EXECUTABLE)
+  message(FATAL_ERROR "bash not found; install Git for Windows or add bash to PATH")
+endif()
 # ALWAYS invoke build.sh and let cargo decide incrementally what to rebuild. An OUTPUT custom command
 # with no source DEPENDS only runs when the .a is missing, so once built it was never refreshed on a
 # Rust source change — that once linked a stale 14-argument teesim_km_init_ex against a 16-argument C++
@@ -129,7 +141,7 @@ add_custom_target(rust_ta
     COMMAND ${CMAKE_COMMAND} -E env
             ABI=${ANDROID_ABI} API=${ANDROID_API_LEVEL} NDK_HOME=${ANDROID_NDK}
             BORINGSSL=${BORINGSSL_DIR}
-            bash ${CMAKE_SOURCE_DIR}/rust/build.sh
+            ${BASH_EXECUTABLE} ${CMAKE_SOURCE_DIR}/rust/build.sh
     VERBATIM USES_TERMINAL)
 
 # --- How the TAs reach BoringSSL --------------------------------------------
