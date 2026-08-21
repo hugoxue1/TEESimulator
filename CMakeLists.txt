@@ -71,10 +71,20 @@ if(NOT EXISTS ${AIDL_GEN}/.done)
   file(MAKE_DIRECTORY ${AIDL_GEN}/src ${AIDL_GEN}/include)
   foreach(pkg keymint secureclock sharedsecret)
     file(GLOB _aidls ${SEC}/${pkg}/aidl/android/hardware/security/${pkg}/*.aidl)
+    set(_aidl_inputs ${_aidls})
+    # Windows aidl normalizes import roots to backslashes but not forward-slash input paths; make
+    # the inputs native too so it recognizes that each file is under its own import root.
+    if(CMAKE_HOST_WIN32)
+      set(_aidl_inputs)
+      foreach(_aidl IN LISTS _aidls)
+        file(TO_NATIVE_PATH "${_aidl}" _aidl_native)
+        list(APPEND _aidl_inputs "${_aidl_native}")
+      endforeach()
+    endif()
     execute_process(
       COMMAND ${AIDL_BIN} --lang=ndk --structured --stability=vintf --min_sdk_version=29
               -I ${KM_AIDL} -I ${SC_AIDL} -I ${SS_AIDL}
-              -o ${AIDL_GEN}/src -h ${AIDL_GEN}/include ${_aidls}
+              -o ${AIDL_GEN}/src -h ${AIDL_GEN}/include ${_aidl_inputs}
       RESULT_VARIABLE _rc)
     if(NOT _rc EQUAL 0)
       message(FATAL_ERROR "aidl generation failed for ${pkg}")
