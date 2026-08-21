@@ -128,7 +128,10 @@ tree (idempotently — it reverse-checks before applying) to drop the `#[cfg(soo
 paths and the `i32` key-length narrowing that BoringSSL's `openssl-sys` binding
 doesn't need. `openssl-sys` with the `bindgen` feature generates the FFI straight
 from BoringSSL's headers at build time, which is why the build needs only
-`$BORINGSSL/include`, no `libcrypto` of any ABI.
+`$BORINGSSL/include`, no `libcrypto` of any ABI. The workspace patches
+`openssl-sys` to make its BoringSSL header allowlist accept both Windows and Unix
+path separators; without that fix, declarations from nested headers disappear on
+Windows even though libclang parsed them.
 
 The output is `libteesim_km.a` — a **staticlib**, nothing more. It records a link
 directive for `libcrypto` but never links one. Resolving `libcrypto` is the
