@@ -3,13 +3,13 @@
 	url = https://github.com/JingMatrix/LSPlt
 [submodule "third_party/keymint"]
 	path = third_party/keymint
-	url = https://android.googlesource.com/platform/system/keymint
+	url = https://mirrors.ustc.edu.cn/aosp/platform/system/keymint
 [submodule "third_party/interfaces"]
 	path = third_party/interfaces
-	url = https://android.googlesource.com/platform/hardware/interfaces
+	url = https://mirrors.ustc.edu.cn/aosp/platform/hardware/interfaces
 [submodule "third_party/frameworks-native"]
 	path = third_party/frameworks-native
-	url = https://android.googlesource.com/platform/frameworks/native
+	url = https://mirrors.ustc.edu.cn/aosp/platform/frameworks/native
 [submodule "third_party/boringssl"]
 	path = third_party/boringssl
 	url = https://boringssl.googlesource.com/boringssl
