@@ -37,7 +37,7 @@ export ANDROID_NDK_HOME="$NDK_HOME" ANDROID_NDK_ROOT="$NDK_HOME" ANDROID_NDK="$N
 # attestation security level (kmr-ta-seclevel.patch). Each patch is applied to the
 # submodule working tree, idempotently — skipped when it already reverse-applies,
 # i.e. is already present.
-for PATCH in "$HERE"/patches/*.patch; do
+for PATCH in "$HERE"/patches/kmr-*.patch; do
   if git -C "$ROOT/third_party/keymint" apply -p1 --reverse --check "$PATCH" 2>/dev/null; then
     :
   else
@@ -48,6 +48,12 @@ done
 BORINGSSL="${BORINGSSL:-$ROOT/third_party/boringssl}"
 if [ ! -f "$BORINGSSL/include/openssl/base.h" ]; then
   git clone --depth 1 https://boringssl.googlesource.com/boringssl "$BORINGSSL"
+fi
+BORINGSSL_PATCH="$HERE/patches/boringssl-bindgen-buf.patch"
+if git -C "$BORINGSSL" apply -p1 --reverse --check "$BORINGSSL_PATCH" 2>/dev/null; then
+  :
+else
+  git -C "$BORINGSSL" apply -p1 "$BORINGSSL_PATCH"
 fi
 
 if [ -z "${LIBCLANG_PATH:-}" ]; then

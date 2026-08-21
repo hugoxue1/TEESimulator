@@ -1,0 +1,10 @@
+--- a/include/openssl/bio.h
++++ b/include/openssl/bio.h
+@@ -15,6 +15,7 @@
+ #define OPENSSL_HEADER_BIO_H
+ 
+ #include <openssl/base.h>   // IWYU pragma: export
++#include <openssl/buf.h>    // Make BUF_MEM's definition visible to Windows bindgen.
+ 
+ #include <stdio.h>  // For FILE
+ 
