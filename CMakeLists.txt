@@ -131,6 +131,9 @@ endif()
 if(NOT BASH_EXECUTABLE)
   message(FATAL_ERROR "bash not found; install Git for Windows or add bash to PATH")
 endif()
+if(CMAKE_HOST_WIN32 AND "$ENV{LIBCLANG_PATH}" STREQUAL "")
+  message(FATAL_ERROR "LIBCLANG_PATH is missing; run through ckb_workspace/build_projects.py")
+endif()
 # ALWAYS invoke build.sh and let cargo decide incrementally what to rebuild. An OUTPUT custom command
 # with no source DEPENDS only runs when the .a is missing, so once built it was never refreshed on a
 # Rust source change — that once linked a stale 14-argument teesim_km_init_ex against a 16-argument C++
@@ -141,6 +144,7 @@ add_custom_target(rust_ta
     COMMAND ${CMAKE_COMMAND} -E env
             ABI=${ANDROID_ABI} API=${ANDROID_API_LEVEL} NDK_HOME=${ANDROID_NDK}
             BORINGSSL=${BORINGSSL_DIR}
+            "LIBCLANG_PATH=$ENV{LIBCLANG_PATH}"
             ${BASH_EXECUTABLE} ${CMAKE_SOURCE_DIR}/rust/build.sh
     VERBATIM USES_TERMINAL)
 
