@@ -2,14 +2,12 @@
 # on 12+) and binds an abstract unix socket; the root control daemon connects to it
 # to push the resolved config. Grant the keystore side the socket-server permissions.
 #
-# The daemon runs in the root manager's own already-privileged domain, which carries
-# connectto, but that domain name differs per manager — so the connectto rules below
-# are best-effort and may need adjustment on a given setup (DESIGN open question Q1).
-# If the socket path proves unworkable on some manager, the daemon can fall back to a
-# file the lib watches instead.
+# The APatch launcher moves the daemon into system_server before app_process starts,
+# so grant only that actual peer domain.  Do not reference the legacy Magisk root
+# domain here: custom APatch treats such a rule as a minimal-v1 incompatibility and
+# consequently cannot arm IReZygisk's domainless early loader.
 allow keystore self unix_stream_socket { create bind listen accept getopt setopt read write shutdown }
-allow su keystore unix_stream_socket connectto
-allow magisk keystore unix_stream_socket connectto
+allow system_server keystore unix_stream_socket connectto
 
 # The `inject` binary attaches to the keystore process with PTRACE_ATTACH (it runs
 # in the crash_dump domain), and keystore then dlopen()s the interceptor .so that
