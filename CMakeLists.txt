@@ -31,14 +31,24 @@ target_link_options(inject PRIVATE -static-libstdc++)
 # fromBinder's local-binder fallback (checked below) only exists in aidl from build-tools >= 35, so
 # prefer the newest installed build-tools over whatever aidl happens to be first on PATH or first in
 # the (alphabetically sorted) glob -- e.g. a leftover 34.0.0 sorts before 36.0.0 and silently wins.
+# Drop a stale pre-fix cache entry when it points at an aidl too old for the required option.
+if(AIDL_BIN)
+  execute_process(COMMAND ${AIDL_BIN} --help OUTPUT_VARIABLE _aidl_help ERROR_VARIABLE _aidl_help)
+  if(NOT _aidl_help MATCHES "--min_sdk_version")
+    unset(AIDL_BIN CACHE)
+    unset(AIDL_BIN)
+  endif()
+endif()
 # AIDL_BIN is a plain variable, not a find_program cache entry, so it is recomputed on every configure
-# and never sticks to a stale detection; an explicit -DAIDL_BIN=... on the command line still wins.
+# and never sticks to a stale detection; an explicit compatible -DAIDL_BIN=... still wins.
 if(NOT AIDL_BIN AND DEFINED ENV{ANDROID_HOME})
   file(GLOB _bt $ENV{ANDROID_HOME}/build-tools/*)
   list(SORT _bt COMPARE NATURAL ORDER DESCENDING)
   foreach(_d ${_bt})
-    if(EXISTS ${_d}/aidl)
-      set(AIDL_BIN ${_d}/aidl)
+    # find_program handles the .exe suffix on Windows; EXISTS ".../aidl" does not.
+    find_program(_sdk_aidl NAMES aidl PATHS ${_d} NO_DEFAULT_PATH NO_CACHE)
+    if(_sdk_aidl)
+      set(AIDL_BIN ${_sdk_aidl})
       break()
     endif()
   endforeach()
