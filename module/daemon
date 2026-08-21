@@ -2,6 +2,13 @@
 # Launches the Kotlin control daemon under app_process.
 #
 #   $1 = MODDIR (the module directory holding classes.dex and $ABI/inject + libs)
+#
+# APatch note:
+# A plain root shell is not enough for a long-lived Java daemon on the customised
+# APatch build.  app_process is another exec boundary, so the daemon must enter an
+# existing Android domain through APatch's bounded privileged-exec API.  Authority
+# is restored only to that successfully transitioned task tree; no permissive
+# domain or global allow rule is required.
 
 MODDIR=$1
 
@@ -14,7 +21,30 @@ else
   exit 1
 fi
 
+APP_PROCESS=/system/bin/app_process
+if [ -x /system/bin/app_process64 ]; then
+  APP_PROCESS=/system/bin/app_process64
+fi
+if [ ! -x "$APP_PROCESS" ]; then
+  echo "teesim: app_process is missing: $APP_PROCESS" >&2
+  exit 1
+fi
+
 # The trailing "$MODDIR" is args[0] to App.main, telling the daemon where the inject
 # binary and native libraries live.
-exec /system/bin/app_process -Djava.class.path="$CLASSPATH" "$MODDIR" \
+#
+# Keep Magisk/KernelSU/upstream APatch behaviour unchanged.  Only the customised
+# APatch advertises the bounded privileged-exec option used below.  Capability
+# detection is intentional: checking only for /data/adb/apd would break upstream
+# APatch versions that do not implement this private interface.
+SU=/system/bin/su
+APATCH_DAEMON_CONTEXT=u:r:system_server:s0
+if [ -x "$SU" ] && "$SU" --help 2>&1 | grep -q -- '--exec-context-privileged'; then
+  exec "$SU" --no-pty -p \
+    --exec-context-privileged "$APATCH_DAEMON_CONTEXT" -- \
+    "$APP_PROCESS" "-Djava.class.path=$CLASSPATH" "$MODDIR" \
+    --nice-name=teesim org.matrix.teesim.App "$MODDIR"
+fi
+
+exec "$APP_PROCESS" "-Djava.class.path=$CLASSPATH" "$MODDIR" \
   --nice-name=teesim org.matrix.teesim.App "$MODDIR"

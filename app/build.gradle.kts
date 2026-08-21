@@ -37,7 +37,12 @@ abstract class GitExecutor @Inject constructor(private val execOperations: ExecO
 val gitExecutor = objects.newInstance(GitExecutor::class.java)
 val gitCommitCount = gitExecutor.execute("git rev-list HEAD --count", rootDir).toInt()
 val gitCommitHash = gitExecutor.execute("git rev-parse --verify --short HEAD", rootDir)
-val verName = "v4.0"
+// Keep the private APatch-compatible line visibly distinct from upstream and above
+// the official v4/canary module version codes. Each later commit still increments
+// monotonically, so a newly built ZIP is never reported as a downgrade.
+val customVersionCodeBase = 40_000
+val moduleVersionCode = customVersionCodeBase + gitCommitCount
+val verName = "v4.0-ckb-apatch1"
 
 android {
     namespace = "org.matrix.teesim"
@@ -49,7 +54,7 @@ android {
         applicationId = "org.matrix.teesim"
         minSdk = 29
         targetSdk = 36
-        versionCode = gitCommitCount
+        versionCode = moduleVersionCode
         versionName = verName
         externalNativeBuild {
             cmake {
@@ -190,7 +195,7 @@ androidComponents {
 
         // Stage per variant so debug and release never clobber each other.
         val tempModuleDir = layout.buildDirectory.dir("module/${variant.name}")
-        val zipFileName = "TEESimulator-$verName-$gitCommitCount-$gitCommitHash-$capitalized.zip"
+        val zipFileName = "TEESimulator-$verName-$moduleVersionCode-$gitCommitHash-$capitalized.zip"
 
         // Where AGP leaves this variant's native build: stripped .so under
         // stripped_native_libs, and the injector executable (never stripped or
@@ -257,9 +262,9 @@ androidComponents {
                 from(sourceModuleDir) {
                     include("module.prop")
                     expand(
-                        "REPLACEMEVERCODE" to gitCommitCount.toString(),
+                        "REPLACEMEVERCODE" to moduleVersionCode.toString(),
                         "REPLACEMEVER" to
-                            "$verName ($gitCommitCount-$gitCommitHash-${variant.name})",
+                            "$verName ($moduleVersionCode-$gitCommitHash-${variant.name})",
                     )
                 }
 
