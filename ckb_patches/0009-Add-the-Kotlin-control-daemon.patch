@@ -1,0 +1,3905 @@
+From 84254b3691169f424015832bd5b1972560cba8dc Mon Sep 17 00:00:00 2001
+From: JingMatrix <jingmatrix@gmail.com>
+Date: Sun, 9 Aug 2026 21:20:57 +0200
+Subject: [PATCH 09/47] Add the Kotlin control daemon
+
+A root app_process daemon harvests the device's real attestation parameters, resolves config.json into per-profile settings, injects the interceptor, and pushes the resolved config over the control channel, re-resolving on package and config changes. It also serves a loopback, token-guarded KeyAdmin endpoint the WebUI uses to list/inspect/delete stored keys and tail the TEESimulator logs. Install tasks accept -Pserial to target a device.
+---
+ app/build.gradle.kts                          | 264 +++++++
+ app/proguard-rules.pro                        |  12 +
+ app/src/main/AndroidManifest.xml              |   2 +
+ app/src/main/java/org/matrix/teesim/App.kt    | 177 +++++
+ .../java/org/matrix/teesim/ConfigStore.kt     | 138 ++++
+ app/src/main/java/org/matrix/teesim/Const.kt  |  34 +
+ .../main/java/org/matrix/teesim/Control.kt    | 230 ++++++
+ .../java/org/matrix/teesim/DeviceProps.kt     | 141 ++++
+ .../main/java/org/matrix/teesim/Harvester.kt  | 659 ++++++++++++++++++
+ .../main/java/org/matrix/teesim/Injector.kt   | 149 ++++
+ .../main/java/org/matrix/teesim/KeyAdmin.kt   | 492 +++++++++++++
+ .../java/org/matrix/teesim/KeyboxInspector.kt | 186 +++++
+ .../org/matrix/teesim/Keystore2Service.kt     |  57 ++
+ .../main/java/org/matrix/teesim/KeystoreDb.kt | 457 ++++++++++++
+ .../main/java/org/matrix/teesim/LogTail.kt    | 112 +++
+ .../java/org/matrix/teesim/PackageWatch.kt    |  44 ++
+ .../main/java/org/matrix/teesim/Packages.kt   |  59 ++
+ .../main/java/org/matrix/teesim/Resolver.kt   | 123 ++++
+ .../java/org/matrix/teesim/SystemLogger.kt    |  32 +
+ .../main/java/org/matrix/teesim/Updater.kt    | 188 +++++
+ stub/build.gradle.kts                         |  27 +
+ stub/src/main/AndroidManifest.xml             |   2 +
+ .../main/java/android/app/ActivityThread.java |  11 +
+ .../main/java/android/app/ContextImpl.java    |   4 +
+ .../android/content/pm/IPackageManager.java   |  17 +
+ .../main/java/android/os/ServiceManager.java  |  19 +
+ .../java/android/os/SystemProperties.java     |  11 +
+ .../keystore/AndroidKeyStoreProvider.java     |   7 +
+ .../keystore2/AndroidKeyStoreProvider.java    |   7 +
+ 29 files changed, 3661 insertions(+)
+ create mode 100644 app/build.gradle.kts
+ create mode 100644 app/proguard-rules.pro
+ create mode 100644 app/src/main/AndroidManifest.xml
+ create mode 100644 app/src/main/java/org/matrix/teesim/App.kt
+ create mode 100644 app/src/main/java/org/matrix/teesim/ConfigStore.kt
+ create mode 100644 app/src/main/java/org/matrix/teesim/Const.kt
+ create mode 100644 app/src/main/java/org/matrix/teesim/Control.kt
+ create mode 100644 app/src/main/java/org/matrix/teesim/DeviceProps.kt
+ create mode 100644 app/src/main/java/org/matrix/teesim/Harvester.kt
+ create mode 100644 app/src/main/java/org/matrix/teesim/Injector.kt
+ create mode 100644 app/src/main/java/org/matrix/teesim/KeyAdmin.kt
+ create mode 100644 app/src/main/java/org/matrix/teesim/KeyboxInspector.kt
+ create mode 100644 app/src/main/java/org/matrix/teesim/Keystore2Service.kt
+ create mode 100644 app/src/main/java/org/matrix/teesim/KeystoreDb.kt
+ create mode 100644 app/src/main/java/org/matrix/teesim/LogTail.kt
+ create mode 100644 app/src/main/java/org/matrix/teesim/PackageWatch.kt
+ create mode 100644 app/src/main/java/org/matrix/teesim/Packages.kt
+ create mode 100644 app/src/main/java/org/matrix/teesim/Resolver.kt
+ create mode 100644 app/src/main/java/org/matrix/teesim/SystemLogger.kt
+ create mode 100644 app/src/main/java/org/matrix/teesim/Updater.kt
+ create mode 100644 stub/build.gradle.kts
+ create mode 100644 stub/src/main/AndroidManifest.xml
+ create mode 100644 stub/src/main/java/android/app/ActivityThread.java
+ create mode 100644 stub/src/main/java/android/app/ContextImpl.java
+ create mode 100644 stub/src/main/java/android/content/pm/IPackageManager.java
+ create mode 100644 stub/src/main/java/android/os/ServiceManager.java
+ create mode 100644 stub/src/main/java/android/os/SystemProperties.java
+ create mode 100644 stub/src/main/java/android/security/keystore/AndroidKeyStoreProvider.java
+ create mode 100644 stub/src/main/java/android/security/keystore2/AndroidKeyStoreProvider.java
+
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+new file mode 100644
+index 0000000..e8ae4f1
+--- /dev/null
++++ b/app/build.gradle.kts
+@@ -0,0 +1,264 @@
++// The TEESimulator control daemon plus the native interceptors and module packaging.
++//
++// Built as an Android application so AGP's R8 pass shrinks the bundled BouncyCastle
++// down to a single classes.dex (app_process runs that dex at boot). The C/C++
++// interceptors (inject, teesim_keymint, teesim_keystore) build through AGP's
++// externalNativeBuild against the repo-root CMakeLists.txt, which also drives the
++// Rust TA (rust/build.sh) via its rust_ta target and links a self-contained static
++// BoringSSL. Packaging mirrors both build variants: `prepareModuleFiles<Variant>`
++// stages the payload (Release: the R8 dex; Debug: the signed APK as service.apk),
++// the stripped native interceptors and the injector, and the module/ tree; then
++// `zip<Variant>` assembles the flashable module into out/.
++import com.android.build.api.artifact.SingleArtifact
++import java.io.ByteArrayOutputStream
++import javax.inject.Inject
++import org.gradle.process.ExecOperations
++
++plugins {
++    alias(libs.plugins.android.application)
++    alias(libs.plugins.ktfmt)
++}
++
++ktfmt { kotlinLangStyle() }
++
++// Helper class to get access to the ExecOperations service for git queries.
++abstract class GitExecutor @Inject constructor(private val execOperations: ExecOperations) {
++    fun execute(command: String, currentWorkingDir: File): String {
++        val byteOut = ByteArrayOutputStream()
++        execOperations.exec {
++            workingDir = currentWorkingDir
++            commandLine = command.split("\\s".toRegex())
++            standardOutput = byteOut
++        }
++        return String(byteOut.toByteArray()).trim()
++    }
++}
++
++val gitExecutor = objects.newInstance(GitExecutor::class.java)
++val gitCommitCount = gitExecutor.execute("git rev-list HEAD --count", rootDir).toInt()
++val gitCommitHash = gitExecutor.execute("git rev-parse --verify --short HEAD", rootDir)
++val verName = "v4.0"
++
++android {
++    namespace = "org.matrix.teesim"
++    compileSdk = 36
++    ndkVersion = "28.2.13676358"
++    buildToolsVersion = "36.0.0"
++
++    defaultConfig {
++        applicationId = "org.matrix.teesim"
++        minSdk = 29
++        targetSdk = 36
++        versionCode = gitCommitCount
++        versionName = verName
++        externalNativeBuild {
++            cmake {
++                // The interceptors are 64-bit only (keystore2 is 64-bit everywhere).
++                abiFilters += listOf("arm64-v8a", "x86_64")
++                // Match package.sh: build the injector and both interceptors; the
++                // static BoringSSL `crypto` target builds transitively for keystore.
++                targets += listOf("inject", "teesim_keymint", "teesim_keystore")
++            }
++        }
++    }
++
++    buildTypes {
++        release {
++            isMinifyEnabled = true
++            proguardFiles("proguard-rules.pro")
++            signingConfig = null
++        }
++    }
++
++    compileOptions {
++        sourceCompatibility = JavaVersion.VERSION_21
++        targetCompatibility = JavaVersion.VERSION_21
++    }
++
++    // No BuildConfig/resources: this is a headless dex, not an app.
++    buildFeatures {
++        buildConfig = false
++        resValues = false
++    }
++
++    // R8 shrinking pulls in mergeReleaseJavaResource, and three BouncyCastle jars
++    // (bcpkix/bcutil/bcprov, all 1.85) each ship an identical META-INF/LICENSE.md,
++    // which fails the merge. We extract only classes.dex, so the resource is never
++    // packaged anyway — drop it to let the merge pass.
++    packaging { resources { excludes += "META-INF/LICENSE.md" } }
++
++    lint { abortOnError = false }
++
++    externalNativeBuild {
++        cmake {
++            path = rootProject.file("CMakeLists.txt")
++            buildStagingDirectory = layout.buildDirectory.get().asFile
++        }
++    }
++}
++
++dependencies {
++    compileOnly(project(":stub"))
++    compileOnly(libs.annotation)
++    // Full BouncyCastle: Android ships only a stripped "BC" provider, so we bundle
++    // and swap in the complete library for ASN.1 parsing of the attestation record.
++    implementation(libs.bcpkix)
++}
++
++// Extract classes.dex from the R8-shrunken release output into build/teesim/.
++// app_process runs this dex directly. Sourced from the R8 intermediate (not the
++// packaged APK) so a plain `:app:dex` does not drag in the native build.
++tasks.register<Copy>("dex") {
++    group = "teesim"
++    description = "Builds the daemon and copies classes.dex to build/teesim/."
++    dependsOn("minifyReleaseWithR8")
++    from(layout.buildDirectory.dir("intermediates/dex/release/minifyReleaseWithR8")) {
++        include("classes.dex")
++    }
++    into(layout.buildDirectory.dir("teesim"))
++}
++
++// --- Module packaging -------------------------------------------------------
++// Assemble the flashable module, once per build variant, from three ingredients:
++// the daemon payload (Release: the R8-shrunken classes.dex that app_process runs
++// at boot; Debug: the signed APK renamed service.apk, which module/daemon uses as
++// a classpath fallback), the stripped interceptor libraries plus the injector
++// executable (AGP's per-variant native build), and the module/ tree (scripts +
++// WebUI). The interceptors are 64-bit only, so binaries live under <abi>/ at the
++// module root, exactly where module/daemon and module/customize.sh expect them.
++
++// Per-root-manager install tasks target adb. When several devices are attached, pick
++// one with adb's own ANDROID_SERIAL env var — the Exec tasks inherit it, so
++//     ANDROID_SERIAL=<serial> ./gradlew installKsuAndRebootDebug
++// targets that device with no extra flags.
++fun adb(vararg args: String): List<String> = listOf("adb", *args)
++
++androidComponents {
++    onVariants(selector().all()) { variant ->
++        val capitalized = variant.name.replaceFirstChar { it.uppercase() }
++        val isDebug = variant.buildType == "debug"
++
++        // Stage per variant so debug and release never clobber each other.
++        val tempModuleDir = layout.buildDirectory.dir("module/${variant.name}")
++        val zipFileName = "TEESimulator-$verName-$gitCommitCount-$gitCommitHash-$capitalized.zip"
++
++        // Where AGP leaves this variant's native build: stripped .so under
++        // stripped_native_libs, and the injector executable (never stripped or
++        // packaged by AGP) only under intermediates/cmake.
++        val strippedLibs =
++            layout.buildDirectory.dir(
++                "intermediates/stripped_native_libs/${variant.name}/strip${capitalized}DebugSymbols/out/lib"
++            )
++        val cmakeObj = layout.buildDirectory.dir("intermediates/cmake/${variant.name}/obj")
++
++        // Stage every module file. Sync clears stale files from previous runs.
++        val prepareModuleFilesTask =
++            tasks.register<Sync>("prepareModuleFiles${capitalized}") {
++                group = "TEESimulator Module Packaging"
++                description = "Prepares all files for the ${variant.name} module zip."
++
++                if (isDebug) {
++                    dependsOn("package${capitalized}")
++                } else {
++                    dependsOn("minify${capitalized}WithR8")
++                }
++                // Stripped .so land in stripped_native_libs; the injector executable
++                // is only collected under intermediates/cmake by externalNativeBuild.
++                dependsOn("strip${capitalized}DebugSymbols")
++                dependsOn("externalNativeBuild${capitalized}")
++
++                if (isDebug) {
++                    // Debug has no R8 pass; ship the packaged APK. module/daemon falls
++                    // back to service.apk when classes.dex is absent.
++                    from(variant.artifacts.get(SingleArtifact.APK)) {
++                        include("*.apk")
++                        rename { "service.apk" }
++                    }
++                } else {
++                    // The control daemon's dex; app_process runs it at boot.
++                    from(
++                        layout.buildDirectory.dir(
++                            "intermediates/dex/${variant.name}/minify${capitalized}WithR8"
++                        )
++                    ) {
++                        include("classes.dex")
++                    }
++                }
++
++                // The stripped interceptor libraries, keeping their <abi>/ layout; the
++                // runtime stubs (libcrypto/libbinder/libutils) stay out of the zip.
++                from(strippedLibs) {
++                    include("**/libteesim_keymint.so", "**/libteesim_keystore.so")
++                }
++
++                // The injector executable, one per <abi>/.
++                from(cmakeObj) { include("**/inject") }
++
++                // The module scripts and WebUI (service.sh, daemon, customize.sh,
++                // sepolicy.rule, config.default.json, webroot/); module.prop is
++                // templated separately below.
++                val sourceModuleDir = rootProject.projectDir.resolve("module")
++                from(sourceModuleDir) { exclude("module.prop") }
++
++                // module.prop with git-derived version fields filled in.
++                from(sourceModuleDir) {
++                    include("module.prop")
++                    expand(
++                        "REPLACEMEVERCODE" to gitCommitCount.toString(),
++                        "REPLACEMEVER" to
++                            "$verName ($gitCommitCount-$gitCommitHash-${variant.name})",
++                    )
++                }
++
++                into(tempModuleDir)
++            }
++
++        // Zip the staged module into out/.
++        val zipTask =
++            tasks.register<Zip>("zip${capitalized}") {
++                group = "TEESimulator Module Packaging"
++                description = "Creates the flashable ${variant.name} module zip in out/."
++                dependsOn(prepareModuleFilesTask)
++                archiveFileName.set(zipFileName)
++                destinationDirectory.set(rootProject.rootDir.resolve("out"))
++                from(tempModuleDir)
++            }
++
++        // Per-root-manager install tasks: push the zip and let the manager flash it.
++        fun createInstallTasks(rootProvider: String, installCli: String) {
++            val pushTask =
++                tasks.register<Exec>("push${rootProvider}Module${capitalized}") {
++                    group = "TEESimulator Module Installation"
++                    description =
++                        "Pushes the ${variant.name} module zip to the device for $rootProvider."
++                    dependsOn(zipTask)
++                    commandLine(
++                        adb(
++                            "push",
++                            zipTask.get().archiveFile.get().asFile.absolutePath,
++                            "/data/local/tmp",
++                        )
++                    )
++                }
++
++            val installTask =
++                tasks.register<Exec>("install${rootProvider}${capitalized}") {
++                    group = "TEESimulator Module Installation"
++                    description = "Installs the ${variant.name} module via $rootProvider."
++                    dependsOn(pushTask)
++                    commandLine(adb("shell", "su", "-c", "$installCli /data/local/tmp/$zipFileName"))
++                }
++
++            tasks.register<Exec>("install${rootProvider}AndReboot${capitalized}") {
++                group = "TEESimulator Module Installation"
++                description = "Installs the ${variant.name} module via $rootProvider and reboots."
++                dependsOn(installTask)
++                commandLine(adb("reboot"))
++            }
++        }
++
++        createInstallTasks("Magisk", "magisk --install-module")
++        createInstallTasks("Ksu", "ksud module install")
++        createInstallTasks("Apatch", "/data/adb/apd module install")
++    }
++}
+diff --git a/app/proguard-rules.pro b/app/proguard-rules.pro
+new file mode 100644
+index 0000000..d227abf
+--- /dev/null
++++ b/app/proguard-rules.pro
+@@ -0,0 +1,12 @@
++# The entry point app_process invokes.
++-keepclasseswithmembers class org.matrix.teesim.App {
++    public static void main(java.lang.String[]);
++}
++
++# BouncyCastle providers are loaded by name/reflection; keep them intact.
++-keep class org.bouncycastle.jcajce.provider.** { *; }
++-keep class org.bouncycastle.jce.provider.** { *; }
++-dontwarn javax.naming.**
++
++# We reference hidden framework classes that are provided at runtime only.
++-dontwarn android.**
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+new file mode 100644
+index 0000000..8072ee0
+--- /dev/null
++++ b/app/src/main/AndroidManifest.xml
+@@ -0,0 +1,2 @@
++<?xml version="1.0" encoding="utf-8"?>
++<manifest />
+diff --git a/app/src/main/java/org/matrix/teesim/App.kt b/app/src/main/java/org/matrix/teesim/App.kt
+new file mode 100644
+index 0000000..bfb29d0
+--- /dev/null
++++ b/app/src/main/java/org/matrix/teesim/App.kt
+@@ -0,0 +1,177 @@
++package org.matrix.teesim
++
++import android.app.ActivityThread
++import android.app.Application
++import android.content.Context
++import android.content.ContextWrapper
++import android.os.Build
++import android.os.Looper
++import java.io.File
++import java.security.Security
++import org.bouncycastle.jce.provider.BouncyCastleProvider
++
++/**
++ * Privileged control daemon, launched via app_process. Bootstraps just enough of the Android
++ * framework for AndroidKeyStore + PackageManager to work in this bare process (following the proven
++ * main-branch sequence), harvests real attestation parameters, injects the native interceptor, and
++ * pushes resolved config over @teesim.
++ *
++ * Launch (from the module's service.sh): app_process -Djava.class.path=$MODDIR/classes.dex $MODDIR
++ * \ --nice-name=teesim org.matrix.teesim.App $MODDIR The trailing $MODDIR tells the Injector where
++ * the inject binary + libraries live.
++ */
++object App {
++
++    @Volatile private lateinit var appContext: Context
++    @Volatile private lateinit var harvest: Harvester.Record
++    @Volatile private var lastGoodConfig: ConfigStore.Config? = null
++
++    @JvmStatic
++    fun main(args: Array<String>) {
++        SystemLogger.info("TEESimulator control daemon starting")
++        try {
++            waitForSystemReady()
++            appContext = prepareEnvironment()
++
++            // AndroidKeyStore provider for this process (harvest needs it).
++            if (Build.VERSION.SDK_INT in Build.VERSION_CODES.Q..Build.VERSION_CODES.R) {
++                android.security.keystore.AndroidKeyStoreProvider.install()
++            } else {
++                android.security.keystore2.AndroidKeyStoreProvider.install()
++            }
++
++            // Swap Android's stripped "BC" for the bundled full BouncyCastle (ASN.1 parsing).
++            Security.removeProvider(BouncyCastleProvider.PROVIDER_NAME)
++            Security.addProvider(BouncyCastleProvider())
++
++            Packages.init(appContext)
++
++            // Real-key harvest (frozen verifiedBoot*), persisted to harvested.json.
++            harvest = Harvester.run(appContext)
++
++            // Key-management endpoint for the WebUI.
++            KeyAdmin.start(harvest)
++
++            // Inject the interceptor and keep it injected across keystore restarts.
++            Injector(resolveModuleDir(args)).start()
++
++            // Control channel + initial push, then watch config and packages.
++            Control.start()
++            resolveAndPush()
++            ConfigStore.watch { resolveAndPush() }
++            PackageWatch.start(appContext) { resolveAndPush() }
++
++            SystemLogger.info("Daemon initialised; entering main loop")
++            Looper.loop()
++        } catch (e: Throwable) {
++            SystemLogger.error("Fatal error in daemon main", e)
++            throw e
++        }
++    }
++
++    /**
++     * The first app_process at boot can start before system_server, and then
++     * ActivityThread.systemMain()/getSystemContext() NPE deep in the framework —
++     * only the service.sh respawn recovers. main fixed this (#99) by waiting for a
++     * core system service first. "package" is one of the last services system_server
++     * registers, so once it answers the framework is fully up.
++     */
++    private fun waitForSystemReady() {
++        try {
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
++                android.os.ServiceManager.waitForService("package")
++                return
++            }
++        } catch (_: Throwable) {}
++        for (i in 0 until 140) { // ~70s total (140 × 500ms)
++            try {
++                if (android.os.ServiceManager.getService("package") != null) return
++            } catch (_: Throwable) {}
++            try {
++                Thread.sleep(500)
++            } catch (_: InterruptedException) {
++                return
++            }
++        }
++        SystemLogger.warning("system_server not ready after 70s; bootstrapping anyway")
++    }
++
++    /** Minimal ActivityThread bootstrap so KeyStore.getApplicationContext() works. */
++    private fun prepareEnvironment(): Context {
++        if (Looper.getMainLooper() == null) {
++            @Suppress("DEPRECATION") Looper.prepareMainLooper()
++        }
++        val activityThread = ActivityThread.systemMain()
++        // getSystemContext() can still NPE on the very first launch; the readiness
++        // gate above usually makes the first attempt succeed, but retry to be safe.
++        var systemContext: Any? = null // stub getSystemContext() returns ContextImpl, passed reflectively
++        for (attempt in 0 until 5) {
++            try {
++                systemContext = activityThread.getSystemContext()
++                if (systemContext != null) break
++            } catch (e: Throwable) {
++                SystemLogger.warning("getSystemContext attempt ${attempt + 1} failed: ${e.message}")
++            }
++            try {
++                Thread.sleep(1000)
++            } catch (_: InterruptedException) {}
++        }
++        val sysCtx =
++            systemContext ?: throw IllegalStateException("system context unavailable after retries")
++
++        val app = Application()
++        val attach =
++            ContextWrapper::class.java.getDeclaredMethod("attachBaseContext", Context::class.java)
++        attach.isAccessible = true
++        attach.invoke(app, sysCtx)
++
++        val field = ActivityThread::class.java.getDeclaredField("mInitialApplication")
++        field.isAccessible = true
++        field.set(activityThread, app)
++        return app
++    }
++
++    /**
++     * Re-read + validate config, resolve against the frozen harvest and the live device, and push.
++     * On config validation failure the last-good config is kept.
++     */
++    @Synchronized
++    private fun resolveAndPush() {
++        try {
++            lastGoodConfig = ConfigStore.load()
++        } catch (e: ConfigStore.ConfigException) {
++            SystemLogger.error("config.json invalid; keeping last-good: ${e.message}")
++        } catch (e: Exception) {
++            SystemLogger.error("config.json read failed; keeping last-good", e)
++        }
++        val cfg =
++            lastGoodConfig
++                ?: run {
++                    SystemLogger.warning("No valid config yet; nothing to push")
++                    return
++                }
++        try {
++            val msg = Resolver.resolve(cfg, harvest)
++            Control.push(msg.toString())
++        } catch (e: Exception) {
++            SystemLogger.error("Failed to resolve/push config", e)
++        }
++    }
++
++    /** Where the inject binary + native libs live: args[0], else the dex dir, else default. */
++    private fun resolveModuleDir(args: Array<String>): File {
++        args.firstOrNull()?.let {
++            val d = File(it)
++            if (d.isDirectory) return d
++        }
++        System.getProperty("java.class.path")?.let { cp ->
++            val first = cp.split(File.pathSeparatorChar).firstOrNull()
++            if (first != null && (first.endsWith(".dex") || first.endsWith(".apk"))) {
++                File(first).parentFile?.let {
++                    return it
++                }
++            }
++        }
++        return File("/data/adb/modules/teesim")
++    }
++}
+diff --git a/app/src/main/java/org/matrix/teesim/ConfigStore.kt b/app/src/main/java/org/matrix/teesim/ConfigStore.kt
+new file mode 100644
+index 0000000..97d17a6
+--- /dev/null
++++ b/app/src/main/java/org/matrix/teesim/ConfigStore.kt
+@@ -0,0 +1,138 @@
++package org.matrix.teesim
++
++import android.os.FileObserver
++import java.io.File
++import org.json.JSONObject
++
++/**
++ * Reads, validates and watches [Const.configFile]. The schema is DESIGN.md "config.json
++ * (daemon-owned)". Validation failures throw [ConfigException]; the caller keeps the last-good
++ * config on failure.
++ */
++object ConfigStore {
++
++    class ConfigException(message: String) : Exception(message)
++
++    /** One profile as written by the WebUI, before resolution against the device. */
++    data class ProfileConfig(
++        val id: String,
++        val keybox: String, // relative to Const.DATA_DIR
++        val patchSystem: String,
++        val patchVendor: String,
++        val patchBoot: String,
++        val osVersion: String, // system_property | "16" | "16.0.0" | "160000"
++        val brand: String,
++        val device: String,
++        val product: String,
++        val manufacturer: String,
++        val model: String,
++        val serial: String,
++        val imei: String,
++        val meid: String,
++        val imei2: String,
++        val apps: List<String>,
++    )
++
++    data class Config(val version: Int, val profiles: List<ProfileConfig>)
++
++    /** Parse and validate the on-disk config. Throws [ConfigException] if invalid. */
++    fun load(): Config {
++        val f = Const.configFile
++        if (!f.exists()) throw ConfigException("config.json not found at ${f.absolutePath}")
++
++        val root =
++            try {
++                JSONObject(f.readText())
++            } catch (e: Exception) {
++                throw ConfigException("config.json is not valid JSON: ${e.message}")
++            }
++
++        val version = root.optInt("version", 0)
++        if (version != 1) throw ConfigException("unsupported config version $version (expected 1)")
++
++        val profilesObj =
++            root.optJSONObject("profiles")
++                ?: throw ConfigException("config.json has no \"profiles\" object")
++        if (profilesObj.length() == 0) throw ConfigException("config.json has no profiles")
++
++        val seenApps = HashMap<String, String>() // package -> owning profile id
++        val profiles = ArrayList<ProfileConfig>()
++
++        val ids = profilesObj.keys()
++        while (ids.hasNext()) {
++            val id = ids.next()
++            val p = profilesObj.getJSONObject(id)
++
++            val keybox = p.optString("keybox", "").trim()
++            if (keybox.isEmpty()) throw ConfigException("profile '$id' has no keybox")
++            val keyboxFile = File(Const.DATA_DIR, keybox)
++            if (!keyboxFile.isFile)
++                throw ConfigException("profile '$id' keybox not found: ${keyboxFile.absolutePath}")
++
++            val patch = p.optJSONObject("patchLevel") ?: JSONObject()
++            val apps =
++                p.optJSONArray("apps")?.let { arr ->
++                    (0 until arr.length()).map { arr.getString(it).trim() }
++                } ?: emptyList()
++            if (apps.isEmpty()) throw ConfigException("profile '$id' has no apps")
++            for (pkg in apps) {
++                val prev = seenApps.put(pkg, id)
++                if (prev != null && prev != id)
++                    throw ConfigException(
++                        "package '$pkg' appears in both profile '$prev' and '$id' " +
++                            "(routing requires one profile per package)"
++                    )
++            }
++
++            profiles.add(
++                ProfileConfig(
++                    id = id,
++                    keybox = keybox,
++                    // Defaults for an omitted field mirror the shipped config: a current-month system
++                    // patch and the conventional YYYY-MM-05 vendor/boot patch; an absent osVersion is
++                    // left empty (reuse the harvested value).
++                    patchSystem = patch.optString("system", "today"),
++                    patchVendor = patch.optString("vendor", "YYYY-MM-05"),
++                    patchBoot = patch.optString("boot", "YYYY-MM-05"),
++                    osVersion =
++                        p.opt("osVersion")?.toString()?.trim().takeUnless { it.isNullOrEmpty() }
++                            ?: "",
++                    brand = p.optString("brand", ""),
++                    device = p.optString("device", ""),
++                    product = p.optString("product", ""),
++                    manufacturer = p.optString("manufacturer", ""),
++                    model = p.optString("model", ""),
++                    serial = p.optString("serial", ""),
++                    imei = p.optString("imei", ""),
++                    meid = p.optString("meid", ""),
++                    imei2 = p.optString("imei2", ""),
++                    apps = apps,
++                )
++            )
++        }
++        return Config(version, profiles)
++    }
++
++    private var observer: FileObserver? = null
++
++    /**
++     * Watch the data dir for config.json / keybox changes and invoke [onChange]. Uses the
++     * directory-level FileObserver (editors write via a temp file + rename).
++     */
++    fun watch(onChange: () -> Unit) {
++        File(Const.DATA_DIR).mkdirs()
++        val mask = FileObserver.CLOSE_WRITE or FileObserver.MOVED_TO or FileObserver.DELETE
++        observer =
++            object : FileObserver(File(Const.DATA_DIR), mask) {
++                override fun onEvent(event: Int, path: String?) {
++                    path ?: return
++                    if (path == "config.json" || path.endsWith(".xml")) {
++                        SystemLogger.info("Config change detected: $path")
++                        onChange()
++                    }
++                }
++            }
++        observer?.startWatching()
++        SystemLogger.info("Watching ${Const.DATA_DIR} for config/keybox changes")
++    }
++}
+diff --git a/app/src/main/java/org/matrix/teesim/Const.kt b/app/src/main/java/org/matrix/teesim/Const.kt
+new file mode 100644
+index 0000000..e286a1e
+--- /dev/null
++++ b/app/src/main/java/org/matrix/teesim/Const.kt
+@@ -0,0 +1,34 @@
++package org.matrix.teesim
++
++import java.io.File
++
++/** Well-known paths and identifiers shared across the daemon. */
++object Const {
++    /** The daemon-owned configuration/state directory. */
++    const val DATA_DIR = "/data/adb/teesim"
++
++    val configFile = File(DATA_DIR, "config.json")
++    val harvestedFile = File(DATA_DIR, "harvested.json")
++    val adminTokenFile = File(DATA_DIR, "admin.token")
++
++    /** keystore's uid; the control socket only sends the keybox once the peer is it. */
++    const val AID_KEYSTORE = 1017
++
++    /** Abstract control socket the interceptor library binds (`\0teesim`). */
++    const val CONTROL_SOCKET = "teesim"
++
++    /** Loopback port the WebUI reaches KeyAdmin on. */
++    const val ADMIN_PORT = 8790
++
++    /** Security-level encodings shared with the native side and the wire protocol. */
++    const val SECLEVEL_SOFTWARE = 0
++    const val SECLEVEL_TEE = 1
++    const val SECLEVEL_STRONGBOX = 2
++
++    fun securityLevelName(level: Int): String =
++        when (level) {
++            SECLEVEL_SOFTWARE -> "Software"
++            SECLEVEL_STRONGBOX -> "StrongBox"
++            else -> "TrustedEnvironment"
++        }
++}
+diff --git a/app/src/main/java/org/matrix/teesim/Control.kt b/app/src/main/java/org/matrix/teesim/Control.kt
+new file mode 100644
+index 0000000..c2f07d1
+--- /dev/null
++++ b/app/src/main/java/org/matrix/teesim/Control.kt
+@@ -0,0 +1,230 @@
++package org.matrix.teesim
++
++import android.net.LocalSocket
++import android.net.LocalSocketAddress
++import java.io.InputStream
++import java.io.OutputStream
++import org.json.JSONObject
++
++/**
++ * Control-channel CLIENT. Connects the abstract unix socket `@teesim`, verifies the peer is
++ * keystore (SO_PEERCRED uid == 1017) before sending the keybox bytes, then speaks the control.cpp
++ * framing: [u32 BE length][UTF-8 JSON].
++ *
++ * Wire sequence: the lib sends its `hello` on accept; we send our `hello` then the latest `config`,
++ * and read back `hello`/`ack`/`pong`. Only ever the newest config is sent (full replace).
++ * Reconnects with backoff and re-pushes on every reconnect.
++ */
++object Control {
++
++    private const val MAX_FRAME = 8 * 1024 * 1024
++
++    private val lock = Object()
++    @Volatile private var latest: String? = null
++    private var seq = 0L
++    @Volatile private var running = false
++
++    @Volatile
++    var libHook: String? = null
++        private set
++
++    @Volatile
++    var libApi: Int = 0
++        private set
++
++    fun start() {
++        if (running) return
++        running = true
++        Thread({ supervise() }, "teesim-control").apply {
++            isDaemon = true
++            start()
++        }
++    }
++
++    /** Queue the newest resolved config; the connection thread pushes it. */
++    fun push(configJson: String) {
++        synchronized(lock) {
++            latest = configJson
++            seq++
++            lock.notifyAll()
++        }
++    }
++
++    private class Conn(val socket: LocalSocket, val out: OutputStream) {
++        @Volatile var alive = true
++        var sentSeq = -1L
++    }
++
++    private fun supervise() {
++        var backoff = 500L
++        while (running) {
++            var socket: LocalSocket? = null
++            try {
++                socket = LocalSocket()
++                socket.connect(
++                    LocalSocketAddress(Const.CONTROL_SOCKET, LocalSocketAddress.Namespace.ABSTRACT)
++                )
++                val peerUid =
++                    try {
++                        socket.peerCredentials.uid
++                    } catch (e: Exception) {
++                        -1
++                    }
++                if (peerUid != Const.AID_KEYSTORE) {
++                    SystemLogger.error(
++                        "control: peer uid $peerUid != keystore ${Const.AID_KEYSTORE}; refusing to send"
++                    )
++                    socket.close()
++                    sleep(backoff)
++                    backoff = (backoff * 2).coerceAtMost(10_000)
++                    continue
++                }
++                SystemLogger.info(
++                    "control: connected to @${Const.CONTROL_SOCKET} (peer uid=$peerUid)"
++                )
++                backoff = 500L
++
++                val out = socket.outputStream
++                val inp = socket.inputStream
++                writeFrame(out, "{\"type\":\"hello\",\"role\":\"daemon\",\"protocol\":1}")
++
++                val conn = Conn(socket, out)
++                val writer =
++                    Thread({ writerLoop(conn) }, "teesim-control-writer").apply {
++                        isDaemon = true
++                        start()
++                    }
++                try {
++                    while (running) {
++                        val frame = readFrame(inp) ?: break
++                        handleFrame(frame)
++                    }
++                } finally {
++                    conn.alive = false
++                    synchronized(lock) { lock.notifyAll() }
++                    writer.interrupt()
++                }
++            } catch (e: Exception) {
++                SystemLogger.warning("control: connection error: ${e.message}")
++            } finally {
++                try {
++                    socket?.close()
++                } catch (ignored: Exception) {}
++            }
++            if (running) {
++                sleep(backoff)
++                backoff = (backoff * 2).coerceAtMost(10_000)
++            }
++        }
++    }
++
++    private fun writerLoop(conn: Conn) {
++        try {
++            while (conn.alive && running) {
++                var toSend: String? = null
++                var doPing = false
++                synchronized(lock) {
++                    if (latest != null && conn.sentSeq != seq) {
++                        toSend = latest
++                        conn.sentSeq = seq
++                    } else {
++                        lock.wait(30_000)
++                        if (!(conn.alive && running)) return
++                        if (latest != null && conn.sentSeq != seq) {
++                            toSend = latest
++                            conn.sentSeq = seq
++                        } else {
++                            doPing = true
++                        }
++                    }
++                }
++                when {
++                    toSend != null -> {
++                        writeFrame(conn.out, toSend!!)
++                        SystemLogger.info("control: pushed config (epoch=$seq)")
++                    }
++                    doPing -> writeFrame(conn.out, "{\"type\":\"ping\",\"epoch\":$seq}")
++                }
++            }
++        } catch (e: Exception) {
++            conn.alive = false
++            try {
++                conn.socket.close()
++            } catch (ignored: Exception) {}
++        }
++    }
++
++    private fun handleFrame(frame: String) {
++        val msg =
++            try {
++                JSONObject(frame)
++            } catch (e: Exception) {
++                SystemLogger.warning("control: unparseable frame from lib")
++                return
++            }
++        when (msg.optString("type")) {
++            "hello" -> {
++                libHook = if (msg.has("hook")) msg.optString("hook") else null
++                libApi = msg.optInt("androidApi", 0)
++                SystemLogger.info(
++                    "control: lib hello hook=$libHook api=$libApi pid=${msg.optInt("keystorePid", 0)}"
++                )
++            }
++            "ack" ->
++                SystemLogger.info(
++                    "control: ack epoch=${msg.optLong("epoch")} ok=${msg.optBoolean("ok")} " +
++                        "applied=${msg.optInt("profilesApplied")} failed=${msg.optInt("profilesFailed")}"
++                )
++            "pong" -> SystemLogger.verbose("control: pong ${msg.optLong("epoch")}")
++        }
++    }
++
++    // --- framing: [u32 BE length][UTF-8 JSON] -----------------------------------
++
++    private fun writeFrame(out: OutputStream, payload: String) {
++        val bytes = payload.toByteArray(Charsets.UTF_8)
++        require(bytes.size in 1..MAX_FRAME) { "frame length ${bytes.size} out of range" }
++        val hdr =
++            byteArrayOf(
++                (bytes.size ushr 24).toByte(),
++                (bytes.size ushr 16).toByte(),
++                (bytes.size ushr 8).toByte(),
++                bytes.size.toByte(),
++            )
++        synchronized(out) {
++            out.write(hdr)
++            out.write(bytes)
++            out.flush()
++        }
++    }
++
++    private fun readFrame(inp: InputStream): String? {
++        val hdr = ByteArray(4)
++        if (!readFully(inp, hdr)) return null
++        val len =
++            ((hdr[0].toInt() and 0xFF) shl 24) or
++                ((hdr[1].toInt() and 0xFF) shl 16) or
++                ((hdr[2].toInt() and 0xFF) shl 8) or
++                (hdr[3].toInt() and 0xFF)
++        if (len <= 0 || len > MAX_FRAME) return null
++        val body = ByteArray(len)
++        if (!readFully(inp, body)) return null
++        return String(body, Charsets.UTF_8)
++    }
++
++    private fun readFully(inp: InputStream, buf: ByteArray): Boolean {
++        var off = 0
++        while (off < buf.size) {
++            val r = inp.read(buf, off, buf.size - off)
++            if (r <= 0) return false
++            off += r
++        }
++        return true
++    }
++
++    private fun sleep(ms: Long) {
++        try {
++            Thread.sleep(ms)
++        } catch (ignored: InterruptedException) {}
++    }
++}
+diff --git a/app/src/main/java/org/matrix/teesim/DeviceProps.kt b/app/src/main/java/org/matrix/teesim/DeviceProps.kt
+new file mode 100644
+index 0000000..c0eccff
+--- /dev/null
++++ b/app/src/main/java/org/matrix/teesim/DeviceProps.kt
+@@ -0,0 +1,141 @@
++package org.matrix.teesim
++
++import android.os.Build
++import android.os.SystemProperties
++import java.time.LocalDate
++
++/**
++ * Read-only access to system properties plus the integer encodings KeyMint expects: osVersion =
++ * major*10000 + minor*100 + sub; osPatchLevel = YYYYMM; vendor/boot patch levels = YYYYMMDD.
++ * Nothing here reaches the keystore hot path.
++ */
++object DeviceProps {
++
++    fun prop(name: String, def: String = ""): String =
++        try {
++            SystemProperties.get(name, def) ?: def
++        } catch (e: Throwable) {
++            def
++        }
++
++    // --- osVersion --------------------------------------------------------------
++
++    private val osVersionBySdk =
++        mapOf(
++            37 to 170000, // Android 17
++            36 to 160000, // Baklava
++            35 to 150000, // VanillaIceCream
++            34 to 140000, // UpsideDownCake
++            33 to 130000, // Tiramisu
++            32 to 120100, // S_V2
++            31 to 120000, // S
++            30 to 110000, // R
++            29 to 100000, // Q
++        )
++
++    /** A last-resort osVersion derived from the running platform SDK. */
++    fun deviceOsVersion(): Int = osVersionBySdk[Build.VERSION.SDK_INT] ?: 170000
++
++    /** Parse a config osVersion literal: "16", "16.0.0", or an already-encoded int string. */
++    fun parseOsVersion(literal: String): Int? {
++        val s = literal.trim()
++        if (s.isEmpty()) return null
++        // Already an integer encoding such as 160000.
++        if (!s.contains('.') && s.toIntOrNull()?.let { it >= 10000 } == true) return s.toInt()
++        val parts = s.split('.')
++        return try {
++            val major = parts.getOrNull(0)?.toInt() ?: return null
++            val minor = parts.getOrNull(1)?.toIntOrNull() ?: 0
++            val sub = parts.getOrNull(2)?.toIntOrNull() ?: 0
++            major * 10000 + minor * 100 + sub
++        } catch (e: NumberFormatException) {
++            null
++        }
++    }
++
++    // --- patch levels -----------------------------------------------------------
++
++    /** "2025-11-01" (or "20251101") -> 202511. */
++    fun toYyyymm(patch: String): Int? {
++        val n = patch.replace("-", "")
++        return when {
++            n.length >= 6 && n.substring(0, 6).all { it.isDigit() } -> n.substring(0, 6).toInt()
++            else -> null
++        }
++    }
++
++    /** "2025-11-05" (or "2025-11") -> 20251105 (day defaults to 01 when absent). */
++    fun toYyyymmdd(patch: String): Int? {
++        val n = patch.replace("-", "")
++        return try {
++            when (n.length) {
++                8 -> n.toInt()
++                6 -> (n.toInt() * 100) + 1 // YYYYMM -> YYYYMM01
++                else -> null
++            }
++        } catch (e: NumberFormatException) {
++            null
++        }
++    }
++
++    /** The system security patch string, e.g. "2025-11-01". */
++    fun systemSecurityPatch(): String = Build.VERSION.SECURITY_PATCH ?: ""
++
++    fun vendorSecurityPatch(): String =
++        prop("ro.vendor.build.security_patch").ifBlank { systemSecurityPatch() }
++
++    /** Boot has no dedicated build property; use the vendor security patch, the closest real value. */
++    fun bootSecurityPatch(): String = vendorSecurityPatch()
++
++    /** osVersion from getprop (ro.build.version.release), encoded, or null when unavailable. */
++    fun propOsVersion(): Int? = parseOsVersion(prop("ro.build.version.release", Build.VERSION.RELEASE ?: ""))
++
++    /**
++     * Resolve one patch-level component from the config mini-language to its integer encoding, or
++     * null to mean "omit / not reported".
++     *
++     * An empty value reuses the value captured from the real TEE at harvest ([harvested]). Keywords:
++     * `system_property` (the matching build property from getprop, and nothing else), `today` (the
++     * current month/day), `no` (report 0), or an explicit `YYYY-MM` / `YYYY-MM-DD` date. A date may
++     * use the template tokens `YYYY` / `MM` / `DD`, resolved to today, so `YYYY-MM-05` tracks the
++     * calendar.
++     *
++     * An empty harvested value or an absent build property reports nothing — the tag is omitted
++     * rather than sent as a made-up default. component: "system" (YYYYMM), "vendor"/"boot" (YYYYMMDD).
++     */
++    fun resolvePatch(language: String, component: String, harvested: Int?): Int? {
++        val isYmd = component != "system"
++        val v = language.trim()
++        return when {
++            v.isEmpty() -> harvested
++            v.equals("no", true) -> 0
++            v.equals("system_property", true) -> {
++                val prop =
++                    when (component) {
++                        "vendor" -> vendorSecurityPatch()
++                        "boot" -> bootSecurityPatch()
++                        else -> systemSecurityPatch()
++                    }
++                if (isYmd) toYyyymmdd(prop) else toYyyymm(prop)
++            }
++            v.equals("today", true) -> {
++                val now = LocalDate.now()
++                if (isYmd) now.year * 10000 + now.monthValue * 100 + now.dayOfMonth
++                else now.year * 100 + now.monthValue
++            }
++            else -> {
++                val resolved = substituteDateTemplates(v)
++                if (isYmd) toYyyymmdd(resolved) else toYyyymm(resolved)
++            }
++        }
++    }
++
++    /** Replace YYYY / MM / DD tokens with today's zero-padded year / month / day. */
++    private fun substituteDateTemplates(v: String): String {
++        if (!v.contains("YYYY") && !v.contains("MM") && !v.contains("DD")) return v
++        val now = LocalDate.now()
++        return v.replace("YYYY", "%04d".format(now.year))
++            .replace("MM", "%02d".format(now.monthValue))
++            .replace("DD", "%02d".format(now.dayOfMonth))
++    }
++}
+diff --git a/app/src/main/java/org/matrix/teesim/Harvester.kt b/app/src/main/java/org/matrix/teesim/Harvester.kt
+new file mode 100644
+index 0000000..4a36ea2
+--- /dev/null
++++ b/app/src/main/java/org/matrix/teesim/Harvester.kt
+@@ -0,0 +1,659 @@
++package org.matrix.teesim
++
++import android.content.Context
++import android.os.Build
++import android.os.IBinder
++import android.security.keystore.KeyGenParameterSpec
++import android.security.keystore.KeyProperties
++import java.lang.reflect.InvocationTargetException
++import java.security.KeyPairGenerator
++import java.security.KeyStore
++import java.security.MessageDigest
++import java.security.SecureRandom
++import java.security.cert.X509Certificate
++import java.security.spec.ECGenParameterSpec
++import java.util.Base64
++import org.bouncycastle.asn1.ASN1Boolean
++import org.bouncycastle.asn1.ASN1Encodable
++import org.bouncycastle.asn1.ASN1Enumerated
++import org.bouncycastle.asn1.ASN1Integer
++import org.bouncycastle.asn1.ASN1Null
++import org.bouncycastle.asn1.ASN1OctetString
++import org.bouncycastle.asn1.ASN1Sequence
++import org.bouncycastle.asn1.ASN1Set
++import org.bouncycastle.asn1.ASN1TaggedObject
++import org.bouncycastle.asn1.x509.Extension
++import org.bouncycastle.cert.X509CertificateHolder
++import org.json.JSONObject
++
++/**
++ * Harvests real attestation parameters from the device TEE by generating a throwaway attested EC
++ * key and parsing the leaf's KeyDescription extension (OID 1.3.6.1.4.1.11129.2.1.17). Extends the
++ * main-branch harvest with deviceLocked, verifiedBootState and the attestation/keymaster security
++ * levels.
++ *
++ * verifiedBootKey/verifiedBootHash feed KeyMint's key-encryption-key derivation, so they are frozen
++ * on the first successful harvest and never overwritten with a different value (that would orphan
++ * every stored key). The full record is cached to [Const.harvestedFile].
++ */
++object Harvester {
++
++    private const val OID = "1.3.6.1.4.1.11129.2.1.17"
++    private const val CHECK_ALIAS = "TEESimulator_AttestationCheck"
++
++    // KeyDescription SEQUENCE field indices.
++    private const val KD_ATTEST_VERSION = 0
++    private const val KD_ATTEST_SECLEVEL = 1
++    private const val KD_KEYMASTER_VERSION = 2
++    private const val KD_KEYMASTER_SECLEVEL = 3
++    private const val KD_SOFTWARE_ENFORCED = 6
++    private const val KD_TEE_ENFORCED = 7
++
++    // RootOfTrust SEQUENCE field indices.
++    private const val ROT_VERIFIED_BOOT_KEY = 0
++    private const val ROT_DEVICE_LOCKED = 1
++    private const val ROT_VERIFIED_BOOT_STATE = 2
++    private const val ROT_VERIFIED_BOOT_HASH = 3
++
++    // AuthorizationList context tags.
++    private const val TAG_ROOT_OF_TRUST = 704
++    private const val TAG_OS_VERSION = 705
++    private const val TAG_OS_PATCHLEVEL = 706
++    private const val TAG_VENDOR_PATCHLEVEL = 718
++    private const val TAG_BOOT_PATCHLEVEL = 719
++    private const val TAG_MODULE_HASH = 724
++
++    // Attestation-ID tags (device properties). Captured so we can provision them back,
++    // letting an app's device-ID attestation request succeed against the real values.
++    private const val TAG_ATTESTATION_ID_BRAND = 710
++    private const val TAG_ATTESTATION_ID_DEVICE = 711
++    private const val TAG_ATTESTATION_ID_PRODUCT = 712
++    private const val TAG_ATTESTATION_ID_SERIAL = 713
++    private const val TAG_ATTESTATION_ID_IMEI = 714
++    private const val TAG_ATTESTATION_ID_MEID = 715
++    private const val TAG_ATTESTATION_ID_MANUFACTURER = 716
++    private const val TAG_ATTESTATION_ID_MODEL = 717
++    private const val TAG_ATTESTATION_ID_SECOND_IMEI = 723
++
++    /** One harvested (or fallback) device-identity record. */
++    data class Record(
++        val harvestFailed: Boolean,
++        val verifiedBootKey: ByteArray, // 32 bytes, frozen
++        val verifiedBootHash: ByteArray, // 32 bytes, frozen
++        val deviceLocked: Boolean,
++        val verifiedBootState: Int, // 0 Verified,1 SelfSigned,2 Unverified,3 Failed
++        val attestationSecurityLevel: Int, // 0 SW,1 TEE,2 SB
++        val keymasterSecurityLevel: Int,
++        val attestationVersion: Int,
++        val keymasterVersion: Int,
++        val osVersion: Int?, // encoded major*10000+minor*100+sub
++        val osPatchLevel: Int?, // YYYYMM
++        val vendorPatchLevel: Int?, // YYYYMMDD
++        val bootPatchLevel: Int?, // YYYYMMDD
++        val moduleHash: ByteArray?,
++        // Device-identity values captured from the attested leaf (empty when the TEE
++        // does not provision that id). Provisioned back so ID attestation can succeed.
++        val brand: String,
++        val device: String,
++        val product: String,
++        val manufacturer: String,
++        val model: String,
++        val serial: String,
++        val imei: String,
++        val meid: String,
++        val imei2: String,
++        // JSON field names whose value we synthesize (fabricate) for attestation, mapped to
++        // the display value we override them to. The record itself keeps the RAW captured
++        // values; this map lets the WebUI show the overrides separately and honestly.
++        val fabricated: Map<String, String>,
++        val harvestedAt: Long,
++    )
++
++    /**
++     * Load the frozen record if present, attempt a fresh harvest, merge (preserving the frozen boot
++     * key/hash), persist, and return the effective record.
++     */
++    fun run(context: Context): Record {
++        val existing = loadPersisted()
++        val fresh = tryHarvest()
++
++        val effective =
++            when {
++                // A prior good harvest exists: keep its frozen boot key/hash forever.
++                existing != null && !existing.harvestFailed -> {
++                    if (fresh != null && !fresh.harvestFailed) {
++                        // Refresh volatile fields but freeze verifiedBoot* — unless a
++                        // stale all-zero value was frozen before the zero-reject fix,
++                        // in which case adopt the fresh (guaranteed non-zero) one.
++                        fresh.copy(
++                            verifiedBootKey =
++                                if (isReal(existing.verifiedBootKey)) existing.verifiedBootKey
++                                else fresh.verifiedBootKey,
++                            verifiedBootHash =
++                                if (isReal(existing.verifiedBootHash)) existing.verifiedBootHash
++                                else fresh.verifiedBootHash,
++                            fabricated =
++                                fresh.fabricated.filterKeys { k ->
++                                    !(k == "verifiedBootKey" && isReal(existing.verifiedBootKey)) &&
++                                        !(k == "verifiedBootHash" && isReal(existing.verifiedBootHash))
++                                },
++                        )
++                    } else {
++                        existing
++                    }
++                }
++                // No frozen record yet.
++                fresh != null && !fresh.harvestFailed -> fresh
++                // Harvest failed and nothing frozen: fabricate a stable fallback.
++                else -> existing?.takeIf { !it.harvestFailed } ?: fallback()
++            }
++
++        val enriched = supplementDeviceIds(effective)
++        persist(enriched)
++        SystemLogger.info(
++            "Harvest complete: failed=${enriched.harvestFailed} " +
++                "bootKey=${effective.verifiedBootKey.toHex()} " +
++                "locked=${effective.deviceLocked} vbState=${effective.verifiedBootState} " +
++                "attestSecLevel=${effective.attestationSecurityLevel} " +
++                "os=${effective.osVersion} osPatch=${effective.osPatchLevel} " +
++                "vendorPatch=${enriched.vendorPatchLevel} bootPatch=${enriched.bootPatchLevel}"
++        )
++        return enriched
++    }
++
++    // A system package name to present as the caller for IPhoneSubInfo. The legacy getDeviceId* path
++    // returns the real IMEI for any package (unlike getImei*, which validates it against the caller uid).
++    private const val TELEPHONY_CALLER_PKG = "android"
++
++    /**
++     * Fill in the device ids that device-properties attestation does not carry — IMEI, MEID, serial — so
++     * the reference TA's ID check passes when an app requests the device's true values.
++     *
++     * The bare app_process never initialized the telephony framework (so `TelephonyManager.getImei()`
++     * hits a null service registerer), and `getImei()`/`getImeiForSlot()` additionally enforce a
++     * "package belongs to caller uid" check we can't satisfy as root (uid 0). So we go straight to the
++     * `IPhoneSubInfo` binder and use the legacy `getDeviceId*` calls, which return the real IMEI
++     * regardless of the calling package — confirmed on-device. Serial comes from `Build.getSerial()`
++     * when permitted, otherwise the `ro.serialno` property.
++     */
++    private fun supplementDeviceIds(r: Record): Record {
++        val imei = r.imei.ifBlank { deviceIdForPhone(0) }
++        var imei2 = r.imei2.ifBlank { deviceIdForPhone(1) }
++        if (imei2.isNotBlank() && imei2 == imei) imei2 = "" // single-SIM: slot 1 mirrors slot 0
++        val meid = r.meid.ifBlank { safeId("getMeidForSubscriber(0)") { phoneSubInfoId("getMeidForSubscriber", 0) } }
++        val serial =
++            r.serial.ifBlank { safeId("Build.getSerial()") { Build.getSerial() } }
++                .ifBlank { DeviceProps.prop("ro.serialno", "") }
++        SystemLogger.info(
++            "Harvest telephony IDs: imei='$imei' secondImei='$imei2' meid='$meid' serial='$serial'"
++        )
++        return r.copy(imei = imei, imei2 = imei2, meid = meid, serial = serial)
++    }
++
++    /** The IMEI for a SIM slot, read via IPhoneSubInfo.getDeviceIdForPhone (works even for uid 0). */
++    private fun deviceIdForPhone(slot: Int): String =
++        safeId("getDeviceIdForPhone($slot)") { phoneSubInfoId("getDeviceIdForPhone", slot) }
++
++    @Volatile private var phoneSubInfo: Any? = null
++
++    /**
++     * Invoke a String-returning IPhoneSubInfo method (e.g. getDeviceIdForPhone, getMeidForSubscriber)
++     * for a SIM slot. The service is reached straight through ServiceManager — no TelephonyManager, no
++     * framework init needed — and any String parameters (callingPackage/featureId) are filled with a
++     * system package name. All by reflection, since IPhoneSubInfo is a hidden interface.
++     */
++    private fun phoneSubInfoId(methodName: String, slot: Int): String? {
++        val svc =
++            phoneSubInfo
++                ?: run {
++                    val sm = Class.forName("android.os.ServiceManager")
++                    val binder =
++                        sm.getMethod("getService", String::class.java).invoke(null, "iphonesubinfo")
++                            as? IBinder ?: return null
++                    val stub = Class.forName("com.android.internal.telephony.IPhoneSubInfo\$Stub")
++                    stub.getMethod("asInterface", IBinder::class.java).invoke(null, binder).also {
++                        phoneSubInfo = it
++                    }
++                }
++        val method =
++            Class.forName("com.android.internal.telephony.IPhoneSubInfo").methods.firstOrNull {
++                it.name == methodName && it.parameterTypes.firstOrNull() == Int::class.javaPrimitiveType
++            } ?: return null
++        val args: List<Any?> =
++            method.parameterTypes.map { t ->
++                when (t) {
++                    Int::class.javaPrimitiveType -> slot
++                    String::class.java -> TELEPHONY_CALLER_PKG
++                    else -> return null
++                }
++            }
++        return method.invoke(svc, *args.toTypedArray()) as? String
++    }
++
++    /** A device id read that never throws or returns a placeholder — "" on any failure, logged. */
++    private inline fun safeId(what: String, block: () -> String?): String =
++        try {
++            val v = block()?.takeIf { it.isNotBlank() && !it.equals("null", true) } ?: ""
++            if (v.isBlank()) SystemLogger.info("Harvest telephony: $what returned empty")
++            v
++        } catch (e: Exception) {
++            val cause = (e as? InvocationTargetException)?.targetException ?: e
++            SystemLogger.warning("Harvest telephony: $what failed: ${cause.javaClass.simpleName}: ${cause.message}")
++            ""
++        }
++
++    // --- live harvest -----------------------------------------------------------
++
++    private fun tryHarvest(): Record? {
++        val leaf = generateAndFetchLeaf() ?: return null
++        return try {
++            parse(leaf)
++        } catch (e: Exception) {
++            SystemLogger.error("Failed to parse harvested attestation", e)
++            null
++        }
++    }
++
++    /**
++     * One harvested leaf: try a device-properties attestation first (so we capture the real
++     * brand/model/… ids), fall back to a plain attestation if the TEE rejects that, and return null
++     * only when both fail — which [run] then reports as a broken TEE.
++     */
++    private fun generateAndFetchLeaf(): X509Certificate? =
++        tryLeaf(withDeviceIds = true) ?: tryLeaf(withDeviceIds = false)
++
++    private fun tryLeaf(withDeviceIds: Boolean): X509Certificate? {
++        return try {
++            val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
++            val gen =
++                KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore")
++            val challenge = ByteArray(16).also { SecureRandom().nextBytes(it) }
++            val builder =
++                KeyGenParameterSpec.Builder(CHECK_ALIAS, KeyProperties.PURPOSE_SIGN)
++                    .setAlgorithmParameterSpec(ECGenParameterSpec("secp256r1"))
++                    .setDigests(KeyProperties.DIGEST_SHA256)
++                    .setAttestationChallenge(challenge)
++            if (withDeviceIds && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
++                builder.setDevicePropertiesAttestationIncluded(true)
++            }
++            gen.initialize(builder.build())
++            gen.generateKeyPair()
++
++            val chain = ks.getCertificateChain(CHECK_ALIAS)
++            ks.deleteEntry(CHECK_ALIAS) // always clean up
++            if (chain.isNullOrEmpty()) {
++                if (!withDeviceIds) SystemLogger.warning("Harvest: empty certificate chain (no working TEE?)")
++                null
++            } else {
++                chain[0] as X509Certificate
++            }
++        } catch (e: Exception) {
++            if (withDeviceIds) {
++                SystemLogger.info("Harvest: device-properties attestation failed; retrying plain (${e.message})")
++            } else {
++                SystemLogger.warning("Harvest: attested key generation failed (no working TEE?)", e)
++            }
++            try {
++                KeyStore.getInstance("AndroidKeyStore")
++                    .apply { load(null) }
++                    .deleteEntry(CHECK_ALIAS)
++            } catch (ignored: Exception) {}
++            null
++        }
++    }
++
++    private fun parse(leaf: X509Certificate): Record {
++        val holder = X509CertificateHolder(leaf.encoded)
++        val ext: Extension =
++            holder.getExtension(org.bouncycastle.asn1.ASN1ObjectIdentifier(OID))
++                ?: throw IllegalStateException("no attestation extension in leaf")
++
++        val kd = ASN1Sequence.getInstance(ext.extnValue.octets)
++        val fields = kd.toArray()
++
++        val attestVersion = ASN1Integer.getInstance(fields[KD_ATTEST_VERSION]).positiveValue.toInt()
++        val attestSecLevel = ASN1Enumerated.getInstance(fields[KD_ATTEST_SECLEVEL]).value.toInt()
++        val keymasterVersion =
++            ASN1Integer.getInstance(fields[KD_KEYMASTER_VERSION]).positiveValue.toInt()
++        val keymasterSecLevel =
++            ASN1Enumerated.getInstance(fields[KD_KEYMASTER_SECLEVEL]).value.toInt()
++
++        var verifiedBootKey: ByteArray? = null
++        var verifiedBootHash: ByteArray? = null
++        var deviceLocked = true
++        var verifiedBootState = 0
++        var osVersion: Int? = null
++        var osPatchLevel: Int? = null
++        var vendorPatchLevel: Int? = null
++        var bootPatchLevel: Int? = null
++        var moduleHash: ByteArray? = null
++
++        // moduleHash may live in softwareEnforced.
++        val sw = ASN1Sequence.getInstance(fields[KD_SOFTWARE_ENFORCED])
++        moduleHash =
++            sw.toArray()
++                .firstOrNull { (it as? ASN1TaggedObject)?.tagNo == TAG_MODULE_HASH }
++                ?.let { ASN1OctetString.getInstance((it as ASN1TaggedObject).baseObject).octets }
++
++        val tee = ASN1Sequence.getInstance(fields[KD_TEE_ENFORCED])
++        tee.forEach { element ->
++            val tagged = element as ASN1TaggedObject
++            when (tagged.tagNo) {
++                TAG_ROOT_OF_TRUST -> {
++                    val rot = ASN1Sequence.getInstance(tagged.baseObject.toASN1Primitive())
++                    if (rot.size() >= 4) {
++                        verifiedBootKey =
++                            ASN1OctetString.getInstance(rot.getObjectAt(ROT_VERIFIED_BOOT_KEY))
++                                .octets
++                        deviceLocked =
++                            ASN1Boolean.getInstance(rot.getObjectAt(ROT_DEVICE_LOCKED)).isTrue
++                        verifiedBootState =
++                            ASN1Enumerated.getInstance(rot.getObjectAt(ROT_VERIFIED_BOOT_STATE))
++                                .value
++                                .toInt()
++                        verifiedBootHash =
++                            ASN1OctetString.getInstance(rot.getObjectAt(ROT_VERIFIED_BOOT_HASH))
++                                .octets
++                    }
++                }
++                TAG_OS_VERSION -> osVersion = intOf(tagged)
++                TAG_OS_PATCHLEVEL -> osPatchLevel = intOf(tagged)
++                TAG_VENDOR_PATCHLEVEL -> vendorPatchLevel = intOf(tagged)
++                TAG_BOOT_PATCHLEVEL -> bootPatchLevel = intOf(tagged)
++            }
++        }
++
++        val fab = mutableMapOf<String, String>()
++        // Always attest a locked, Verified device (an unlocked / unverified state fails
++        // attestation by construction). The record keeps the RAW captured values; these two
++        // are fabricated only when the device's real value differs — a genuinely locked,
++        // Verified device reports them captured, so the map stays empty for them.
++        if (!deviceLocked) fab["deviceLocked"] = "true"
++        if (verifiedBootState != 0) fab["verifiedBootState"] = "Verified (0)"
++
++        // Device-identity ids parsed per tag. An empty value means the tag was ABSENT from the leaf —
++        // device-properties attestation omits imei/meid/serial — not a parse failure.
++        val brand = idFrom(sw, tee, TAG_ATTESTATION_ID_BRAND)
++        val device = idFrom(sw, tee, TAG_ATTESTATION_ID_DEVICE)
++        val product = idFrom(sw, tee, TAG_ATTESTATION_ID_PRODUCT)
++        val manufacturer = idFrom(sw, tee, TAG_ATTESTATION_ID_MANUFACTURER)
++        val model = idFrom(sw, tee, TAG_ATTESTATION_ID_MODEL)
++        val serial = idFrom(sw, tee, TAG_ATTESTATION_ID_SERIAL)
++        val imei = idFrom(sw, tee, TAG_ATTESTATION_ID_IMEI)
++        val meid = idFrom(sw, tee, TAG_ATTESTATION_ID_MEID)
++        val imei2 = idFrom(sw, tee, TAG_ATTESTATION_ID_SECOND_IMEI)
++        SystemLogger.info("Harvest: device reports locked=$deviceLocked vbState=$verifiedBootState; attesting locked/Verified")
++        // The whole KeyDescription decoded onto one line — every field, and every key parameter in the
++        // softwareEnforced/teeEnforced authorization lists, as tag-and-value. This is the ground truth
++        // to check a captured id (e.g. the IMEI tag) against, independent of the per-field parsing above.
++        SystemLogger.info(
++            "Harvest leaf KeyDescription: " + kd.joinToString(separator = ", ") { formatAsn1Primitive(it) }
++        )
++        return Record(
++            harvestFailed = false,
++            verifiedBootKey =
++                resolveBoot(verifiedBootKey, "ro.boot.vbmeta.public_key_digest", ::fallbackBootKey, fab, "verifiedBootKey"),
++            verifiedBootHash =
++                resolveBoot(verifiedBootHash, "ro.boot.vbmeta.digest", ::fallbackBootHash, fab, "verifiedBootHash"),
++            deviceLocked = deviceLocked,
++            verifiedBootState = verifiedBootState,
++            attestationSecurityLevel = attestSecLevel,
++            keymasterSecurityLevel = keymasterSecLevel,
++            attestationVersion = attestVersion,
++            keymasterVersion = keymasterVersion,
++            osVersion = osVersion,
++            osPatchLevel = osPatchLevel,
++            vendorPatchLevel = vendorPatchLevel,
++            bootPatchLevel = bootPatchLevel,
++            moduleHash = moduleHash,
++            brand = brand,
++            device = device,
++            product = product,
++            manufacturer = manufacturer,
++            model = model,
++            serial = serial,
++            imei = imei,
++            meid = meid,
++            imei2 = imei2,
++            fabricated = fab,
++            harvestedAt = System.currentTimeMillis(),
++        )
++    }
++
++    private fun intOf(t: ASN1TaggedObject): Int =
++        ASN1Integer.getInstance(t.baseObject.toASN1Primitive()).positiveValue.toInt()
++
++    /**
++     * Recursively formats any ASN.1 value into one concise, readable token: integers/enumerated as
++     * their number, an octet string as "text" when printable else #hex, a tagged object as
++     * [TAG n]<inner>, a sequence as [ … ], a set as { … }. Applied over a KeyDescription it renders
++     * the entire authorization list — every key parameter — on a single log line.
++     */
++    private fun formatAsn1Primitive(obj: ASN1Encodable?): String {
++        return when (val primitive = obj?.toASN1Primitive()) {
++            null -> "NULL"
++            is ASN1Integer -> primitive.value.toString()
++            is ASN1Enumerated -> primitive.value.toString()
++            is ASN1Boolean -> primitive.isTrue.toString()
++            is ASN1Null -> "NULL"
++            is ASN1OctetString -> {
++                val bytes = primitive.octets
++                when {
++                    bytes.isEmpty() -> "\"\""
++                    bytes.all { it >= 32 && it < 127 } -> "\"${String(bytes, Charsets.UTF_8)}\""
++                    else -> "#" + bytes.toHex()
++                }
++            }
++            is ASN1TaggedObject -> "[TAG ${primitive.tagNo}]${formatAsn1Primitive(primitive.baseObject)}"
++            is ASN1Sequence ->
++                primitive.map { formatAsn1Primitive(it) }.joinToString(prefix = "[", postfix = "]", separator = ", ")
++            is ASN1Set ->
++                primitive.map { formatAsn1Primitive(it) }.joinToString(prefix = "{", postfix = "}", separator = ", ")
++            else -> primitive.toString()
++        }
++    }
++
++    /** The UTF-8 value of an attestation-ID tag, searching both enforced lists, or "". */
++    private fun idFrom(sw: ASN1Sequence, tee: ASN1Sequence, tag: Int): String {
++        for (seq in listOf(sw, tee)) {
++            val el = seq.toArray().firstOrNull { (it as? ASN1TaggedObject)?.tagNo == tag } ?: continue
++            return try {
++                String(
++                    ASN1OctetString.getInstance((el as ASN1TaggedObject).baseObject).octets,
++                    Charsets.UTF_8,
++                )
++            } catch (e: Exception) {
++                ""
++            }
++        }
++        return ""
++    }
++
++    /** A device-identity value from a system property, falling back to the Build constant. */
++    private fun buildId(prop: String, fallback: String?): String =
++        DeviceProps.prop(prop, "").ifBlank { fallback ?: "" }
++
++    /**
++     * Resolve a verified-boot value: prefer a real, non-zero 32-byte value from the
++     * attested leaf; else the device's vbmeta digest property; else a deterministic
++     * stable fallback. Never all-zeros — that is what an unlocked device reports and
++     * it fails attestation.
++     */
++    private fun resolveBoot(
++        harvested: ByteArray?,
++        prop: String,
++        fallback: () -> ByteArray,
++        fabricated: MutableMap<String, String>,
++        name: String,
++    ): ByteArray {
++        if (isReal(harvested)) return harvested!!
++        hexBytes(DeviceProps.prop(prop, ""))?.let {
++            return it
++        }
++        val synthesized = fallback()
++        fabricated[name] = synthesized.toHex()
++        return synthesized
++    }
++
++    /** A usable boot value: exactly 32 bytes and not all zero. */
++    private fun isReal(v: ByteArray?): Boolean = v != null && v.size == 32 && v.any { it.toInt() != 0 }
++
++    /** Parse 64 hex chars into 32 non-zero bytes, or null. */
++    private fun hexBytes(s: String): ByteArray? {
++        val h = s.trim().removePrefix("0x")
++        if (h.length != 64 || h.any { it !in '0'..'9' && it !in 'a'..'f' && it !in 'A'..'F' }) return null
++        val out =
++            ByteArray(32) { ((h[it * 2].digitToInt(16) shl 4) or h[it * 2 + 1].digitToInt(16)).toByte() }
++        return if (out.any { it.toInt() != 0 }) out else null
++    }
++
++    // --- fallback (no working TEE) ---------------------------------------------
++
++    private fun fallback(): Record {
++        SystemLogger.warning("Harvest failed; using fixed non-zero boot key + Build.VERSION props")
++        val osVersion = DeviceProps.deviceOsVersion()
++        val osPatchLevel = DeviceProps.toYyyymm(DeviceProps.systemSecurityPatch())
++        val vendorPatchLevel = DeviceProps.toYyyymmdd(DeviceProps.vendorSecurityPatch())
++        val bootPatchLevel = DeviceProps.toYyyymmdd(DeviceProps.vendorSecurityPatch())
++        return Record(
++            harvestFailed = true,
++            verifiedBootKey = fallbackBootKey(),
++            verifiedBootHash = fallbackBootHash(),
++            deviceLocked = true,
++            verifiedBootState = 0, // Verified
++            attestationSecurityLevel = Const.SECLEVEL_TEE,
++            keymasterSecurityLevel = Const.SECLEVEL_TEE,
++            attestationVersion = 300,
++            keymasterVersion = 300,
++            osVersion = osVersion,
++            osPatchLevel = osPatchLevel,
++            vendorPatchLevel = vendorPatchLevel,
++            bootPatchLevel = bootPatchLevel,
++            moduleHash = null,
++            brand = buildId("ro.product.brand", Build.BRAND),
++            device = buildId("ro.product.device", Build.DEVICE),
++            product = buildId("ro.product.name", Build.PRODUCT),
++            manufacturer = buildId("ro.product.manufacturer", Build.MANUFACTURER),
++            model = buildId("ro.product.model", Build.MODEL),
++            serial = DeviceProps.prop("ro.serialno", ""),
++            imei = "",
++            meid = "",
++            imei2 = "",
++            // No working TEE: every attestation-critical value is synthesized.
++            fabricated =
++                mapOf(
++                    "deviceLocked" to "true",
++                    "verifiedBootState" to "Verified (0)",
++                    "verifiedBootKey" to fallbackBootKey().toHex(),
++                    "verifiedBootHash" to fallbackBootHash().toHex(),
++                    "osVersion" to osVersion.toString(),
++                    "osPatchLevel" to osPatchLevel.toString(),
++                    "vendorPatchLevel" to vendorPatchLevel.toString(),
++                    "bootPatchLevel" to bootPatchLevel.toString(),
++                ),
++            harvestedAt = System.currentTimeMillis(),
++        )
++    }
++
++    // Deterministic, non-zero, stable across runs so the fallback KEK is also stable.
++    private fun fallbackBootKey(): ByteArray = sha256("TEESimulator/verified_boot_key")
++
++    private fun fallbackBootHash(): ByteArray = sha256("TEESimulator/verified_boot_hash")
++
++    private fun sha256(s: String): ByteArray =
++        MessageDigest.getInstance("SHA-256").digest(s.toByteArray())
++
++    // --- persistence ------------------------------------------------------------
++
++    private fun loadPersisted(): Record? {
++        val f = Const.harvestedFile
++        if (!f.exists()) return null
++        return try {
++            fromJson(JSONObject(f.readText()))
++        } catch (e: Exception) {
++            SystemLogger.warning("Could not read harvested.json; ignoring", e)
++            null
++        }
++    }
++
++    private fun persist(r: Record) {
++        try {
++            Const.harvestedFile.parentFile?.mkdirs()
++            Const.harvestedFile.writeText(toJson(r).toString(2))
++        } catch (e: Exception) {
++            SystemLogger.error("Failed to write harvested.json", e)
++        }
++    }
++
++    private val b64 = Base64.getEncoder()
++    private val b64d = Base64.getDecoder()
++
++    fun toJson(r: Record): JSONObject =
++        JSONObject().apply {
++            put("version", 1)
++            put("harvestFailed", r.harvestFailed)
++            put("frozen", !r.harvestFailed)
++            put("verifiedBootKey", b64.encodeToString(r.verifiedBootKey))
++            put("verifiedBootHash", b64.encodeToString(r.verifiedBootHash))
++            put("deviceLocked", r.deviceLocked)
++            put("verifiedBootState", r.verifiedBootState)
++            put("attestationSecurityLevel", r.attestationSecurityLevel)
++            put("keymasterSecurityLevel", r.keymasterSecurityLevel)
++            put("attestationVersion", r.attestationVersion)
++            put("keymasterVersion", r.keymasterVersion)
++            put("osVersion", r.osVersion ?: JSONObject.NULL)
++            put("osPatchLevel", r.osPatchLevel ?: JSONObject.NULL)
++            put("vendorPatchLevel", r.vendorPatchLevel ?: JSONObject.NULL)
++            put("bootPatchLevel", r.bootPatchLevel ?: JSONObject.NULL)
++            put("moduleHash", r.moduleHash?.let { b64.encodeToString(it) } ?: JSONObject.NULL)
++            put("brand", r.brand)
++            put("device", r.device)
++            put("product", r.product)
++            put("manufacturer", r.manufacturer)
++            put("model", r.model)
++            put("serial", r.serial)
++            put("imei", r.imei)
++            put("meid", r.meid)
++            put("imei2", r.imei2)
++            put("fabricated", JSONObject(r.fabricated as Map<*, *>))
++            put("harvestedAt", r.harvestedAt)
++        }
++
++    private fun fromJson(o: JSONObject): Record =
++        Record(
++            harvestFailed = o.optBoolean("harvestFailed", false),
++            verifiedBootKey = b64d.decode(o.getString("verifiedBootKey")),
++            verifiedBootHash = b64d.decode(o.getString("verifiedBootHash")),
++            deviceLocked = o.optBoolean("deviceLocked", true),
++            verifiedBootState = o.optInt("verifiedBootState", 0),
++            attestationSecurityLevel = o.optInt("attestationSecurityLevel", Const.SECLEVEL_TEE),
++            keymasterSecurityLevel = o.optInt("keymasterSecurityLevel", Const.SECLEVEL_TEE),
++            attestationVersion = o.optInt("attestationVersion", 300),
++            keymasterVersion = o.optInt("keymasterVersion", 300),
++            osVersion = o.optIntOrNull("osVersion"),
++            osPatchLevel = o.optIntOrNull("osPatchLevel"),
++            vendorPatchLevel = o.optIntOrNull("vendorPatchLevel"),
++            bootPatchLevel = o.optIntOrNull("bootPatchLevel"),
++            moduleHash = o.optStringOrNull("moduleHash")?.let { b64d.decode(it) },
++            brand = o.optString("brand", ""),
++            device = o.optString("device", ""),
++            product = o.optString("product", ""),
++            manufacturer = o.optString("manufacturer", ""),
++            model = o.optString("model", ""),
++            serial = o.optString("serial", ""),
++            imei = o.optString("imei", ""),
++            meid = o.optString("meid", ""),
++            imei2 = o.optString("imei2", ""),
++            fabricated =
++                o.optJSONObject("fabricated")?.let { obj ->
++                    obj.keys().asSequence().associateWith { obj.getString(it) }
++                } ?: emptyMap(),
++            harvestedAt = o.optLong("harvestedAt", System.currentTimeMillis()),
++        )
++
++    private fun JSONObject.optIntOrNull(k: String): Int? =
++        if (isNull(k) || !has(k)) null else optInt(k)
++
++    private fun JSONObject.optStringOrNull(k: String): String? =
++        if (isNull(k) || !has(k)) null else optString(k)
++}
+diff --git a/app/src/main/java/org/matrix/teesim/Injector.kt b/app/src/main/java/org/matrix/teesim/Injector.kt
+new file mode 100644
+index 0000000..a73a586
+--- /dev/null
++++ b/app/src/main/java/org/matrix/teesim/Injector.kt
+@@ -0,0 +1,149 @@
++package org.matrix.teesim
++
++import android.os.Build
++import java.io.File
++
++/**
++ * Finds the keystore daemon and drives the packaged `inject` binary to load the right interceptor
++ * into it: `inject <pid> <lib.so> entry`. On Android 12+ the target is keystore2 with
++ * libteesim_keymint.so; on 10/11 it is keystore with libteesim_keystore.so. Re-injects whenever the
++ * daemon restarts (new pid).
++ */
++class Injector(private val moduleDir: File) {
++
++    private val api = Build.VERSION.SDK_INT
++    private val procName = if (api >= 31) "keystore2" else "keystore"
++    private val libName = if (api >= 31) "libteesim_keymint.so" else "libteesim_keystore.so"
++
++    private val abi: String =
++        Build.SUPPORTED_ABIS?.firstOrNull() ?: DeviceProps.prop("ro.product.cpu.abi", "arm64-v8a")
++
++    private val injectBin = File(moduleDir, "$abi/inject")
++    private val libFile = File(moduleDir, "$abi/$libName")
++
++    @Volatile private var running = false
++    @Volatile private var lastPid = -1
++
++    fun start() {
++        if (running) return
++        running = true
++        if (!injectBin.exists() || !libFile.exists()) {
++            SystemLogger.error(
++                "injector: missing artifacts (inject=${injectBin.exists()} lib=${libFile.exists()}) " +
++                    "under ${moduleDir.absolutePath}/$abi"
++            )
++        }
++        injectBin.setExecutable(true, false)
++        Thread({ loop() }, "teesim-injector").apply {
++            isDaemon = true
++            start()
++        }
++    }
++
++    private fun loop() {
++        SystemLogger.info("injector: watching $procName (abi=$abi lib=$libName)")
++        var failures = 0
++        while (running) {
++            val pid = findPid(procName)
++            // Tell the log tail which process to capture, so the Logs panel shows the
++            // target keystore's own output — even before we manage to inject it.
++            LogTail.targetPid = if (pid > 0) pid else -1
++            if (pid > 0 && pid != lastPid && serviceReady()) {
++                if (inject(pid)) {
++                    lastPid = pid
++                    failures = 0
++                    SystemLogger.info("injector: injected into $procName pid=$pid")
++                    confirmAsync(pid)
++                } else {
++                    failures++
++                    SystemLogger.warning("injector: injection into pid=$pid failed; will retry")
++                }
++            } else if (pid <= 0) {
++                lastPid = -1 // process gone; force re-inject when it returns
++            }
++            // Back off when injection keeps failing so we don't hammer a wedged keystore.
++            sleep(if (failures > 3) 10000 else 2000)
++        }
++    }
++
++    /** keystore forks before it registers its binder; wait for the service so we don't
++     * inject into a half-initialised process. */
++    private fun serviceReady(): Boolean {
++        val name =
++            if (api >= 31) "android.system.keystore2.IKeystoreService/default"
++            else "android.security.keystore"
++        return try {
++            android.os.ServiceManager.getService(name) != null
++        } catch (e: Throwable) {
++            true // can't check (stub / older API): don't block injection
++        }
++    }
++
++    /** The control-channel hello is the real proof the lib loaded and bound @teesim. Warn
++     * (don't re-inject — that risks double-hooking) if it never arrives. */
++    private fun confirmAsync(pid: Int) {
++        Thread({
++                for (i in 0 until 24) { // ~12s
++                    if (Control.libApi != 0) return@Thread
++                    sleep(500)
++                }
++                SystemLogger.warning(
++                    "injector: injected pid=$pid but the lib never checked in over @teesim " +
++                        "(SELinux on the abstract socket? look for 'avc: denied' in logcat)"
++                )
++            }, "teesim-inject-confirm")
++            .apply {
++                isDaemon = true
++                start()
++            }
++    }
++
++    private fun inject(pid: Int): Boolean {
++        return try {
++            val proc =
++                ProcessBuilder(
++                        injectBin.absolutePath,
++                        pid.toString(),
++                        libFile.absolutePath,
++                        "entry",
++                    )
++                    .redirectErrorStream(true)
++                    .start()
++            val output = proc.inputStream.bufferedReader().readText()
++            val code = proc.waitFor()
++            if (code != 0) SystemLogger.warning("injector: inject exit=$code output=$output")
++            code == 0
++        } catch (e: Exception) {
++            SystemLogger.error("injector: failed to run inject binary", e)
++            false
++        }
++    }
++
++    /** Return the pid whose /proc/<pid>/cmdline basename matches [name], else -1. */
++    private fun findPid(name: String): Int {
++        val proc = File("/proc")
++        val entries =
++            proc.listFiles { f -> f.isDirectory && f.name.all { it.isDigit() } } ?: return -1
++        for (dir in entries) {
++            val cmdlineFile = File(dir, "cmdline")
++            val cmd =
++                try {
++                    cmdlineFile.readBytes()
++                } catch (e: Exception) {
++                    continue
++                }
++            if (cmd.isEmpty()) continue
++            val end = cmd.indexOf(0.toByte()).let { if (it < 0) cmd.size else it }
++            val arg0 = String(cmd, 0, end)
++            val base = arg0.substringAfterLast('/')
++            if (base == name) return dir.name.toIntOrNull() ?: continue
++        }
++        return -1
++    }
++
++    private fun sleep(ms: Long) {
++        try {
++            Thread.sleep(ms)
++        } catch (ignored: InterruptedException) {}
++    }
++}
+diff --git a/app/src/main/java/org/matrix/teesim/KeyAdmin.kt b/app/src/main/java/org/matrix/teesim/KeyAdmin.kt
+new file mode 100644
+index 0000000..bc71c1a
+--- /dev/null
++++ b/app/src/main/java/org/matrix/teesim/KeyAdmin.kt
+@@ -0,0 +1,492 @@
++package org.matrix.teesim
++
++import android.os.Build
++import android.security.keystore.KeyInfo
++import java.io.BufferedReader
++import java.io.InputStreamReader
++import java.io.OutputStream
++import java.net.InetAddress
++import java.net.ServerSocket
++import java.net.Socket
++import java.security.KeyFactory
++import java.security.KeyStore
++import java.security.PrivateKey
++import java.security.SecureRandom
++import java.security.cert.X509Certificate
++import java.security.interfaces.ECPublicKey
++import java.security.interfaces.RSAPublicKey
++import java.util.Base64
++import org.bouncycastle.asn1.ASN1Boolean
++import org.bouncycastle.asn1.ASN1Enumerated
++import org.bouncycastle.asn1.ASN1Integer
++import org.bouncycastle.asn1.ASN1ObjectIdentifier
++import org.bouncycastle.asn1.ASN1OctetString
++import org.bouncycastle.asn1.ASN1Sequence
++import org.bouncycastle.asn1.ASN1Set
++import org.bouncycastle.asn1.ASN1TaggedObject
++import org.bouncycastle.cert.X509CertificateHolder
++import org.json.JSONArray
++import org.json.JSONObject
++
++/**
++ * Key-management endpoint the WebUI calls to list / inspect / delete AndroidKeyStore entries the
++ * daemon (a real root Context) can reach. Minimal HTTP/1.1 on loopback, guarded by a random token
++ * written to [Const.adminTokenFile] (0600) — only root (the WebUI's manager bridge) can read the
++ * token, so other apps on the device can't drive it.
++ *
++ * Contract (all responses application/json; send header `X-Teesim-Token: <token>`): GET /status ->
++ * { ok, harvest{...}, lib{hook,api} } GET /keys -> { ok, keys:[ {alias, securityLevel, ours,
++ * cert{...}} ] } GET /keys/db -> { ok, available, apiLevel, keys:[ {id, alias, uid, package, state,
++ * created?, keybox?, keyAlgorithm?} ] } (the keys THIS MODULE minted for target apps, from keystore2's DB
++ * on API >= 31; empty + available=false on 10/11 where there is no such database) POST
++ * /keys/db/delete?ids=1,2,3 -> { ok, deleted, requested } (removes those keyentry ids from keystore2,
++ * marker- and target-verified) GET /keys/inspect?alias=A -> { ok, alias, attestation{...} | null }
++ * POST /keys/delete?alias=A -> { ok, deleted } GET /logs?after=N&max=M
++ * -> { ok, lines:[{seq,level,tag,text}], nextAfter } GET /keybox/inspect?name=F -> { ok, name,
++ * deviceId, keys:[{algorithm, privateKeyPresent, chainLength, linkage, certs:[{...}]}] } GET /canary ->
++ * { ok, currentCode, latest{...}|null, updateAvailable } POST /canary/install?tag=&variant= -> { ok,
++ * message }
++ */
++object KeyAdmin {
++
++    private const val ATTEST_OID = "1.3.6.1.4.1.11129.2.1.17"
++    private val b64 = Base64.getEncoder()
++
++    @Volatile private var token: String = ""
++    @Volatile private var harvest: Harvester.Record? = null
++
++    fun start(record: Harvester.Record) {
++        harvest = record
++        token = newToken()
++        try {
++            Const.adminTokenFile.parentFile?.mkdirs()
++            Const.adminTokenFile.writeText(token)
++            Const.adminTokenFile.setReadable(false, false)
++            Const.adminTokenFile.setReadable(true, true) // owner (root) only
++        } catch (e: Exception) {
++            SystemLogger.error("KeyAdmin: failed to write admin token", e)
++        }
++        LogTail.start()
++        Thread({ serve() }, "teesim-keyadmin").apply {
++            isDaemon = true
++            start()
++        }
++    }
++
++    private fun newToken(): String {
++        val b = ByteArray(24)
++        SecureRandom().nextBytes(b)
++        return b.joinToString("") { "%02x".format(it) }
++    }
++
++    private fun serve() {
++        val server =
++            try {
++                ServerSocket(Const.ADMIN_PORT, 8, InetAddress.getByName("127.0.0.1"))
++            } catch (e: Exception) {
++                SystemLogger.error("KeyAdmin: cannot bind 127.0.0.1:${Const.ADMIN_PORT}", e)
++                return
++            }
++        SystemLogger.info("KeyAdmin: listening on 127.0.0.1:${Const.ADMIN_PORT}")
++        while (true) {
++            try {
++                val client = server.accept()
++                handle(client)
++            } catch (e: Exception) {
++                SystemLogger.warning("KeyAdmin: accept/handle error", e)
++            }
++        }
++    }
++
++    private fun handle(client: Socket) {
++        client.use {
++            val reader = BufferedReader(InputStreamReader(client.getInputStream(), Charsets.UTF_8))
++            val out = client.getOutputStream()
++
++            val requestLine = reader.readLine() ?: return
++            val parts = requestLine.split(" ")
++            if (parts.size < 2) {
++                respond(out, 400, JSONObject().put("ok", false).put("error", "bad request"))
++                return
++            }
++            val method = parts[0]
++            val rawPath = parts[1]
++
++            var headerToken: String? = null
++            while (true) {
++                val line = reader.readLine() ?: break
++                if (line.isEmpty()) break
++                val idx = line.indexOf(':')
++                if (idx > 0 && line.substring(0, idx).trim().equals("X-Teesim-Token", true)) {
++                    headerToken = line.substring(idx + 1).trim()
++                }
++            }
++
++            if (method == "OPTIONS") { // CORS preflight
++                respond(out, 204, null)
++                return
++            }
++            if (headerToken == null || headerToken != token) {
++                respond(out, 403, JSONObject().put("ok", false).put("error", "invalid token"))
++                return
++            }
++
++            val path = rawPath.substringBefore('?')
++            val query = parseQuery(rawPath.substringAfter('?', ""))
++            try {
++                val body =
++                    when {
++                        method == "GET" && path == "/status" -> status()
++                        method == "GET" && path == "/keys" -> listKeys()
++                        method == "GET" && path == "/keys/db" -> keysDb()
++                        method == "POST" && path == "/keys/db/delete" -> deleteDbKeys(query)
++                        method == "GET" && path == "/keys/inspect" ->
++                            inspect(query["alias"] ?: error("alias required"))
++                        method == "POST" && path == "/keys/delete" ->
++                            delete(query["alias"] ?: error("alias required"))
++                        method == "GET" && path == "/logs" -> logs(query)
++                        method == "GET" && path == "/keybox/inspect" ->
++                            KeyboxInspector.inspect(query["name"] ?: error("name required"))
++                        method == "GET" && path == "/canary" -> Updater.status()
++                        method == "POST" && path == "/canary/install" ->
++                            Updater.install(
++                                query["tag"] ?: error("tag required"),
++                                query["variant"] ?: "release",
++                            )
++                        else -> JSONObject().put("ok", false).put("error", "not found")
++                    }
++                respond(out, if (body.optBoolean("ok", true)) 200 else 400, body)
++            } catch (e: Exception) {
++                respond(out, 500, JSONObject().put("ok", false).put("error", e.message ?: "error"))
++            }
++        }
++    }
++
++    // --- operations -------------------------------------------------------------
++
++    private fun androidKeyStore(): KeyStore =
++        KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
++
++    private fun status(): JSONObject {
++        val o = JSONObject().put("ok", true)
++        harvest?.let { o.put("harvest", Harvester.toJson(it)) }
++        o.put(
++            "lib",
++            JSONObject().put("hook", Control.libHook ?: JSONObject.NULL).put("api", Control.libApi),
++        )
++        return o
++    }
++
++    private fun listKeys(): JSONObject {
++        val ks = androidKeyStore()
++        val keys = JSONArray()
++        val ours = harvest?.verifiedBootKey
++        val aliases = ks.aliases()
++        while (aliases.hasMoreElements()) {
++            val alias = aliases.nextElement()
++            val entry = JSONObject().put("alias", alias)
++            val cert = ks.getCertificate(alias) as? X509Certificate
++            entry.put("securityLevel", securityLevelForAlias(ks, alias))
++            entry.put("ours", cert != null && isOurs(cert, ours))
++            if (cert != null) {
++                // The provenance the WebUI shows: which app asked (the attestation
++                // application id), which profile/keybox would sign for it, and the key's
++                // algorithm/created (from certSummary). Cert subject/issuer is not shown.
++                entry.put("cert", certSummary(cert))
++                val apps = attestationAppPackages(cert)
++                if (apps.isNotEmpty()) entry.put("requestedBy", JSONArray(apps))
++                keyboxForApps(apps)?.let { (profile, keybox) ->
++                    entry.put("profile", profile)
++                    entry.put("keybox", keybox)
++                }
++            }
++            keys.put(entry)
++        }
++        return JSONObject().put("ok", true).put("keys", keys)
++    }
++
++    /**
++     * The keys the target apps (every package named across the live config's profiles) hold in
++     * keystore2's per-app namespaces, read from [KeystoreDb]. This is the visibility [listKeys]
++     * cannot give: those keys live under the apps' uids, not the daemon's AndroidKeyStore. On
++     * Android 10/11 there is no keystore2 database, so `available` is false and `keys` is empty —
++     * the WebUI turns that into its "hidden" hint.
++     */
++    private fun keysDb(): JSONObject {
++        val targets = targetUidToPackage()
++        val keys = JSONArray()
++        KeystoreDb.listKeys(targets).forEach { keys.put(it) }
++        return JSONObject()
++            .put("ok", true)
++            .put("available", KeystoreDb.available())
++            .put("apiLevel", Build.VERSION.SDK_INT)
++            .put("keys", keys)
++    }
++
++    /**
++     * Remove the given keystore2 keys (keyentry ids, comma-separated in `ids`) that this module minted.
++     * [KeystoreDb.deleteKeys] re-checks, against the live database, that each id is one of OUR marked
++     * blobs and belongs to a target app before deleting it, so an out-of-range id is a no-op rather than
++     * a hazard. Deleting an attestation key just makes the app re-create (and re-attest) it.
++     */
++    private fun deleteDbKeys(query: Map<String, String>): JSONObject {
++        val raw = query["ids"] ?: error("ids required")
++        val ids = raw.split(",").mapNotNull { it.trim().toLongOrNull() }
++        if (ids.isEmpty()) return JSONObject().put("ok", false).put("error", "no valid ids")
++        val n = KeystoreDb.deleteKeys(targetUidToPackage().keys, ids)
++        return JSONObject().put("ok", true).put("deleted", n).put("requested", ids.size)
++    }
++
++    /** uid -> package for every installed app named across the live config's profiles. */
++    private fun targetUidToPackage(): Map<Int, String> {
++        val cfg =
++            try {
++                ConfigStore.load()
++            } catch (e: Exception) {
++                SystemLogger.warning("KeyAdmin: config load failed for /keys/db", e)
++                return emptyMap()
++            }
++        val map = HashMap<Int, String>()
++        for (p in cfg.profiles) for (pkg in p.apps) {
++            val uid = Packages.uidForPackage(pkg)
++            if (uid >= 0) map[uid] = pkg
++        }
++        return map
++    }
++
++    private fun inspect(alias: String): JSONObject {
++        val ks = androidKeyStore()
++        val cert =
++            ks.getCertificate(alias) as? X509Certificate
++                ?: return JSONObject().put("ok", false).put("error", "no certificate for alias")
++        val attestation = parseAttestation(cert)
++        return JSONObject()
++            .put("ok", true)
++            .put("alias", alias)
++            .put("cert", certSummary(cert))
++            .put("attestation", attestation ?: JSONObject.NULL)
++    }
++
++    private fun delete(alias: String): JSONObject {
++        val ks = androidKeyStore()
++        if (!ks.containsAlias(alias))
++            return JSONObject().put("ok", false).put("error", "alias not found")
++        ks.deleteEntry(alias)
++        SystemLogger.info("KeyAdmin: deleted alias $alias")
++        return JSONObject().put("ok", true).put("deleted", alias)
++    }
++
++    /** Recent TEESimulator logcat lines with seq greater than `after`, for the WebUI's Logs tab. */
++    private fun logs(query: Map<String, String>): JSONObject {
++        val after = query["after"]?.toLongOrNull() ?: 0L
++        val max = (query["max"]?.toIntOrNull() ?: 500).coerceIn(1, 2000)
++        val (lines, next) = LogTail.snapshot(after, max)
++        val arr = JSONArray()
++        lines.forEach {
++            arr.put(
++                JSONObject()
++                    .put("seq", it.seq)
++                    .put("level", it.level.toString())
++                    .put("tag", it.tag)
++                    .put("text", it.text)
++            )
++        }
++        return JSONObject().put("ok", true).put("lines", arr).put("nextAfter", next)
++    }
++
++    // --- helpers ----------------------------------------------------------------
++
++    // isInsideSecureHardware is the only pre-31 signal, and the fallback for an unknown level on 31+.
++    @Suppress("DEPRECATION")
++    private fun securityLevelForAlias(ks: KeyStore, alias: String): String {
++        return try {
++            val key = ks.getKey(alias, null) as? PrivateKey ?: return "unknown"
++            val factory = KeyFactory.getInstance(key.algorithm, "AndroidKeyStore")
++            val info = factory.getKeySpec(key, KeyInfo::class.java) as KeyInfo
++            if (Build.VERSION.SDK_INT >= 31) {
++                when (info.securityLevel) {
++                    0 -> "Software"
++                    1 -> "TrustedEnvironment"
++                    2 -> "StrongBox"
++                    else -> if (info.isInsideSecureHardware) "TrustedEnvironment" else "Software"
++                }
++            } else {
++                if (info.isInsideSecureHardware) "TrustedEnvironment" else "Software"
++            }
++        } catch (e: Exception) {
++            "unknown"
++        }
++    }
++
++    /** Ours = leaf carries an attestation whose RootOfTrust boot key is our frozen one. */
++    private fun isOurs(cert: X509Certificate, ourBootKey: ByteArray?): Boolean {
++        if (ourBootKey == null) return false
++        val a = parseAttestation(cert) ?: return false
++        val vbk = a.optString("verifiedBootKeyHex", "")
++        return vbk.isNotEmpty() && vbk.equals(ourBootKey.toHex(), true)
++    }
++
++    private fun certSummary(cert: X509Certificate): JSONObject =
++        JSONObject().apply {
++            put("subject", cert.subjectX500Principal.name)
++            put("issuer", cert.issuerX500Principal.name)
++            put("serial", cert.serialNumber.toString(16))
++            put("notBefore", cert.notBefore.time)
++            put("notAfter", cert.notAfter.time)
++            put("expired", cert.notAfter.time < System.currentTimeMillis())
++            put("sigAlg", cert.sigAlgName)
++            when (val pk = cert.publicKey) {
++                is RSAPublicKey -> {
++                    put("keyAlgorithm", "RSA")
++                    put("keySize", pk.modulus.bitLength())
++                }
++                is ECPublicKey -> {
++                    put("keyAlgorithm", "EC")
++                    put("keySize", pk.params.curve.field.fieldSize)
++                }
++                else -> {
++                    put("keyAlgorithm", pk.algorithm ?: "?")
++                    put("keySize", 0)
++                }
++            }
++        }
++
++    /** Parse the leaf's KeyDescription extension into a flat JSON summary, or null. */
++    private fun parseAttestation(cert: X509Certificate): JSONObject? {
++        return try {
++            val holder = X509CertificateHolder(cert.encoded)
++            val ext = holder.getExtension(ASN1ObjectIdentifier(ATTEST_OID)) ?: return null
++            val kd = ASN1Sequence.getInstance(ext.extnValue.octets)
++            val fields = kd.toArray()
++            val o = JSONObject()
++            o.put("attestationVersion", ASN1Integer.getInstance(fields[0]).positiveValue.toInt())
++            o.put("attestationSecurityLevel", ASN1Enumerated.getInstance(fields[1]).value.toInt())
++            o.put("keymasterVersion", ASN1Integer.getInstance(fields[2]).positiveValue.toInt())
++            o.put("keymasterSecurityLevel", ASN1Enumerated.getInstance(fields[3]).value.toInt())
++
++            val tee = ASN1Sequence.getInstance(fields[7])
++            tee.forEach { element ->
++                val tagged = element as ASN1TaggedObject
++                when (tagged.tagNo) {
++                    704 -> { // RootOfTrust
++                        val rot = ASN1Sequence.getInstance(tagged.baseObject.toASN1Primitive())
++                        if (rot.size() >= 4) {
++                            o.put(
++                                "verifiedBootKeyHex",
++                                ASN1OctetString.getInstance(rot.getObjectAt(0)).octets.toHex(),
++                            )
++                            o.put(
++                                "deviceLocked",
++                                ASN1Boolean.getInstance(rot.getObjectAt(1)).isTrue,
++                            )
++                            o.put(
++                                "verifiedBootState",
++                                ASN1Enumerated.getInstance(rot.getObjectAt(2)).value.toInt(),
++                            )
++                            o.put(
++                                "verifiedBootHashHex",
++                                ASN1OctetString.getInstance(rot.getObjectAt(3)).octets.toHex(),
++                            )
++                        }
++                    }
++                    705 -> o.put("osVersion", intOf(tagged))
++                    706 -> o.put("osPatchLevel", intOf(tagged))
++                    718 -> o.put("vendorPatchLevel", intOf(tagged))
++                    719 -> o.put("bootPatchLevel", intOf(tagged))
++                }
++            }
++            o.put("extensionB64", b64.encodeToString(ext.extnValue.octets))
++            o
++        } catch (e: Exception) {
++            SystemLogger.warning("KeyAdmin: could not parse attestation for cert", e)
++            null
++        }
++    }
++
++    private fun intOf(t: ASN1TaggedObject): Int =
++        ASN1Integer.getInstance(t.baseObject.toASN1Primitive()).positiveValue.toInt()
++
++    /**
++     * Package names from the leaf's ATTESTATION_APPLICATION_ID (tag 709, in
++     * softwareEnforced) — i.e. which app requested the key. Empty when absent/unparseable.
++     */
++    private fun attestationAppPackages(cert: X509Certificate): List<String> =
++        try {
++            val holder = X509CertificateHolder(cert.encoded)
++            val ext = holder.getExtension(ASN1ObjectIdentifier(ATTEST_OID))
++            if (ext == null) {
++                emptyList()
++            } else {
++                val kd = ASN1Sequence.getInstance(ext.extnValue.octets)
++                val sw = ASN1Sequence.getInstance(kd.toArray()[6]) // softwareEnforced
++                val appId = sw.toArray().firstOrNull { (it as? ASN1TaggedObject)?.tagNo == 709 }
++                if (appId == null) {
++                    emptyList()
++                } else {
++                    val octets =
++                        ASN1OctetString.getInstance((appId as ASN1TaggedObject).baseObject).octets
++                    val seq = ASN1Sequence.getInstance(octets)
++                    // AttestationApplicationId ::= { SET OF AttestationPackageInfo, SET OF digests }
++                    val pkgSet = ASN1Set.getInstance(seq.getObjectAt(0))
++                    pkgSet.toArray().map { e ->
++                        val info = ASN1Sequence.getInstance(e)
++                        String(ASN1OctetString.getInstance(info.getObjectAt(0)).octets, Charsets.UTF_8)
++                    }
++                }
++            }
++        } catch (e: Exception) {
++            emptyList()
++        }
++
++    /** The (profile id, keybox) that would sign for any of [apps], from the live config. */
++    private fun keyboxForApps(apps: List<String>): Pair<String, String>? {
++        if (apps.isEmpty()) return null
++        val cfg =
++            try {
++                ConfigStore.load()
++            } catch (e: Exception) {
++                return null
++            }
++        val p = cfg.profiles.firstOrNull { prof -> prof.apps.any { it in apps } } ?: return null
++        return p.id to p.keybox
++    }
++
++    private fun parseQuery(q: String): Map<String, String> {
++        if (q.isEmpty()) return emptyMap()
++        return q.split("&")
++            .mapNotNull {
++                val i = it.indexOf('=')
++                if (i <= 0) null
++                else
++                    java.net.URLDecoder.decode(it.substring(0, i), "UTF-8") to
++                        java.net.URLDecoder.decode(it.substring(i + 1), "UTF-8")
++            }
++            .toMap()
++    }
++
++    private fun respond(out: OutputStream, code: Int, body: JSONObject?) {
++        val reason =
++            when (code) {
++                200 -> "OK"
++                204 -> "No Content"
++                400 -> "Bad Request"
++                403 -> "Forbidden"
++                404 -> "Not Found"
++                500 -> "Internal Server Error"
++                else -> "OK"
++            }
++        val payload = body?.toString()?.toByteArray(Charsets.UTF_8) ?: ByteArray(0)
++        val sb = StringBuilder()
++        sb.append("HTTP/1.1 $code $reason\r\n")
++        sb.append("Content-Type: application/json\r\n")
++        sb.append("Content-Length: ${payload.size}\r\n")
++        sb.append("Access-Control-Allow-Origin: *\r\n")
++        sb.append("Access-Control-Allow-Headers: X-Teesim-Token, Content-Type\r\n")
++        sb.append("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n")
++        sb.append("Connection: close\r\n")
++        sb.append("\r\n")
++        out.write(sb.toString().toByteArray(Charsets.UTF_8))
++        if (payload.isNotEmpty()) out.write(payload)
++        out.flush()
++    }
++}
+diff --git a/app/src/main/java/org/matrix/teesim/KeyboxInspector.kt b/app/src/main/java/org/matrix/teesim/KeyboxInspector.kt
+new file mode 100644
+index 0000000..aaeb0e4
+--- /dev/null
++++ b/app/src/main/java/org/matrix/teesim/KeyboxInspector.kt
+@@ -0,0 +1,186 @@
++package org.matrix.teesim
++
++import java.io.ByteArrayInputStream
++import java.io.File
++import java.security.cert.CertificateFactory
++import java.security.cert.X509Certificate
++import java.security.interfaces.ECPublicKey
++import java.security.interfaces.RSAPublicKey
++import java.util.Base64
++import javax.xml.parsers.DocumentBuilderFactory
++import org.json.JSONArray
++import org.json.JSONObject
++import org.w3c.dom.Element
++
++/**
++ * Parses a keybox.xml for the WebUI's keybox inspector. For each `<Key algorithm>` block it decodes
++ * the certificate chain and reports the fields that let a user spot a bad keybox — subject/issuer,
++ * validity (with expiry), key type and size, and whether the chain links up — plus whether a private
++ * key is present. Read-only: the private key material is never returned, only that it exists.
++ */
++object KeyboxInspector {
++
++    private val NAME_RE = Regex("^[A-Za-z0-9._-]+\\.xml$")
++
++    /** Coerce to a safe *.xml basename inside the module dir, or null. Mirrors the WebUI's safeName. */
++    private fun safeName(raw: String): String? {
++        val name = raw.trim().substringAfterLast('/').substringAfterLast('\\')
++        if (name.isEmpty() || name.contains("..") || !NAME_RE.matches(name)) return null
++        return name
++    }
++
++    fun inspect(rawName: String): JSONObject {
++        val name = safeName(rawName) ?: return fail("invalid keybox name")
++        val file = File(Const.DATA_DIR, name)
++        if (!file.isFile) return fail("no such keybox: $name")
++        return try {
++            val doc = newSafeBuilder().parse(file)
++            val root = doc.documentElement
++            val kb = firstChild(root, "Keybox")
++            val scope = kb ?: root
++            val keyNodes = scope.getElementsByTagName("Key")
++            val keys = JSONArray()
++            for (i in 0 until keyNodes.length) {
++                (keyNodes.item(i) as? Element)?.let { keys.put(inspectKey(it)) }
++            }
++            JSONObject()
++                .put("ok", true)
++                .put("name", name)
++                .put("deviceId", kb?.getAttribute("DeviceID") ?: "")
++                .put("keys", keys)
++        } catch (e: Exception) {
++            SystemLogger.warning("KeyboxInspector: failed to parse $name", e)
++            fail("could not parse keybox: ${e.message}")
++        }
++    }
++
++    /**
++     * Canonical subject-DN -> keybox filename, across every `*.xml` keybox in the module dir. Used to
++     * attribute a stored attestation key to the keybox that signed it: the key's leaf certificate is
++     * issued by the keybox's signing (batch) cert, whose subject appears here, and the batch/intermediate/
++     * root certs of the key's chain are keybox subjects too — so a hit on either the leaf's issuer or any
++     * chain subject names the signer. Best effort: an unparseable keybox simply contributes nothing.
++     */
++    fun signerIndex(): Map<String, String> {
++        val out = HashMap<String, String>()
++        val files = File(Const.DATA_DIR).listFiles { f -> f.isFile && NAME_RE.matches(f.name) } ?: return out
++        for (file in files) {
++            try {
++                val certNodes = newSafeBuilder().parse(file).documentElement.getElementsByTagName("Certificate")
++                for (i in 0 until certNodes.length) {
++                    val cert = parsePem(certNodes.item(i).textContent) ?: continue
++                    out[canonicalDn(cert.subjectX500Principal)] = file.name
++                }
++            } catch (e: Exception) {
++                SystemLogger.warning("KeyboxInspector.signerIndex: skipping ${file.name}", e)
++            }
++        }
++        return out
++    }
++
++    /** RFC 2253 canonical form of a DN, so subject/issuer strings compare regardless of encoding quirks. */
++    fun canonicalDn(p: javax.security.auth.x500.X500Principal): String =
++        p.getName(javax.security.auth.x500.X500Principal.CANONICAL)
++
++    private fun inspectKey(ke: Element): JSONObject {
++        val out = JSONObject().put("algorithm", ke.getAttribute("algorithm").ifBlank { "?" })
++
++        val priv = firstChild(ke, "PrivateKey")
++        out.put("privateKeyPresent", priv != null && priv.textContent.contains("PRIVATE KEY"))
++
++        val certParent = firstChild(ke, "CertificateChain") ?: ke
++        val certNodes = certParent.getElementsByTagName("Certificate")
++        val certs = JSONArray()
++        val parsed = ArrayList<X509Certificate>()
++        for (i in 0 until certNodes.length) {
++            val cert = parsePem(certNodes.item(i).textContent)
++            if (cert == null) {
++                certs.put(JSONObject().put("index", i).put("error", "could not parse certificate"))
++            } else {
++                parsed.add(cert)
++                certs.put(certJson(i, cert))
++            }
++        }
++        out.put("chainLength", certNodes.length)
++        out.put("certs", certs)
++        out.put("linkage", linkage(parsed))
++        return out
++    }
++
++    private fun certJson(index: Int, cert: X509Certificate): JSONObject {
++        val now = System.currentTimeMillis()
++        val (keyAlgo, keySize) = keyInfo(cert)
++        return JSONObject()
++            .put("index", index)
++            .put("subject", cert.subjectX500Principal.name)
++            .put("issuer", cert.issuerX500Principal.name)
++            .put("serial", cert.serialNumber.toString(16))
++            .put("notBefore", cert.notBefore.time)
++            .put("notAfter", cert.notAfter.time)
++            .put("expired", cert.notAfter.time < now)
++            .put("notYetValid", cert.notBefore.time > now)
++            .put("sigAlg", cert.sigAlgName)
++            .put("keyAlgorithm", keyAlgo)
++            .put("keySize", keySize)
++            .put("isCa", cert.basicConstraints >= 0)
++            .put("selfSigned", cert.subjectX500Principal == cert.issuerX500Principal)
++    }
++
++    private fun keyInfo(cert: X509Certificate): Pair<String, Int> =
++        when (val pk = cert.publicKey) {
++            is RSAPublicKey -> "RSA" to pk.modulus.bitLength()
++            is ECPublicKey -> "EC" to pk.params.curve.field.fieldSize
++            else -> (pk.algorithm ?: "?") to 0
++        }
++
++    /** "ok" when each cert's issuer is the next cert's subject; "broken" otherwise. */
++    private fun linkage(chain: List<X509Certificate>): String {
++        if (chain.isEmpty()) return "empty"
++        if (chain.size == 1) return "single"
++        for (i in 0 until chain.size - 1) {
++            if (chain[i].issuerX500Principal != chain[i + 1].subjectX500Principal) return "broken"
++        }
++        return "ok"
++    }
++
++    private fun parsePem(text: String): X509Certificate? =
++        try {
++            val body =
++                text.replace("-----BEGIN CERTIFICATE-----", "")
++                    .replace("-----END CERTIFICATE-----", "")
++                    .replace(Regex("\\s"), "")
++            if (body.isEmpty()) null
++            else
++                CertificateFactory.getInstance("X.509")
++                    .generateCertificate(ByteArrayInputStream(Base64.getDecoder().decode(body)))
++                    as X509Certificate
++        } catch (e: Exception) {
++            null
++        }
++
++    /** A DocumentBuilder with DTD/external-entity processing off — it parses an untrusted file. */
++    private fun newSafeBuilder() =
++        DocumentBuilderFactory.newInstance()
++            .apply {
++                isNamespaceAware = false
++                for (f in
++                    listOf(
++                        "http://apache.org/xml/features/disallow-doctype-decl" to true,
++                        "http://xml.org/sax/features/external-general-entities" to false,
++                        "http://xml.org/sax/features/external-parameter-entities" to false,
++                    )) {
++                    try {
++                        setFeature(f.first, f.second)
++                    } catch (_: Exception) {}
++                }
++                isExpandEntityReferences = false
++            }
++            .newDocumentBuilder()
++
++    private fun firstChild(parent: Element, tag: String): Element? {
++        val n = parent.getElementsByTagName(tag)
++        return if (n.length > 0) n.item(0) as? Element else null
++    }
++
++    private fun fail(msg: String) = JSONObject().put("ok", false).put("error", msg)
++}
+diff --git a/app/src/main/java/org/matrix/teesim/Keystore2Service.kt b/app/src/main/java/org/matrix/teesim/Keystore2Service.kt
+new file mode 100644
+index 0000000..c4c58b9
+--- /dev/null
++++ b/app/src/main/java/org/matrix/teesim/Keystore2Service.kt
+@@ -0,0 +1,57 @@
++package org.matrix.teesim
++
++import android.os.IBinder
++import java.lang.reflect.InvocationTargetException
++
++/**
++ * Reflective bridge to keystore2's binder service (`android.system.keystore2.IKeystoreService`), used
++ * to delete a key the proper way: asking keystore2 to remove it in its own privileged context, rather
++ * than editing its database from underneath it. Reflection keeps the daemon free of keystore2's large
++ * AIDL surface — the real classes resolve on the device at runtime.
++ *
++ * A key is addressed by `Domain.KEY_ID`, so keystore2 looks it up by its own keyentry id and needs no
++ * namespace or alias from us; it still enforces its own access control, so a caller our SELinux context
++ * isn't allowed to touch is rejected — which the caller treats as "fall back to a direct database
++ * delete".
++ */
++object Keystore2Service {
++
++    private const val SERVICE = "android.system.keystore2.IKeystoreService/default"
++    private const val DOMAIN_KEY_ID = 4 // android.system.keystore2.Domain.KEY_ID
++
++    /**
++     * Ask keystore2 to delete the key with keyentry id [keyId]. Returns true on success; false if the
++     * service is absent or the call is rejected (e.g. SELinux denies our context) — logged either way.
++     */
++    fun deleteKeyById(keyId: Long): Boolean {
++        return try {
++            val serviceManager = Class.forName("android.os.ServiceManager")
++            val binder =
++                serviceManager.getMethod("getService", String::class.java).invoke(null, SERVICE) as? IBinder
++            if (binder == null) {
++                SystemLogger.warning("Keystore2Service: service $SERVICE not found")
++                return false
++            }
++
++            val stub = Class.forName("android.system.keystore2.IKeystoreService\$Stub")
++            val service = stub.getMethod("asInterface", IBinder::class.java).invoke(null, binder)
++            val iface = Class.forName("android.system.keystore2.IKeystoreService")
++
++            val descriptorClass = Class.forName("android.system.keystore2.KeyDescriptor")
++            val descriptor = descriptorClass.getConstructor().newInstance()
++            descriptorClass.getField("domain").setInt(descriptor, DOMAIN_KEY_ID)
++            descriptorClass.getField("nspace").setLong(descriptor, keyId)
++            // alias and blob stay null: KEY_ID addresses the key directly.
++
++            iface.getMethod("deleteKey", descriptorClass).invoke(service, descriptor)
++            SystemLogger.info("Keystore2Service: deleted key id=$keyId via keystore2 API")
++            true
++        } catch (e: Throwable) {
++            val cause = (e as? InvocationTargetException)?.targetException ?: e
++            SystemLogger.warning(
++                "Keystore2Service.deleteKeyById($keyId) failed: ${cause.javaClass.simpleName}: ${cause.message}"
++            )
++            false
++        }
++    }
++}
+diff --git a/app/src/main/java/org/matrix/teesim/KeystoreDb.kt b/app/src/main/java/org/matrix/teesim/KeystoreDb.kt
+new file mode 100644
+index 0000000..b754c24
+--- /dev/null
++++ b/app/src/main/java/org/matrix/teesim/KeystoreDb.kt
+@@ -0,0 +1,457 @@
++package org.matrix.teesim
++
++import android.database.sqlite.SQLiteDatabase
++import android.os.Build
++import java.io.ByteArrayInputStream
++import java.io.File
++import java.security.cert.CertificateFactory
++import java.security.cert.X509Certificate
++import java.security.interfaces.ECPublicKey
++import java.security.interfaces.RSAPublicKey
++import org.json.JSONObject
++
++/**
++ * Read/manage window into keystore2's on-disk database, so the WebUI can list and remove the keys THIS
++ * MODULE generated for target apps (gms, key-attestation, …). Those keys live in keystore2's per-app
++ * namespaces, not in the daemon's own AndroidKeyStore, so [KeyAdmin.listKeys] can never see them. Only
++ * meaningful on Android 12+ (API 31+), where keystore2 replaced the legacy keystore; on 10/11 there is
++ * no such database and [available] returns false.
++ *
++ * "Ours" is decided by fact, not heuristics: our KeyMint TA prepends the routing marker `TEESIMkm\0` to
++ * every key blob it emits (teesim-km `BLOB_MARKER` / `mark_blob`), and keystore2 stores that blob in
++ * `blobentry`. A key whose blob starts with the marker is one we minted; every other key on the device
++ * is ignored. (A key keystore2 super-encrypts before storing would hide the marker, but the attestation
++ * keys these apps create are not auth-bound, so their blobs are stored as the TA returned them.)
++ *
++ * The keybox that signed a key is recovered from its stored certificate chain: the leaf attestation
++ * cert is issued by the keybox's signing (batch) cert, so the leaf's issuer DN — and the batch/root
++ * subjects in the chain — match an entry in [KeyboxInspector.signerIndex].
++ *
++ * Reads never touch the live file: keystore2 owns persistent.sqlite in WAL mode under a live lock, so we
++ * snapshot it (+ its -wal / -shm siblings) into a private dir under [Const.DATA_DIR], open the COPY
++ * read-only, and delete the snapshot. Deletion is the one write path and DOES open the live database —
++ * safely, because it is already a WAL database that supports a second writer (we set a busy timeout and
++ * only ever remove rows we re-verify as our own target-app keys). Root can read and write the
++ * keystore-owned files.
++ *
++ * Schema (AOSP system/security/keystore2/src/database.rs, confirmed against a live API 37 device):
++ * ```
++ *   keyentry(id, key_type, domain, namespace, alias BLOB, state, km_uuid)
++ *     domain    Domain::APP = 0  -> namespace is the app uid
++ *     state     KeyLifeCycle: Live = 1 (usable), Existing = 0 (mid-create), Unreferenced = 2
++ *     alias     UTF-8 text stored as a BLOB; CAST(... AS TEXT) so the cursor yields a String
++ *   blobentry(id, subcomponent_type, keyentryid, blob)  -- the KM key blob and the attestation certs
++ *   keymetadata(keyentryid, tag, data)  -- creation date = ms-since-epoch in an INTEGER `data` cell,
++ *     recognised by SHAPE (a plausible epoch-millis integer) since the tag number drifts across releases.
++ * ```
++ *
++ * Every path is wrapped so a schema/lock/IO surprise yields an empty result, never a throw.
++ */
++object KeystoreDb {
++
++    private const val KEYSTORE2_DB = "/data/misc/keystore/persistent.sqlite"
++    private val snapshotDir = File(Const.DATA_DIR, ".ks-snapshot")
++
++    // The routing marker teesim-km prepends to every key blob (`b"TEESIMkm\x00"`), as a SQLite blob
++    // literal so `substr(blob,1,9) = X'…'` selects the keys we minted.
++    private const val MARKER_HEX = "54454553494D6B6D00"
++
++    // Plausible epoch-millis window (~2014-05 .. ~2128), used to spot a creation-date metadata cell
++    // without depending on the release-specific tag number.
++    private const val TS_MIN = 1_400_000_000_000L
++    private const val TS_MAX = 5_000_000_000_000L
++
++    @Volatile private var schemaLogged = false
++
++    /** keystore2 — and thus a readable database — only exists on Android 12+. */
++    fun available(): Boolean = Build.VERSION.SDK_INT >= 31
++
++    /**
++     * The live keys THIS MODULE minted for the given apps, read from a snapshot of keystore2's database.
++     * [targets] maps each target app uid (keystore2's `namespace`) to its package name; the map's keys are
++     * the uids we query for, its values decorate each returned row. Yields one JSON object per key:
++     * `{ id, alias, uid, package, state, created?, keybox? }` — `id` is keyentry.id (the handle
++     * [deleteKeys] removes by), `keybox` is the signing keybox filename when the chain could be
++     * attributed. Returns an empty list on any failure, when [available] is false, or when [targets] is
++     * empty — never throws.
++     */
++    fun listKeys(targets: Map<Int, String>): List<JSONObject> {
++        if (!available() || targets.isEmpty()) return emptyList()
++
++        val src = File(KEYSTORE2_DB)
++        if (!src.isFile) {
++            SystemLogger.warning("KeystoreDb: $KEYSTORE2_DB not present")
++            return emptyList()
++        }
++
++        var db: SQLiteDatabase? = null
++        return try {
++            val copy = snapshot(src)
++            db = SQLiteDatabase.openDatabase(copy.absolutePath, null, SQLiteDatabase.OPEN_READONLY)
++            logSchemaOnce(db)
++            query(db, targets)
++        } catch (e: Throwable) {
++            SystemLogger.warning("KeystoreDb.listKeys failed", e)
++            emptyList()
++        } finally {
++            try {
++                db?.close()
++            } catch (_: Throwable) {}
++            try {
++                snapshotDir.deleteRecursively()
++            } catch (_: Throwable) {}
++        }
++    }
++
++    /**
++     * Remove the given keys. [ids] are keyentry.id values from [listKeys]; each is first re-verified
++     * (read-only, against a snapshot) to be one of our marked blobs belonging to a [targets] app, so a
++     * stray or malicious id can never take out a system/banking key. Each eligible key is then deleted
++     * the proper way — [Keystore2Service.deleteKeyById], letting keystore2 do it in its own context —
++     * and only if that is rejected (e.g. SELinux) does it fall back to a direct database delete, which
++     * is logged. Returns the number of keys removed; 0 on any failure — never throws.
++     */
++    fun deleteKeys(targets: Set<Int>, ids: List<Long>): Int {
++        if (!available() || ids.isEmpty() || targets.isEmpty()) return 0
++
++        val eligible = filterOurTargetIds(targets, ids)
++        val refused = ids.size - eligible.size
++        if (refused > 0)
++            SystemLogger.warning("KeystoreDb.deleteKeys: skipping $refused id(s) that aren't marked target-app keys")
++        if (eligible.isEmpty()) return 0
++
++        var deleted = 0
++        val dbFallback = ArrayList<Long>()
++        for (id in eligible) {
++            if (Keystore2Service.deleteKeyById(id)) deleted++ else dbFallback.add(id)
++        }
++
++        if (dbFallback.isNotEmpty()) {
++            SystemLogger.warning(
++                "KeystoreDb.deleteKeys: keystore2 API unavailable for ${dbFallback.size} key(s); " +
++                    "falling back to direct database delete"
++            )
++            deleted += deleteFromDatabase(targets, dbFallback)
++        }
++        SystemLogger.info("KeystoreDb.deleteKeys: removed $deleted of ${ids.size} requested key(s)")
++        return deleted
++    }
++
++    /** The subset of [ids] that are, right now, our marked blobs owned by a [targets] app (snapshot read). */
++    private fun filterOurTargetIds(targets: Set<Int>, ids: List<Long>): List<Long> {
++        val src = File(KEYSTORE2_DB)
++        if (!src.isFile) return emptyList()
++        var db: SQLiteDatabase? = null
++        return try {
++            val copy = snapshot(src)
++            db = SQLiteDatabase.openDatabase(copy.absolutePath, null, SQLiteDatabase.OPEN_READONLY)
++            if (!tableExists(db, "blobentry")) return emptyList()
++            val uids = targets.joinToString(",")
++            val idList = ids.joinToString(",")
++            val out = ArrayList<Long>()
++            db.rawQuery(
++                    "SELECT k.id FROM keyentry k WHERE k.id IN ($idList) AND k.domain=0 " +
++                        "AND k.namespace IN ($uids) AND EXISTS (SELECT 1 FROM blobentry b " +
++                        "WHERE b.keyentryid=k.id AND substr(b.blob,1,9)=X'$MARKER_HEX')",
++                    null,
++                )
++                .use { c -> while (c.moveToNext()) out.add(c.getLong(0)) }
++            out
++        } catch (e: Throwable) {
++            SystemLogger.warning("KeystoreDb.filterOurTargetIds failed", e)
++            emptyList()
++        } finally {
++            try {
++                db?.close()
++            } catch (_: Throwable) {}
++            try {
++                snapshotDir.deleteRecursively()
++            } catch (_: Throwable) {}
++        }
++    }
++
++    /**
++     * Fallback delete: remove the keys directly from keystore2's LIVE database (WAL, matching keystore2's
++     * mode, with a busy wait), clearing every child row — blobentry + its blobmetadata, keyparameter,
++     * keymetadata, grant, … — before the keyentry. [ids] are already verified eligible; each is re-checked
++     * against the live DB as a last guard. This write may itself be denied by SELinux for our context, in
++     * which case nothing is removed and the failure is logged. Returns the number of keyentry rows deleted.
++     */
++    private fun deleteFromDatabase(targets: Set<Int>, ids: List<Long>): Int {
++        val src = File(KEYSTORE2_DB)
++        if (!src.isFile) return 0
++
++        var db: SQLiteDatabase? = null
++        var deleted = 0
++        try {
++            // Open WAL explicitly (keystore2's mode): matching it means we neither flip its journal
++            // mode nor trip beginTransactionNonExclusive, which requires the connection be in WAL.
++            db =
++                SQLiteDatabase.openDatabase(
++                    src.absolutePath,
++                    null,
++                    SQLiteDatabase.OPEN_READWRITE or SQLiteDatabase.ENABLE_WRITE_AHEAD_LOGGING,
++                )
++            // A bounded busy wait lets our writer take the write lock without failing the moment
++            // keystore2 happens to be mid-transaction.
++            db.rawQuery("PRAGMA busy_timeout=4000", null).use { it.moveToNext() }
++
++            val childTables = tablesWithColumn(db, "keyentryid")
++            val hasBlobMeta = tableExists(db, "blobmetadata") && tableExists(db, "blobentry")
++
++            db.beginTransactionNonExclusive()
++            try {
++                for (id in ids) {
++                    if (!isOurTargetKey(db, id, targets)) continue
++                    // blobmetadata is keyed by blobentryid, so clear it before blobentry rows go.
++                    if (hasBlobMeta) {
++                        db.execSQL(
++                            "DELETE FROM blobmetadata WHERE blobentryid IN " +
++                                "(SELECT id FROM blobentry WHERE keyentryid=?)",
++                            arrayOf(id),
++                        )
++                    }
++                    for (t in childTables) db.delete(t, "keyentryid=?", arrayOf(id.toString()))
++                    deleted += db.delete("keyentry", "id=?", arrayOf(id.toString()))
++                }
++                db.setTransactionSuccessful()
++            } finally {
++                db.endTransaction()
++            }
++            SystemLogger.info("KeystoreDb: direct database delete removed $deleted of ${ids.size} key(s)")
++        } catch (e: Throwable) {
++            SystemLogger.warning("KeystoreDb.deleteFromDatabase failed (SELinux may deny writing keystore2's DB)", e)
++        } finally {
++            try {
++                db?.close()
++            } catch (_: Throwable) {}
++        }
++        return deleted
++    }
++
++    /**
++     * Copy the DB (and its WAL/SHM siblings when present) into [snapshotDir] and return the copied
++     * main file. Copying dodges keystore2's live WAL lock; keeping the -wal/-shm next to the copy
++     * (same basename) lets SQLite surface committed-but-uncheckpointed rows.
++     */
++    private fun snapshot(src: File): File {
++        snapshotDir.deleteRecursively()
++        if (!snapshotDir.mkdirs() && !snapshotDir.isDirectory)
++            throw IllegalStateException("cannot create ${snapshotDir.absolutePath}")
++        val dest = File(snapshotDir, src.name)
++        src.copyTo(dest, overwrite = true)
++        for (suffix in arrayOf("-wal", "-shm")) {
++            val sib = File(src.parentFile, src.name + suffix)
++            if (sib.isFile) sib.copyTo(File(snapshotDir, sib.name), overwrite = true)
++        }
++        return dest
++    }
++
++    /** Log the discovered table set and the keyentry DDL once, to keep the assumptions auditable. */
++    private fun logSchemaOnce(db: SQLiteDatabase) {
++        if (schemaLogged) return
++        schemaLogged = true
++        try {
++            val tables = ArrayList<String>()
++            db.rawQuery("SELECT name FROM sqlite_master WHERE type='table'", null).use { c ->
++                while (c.moveToNext()) tables.add(c.getString(0))
++            }
++            var keyentrySql = ""
++            db.rawQuery("SELECT sql FROM sqlite_master WHERE name='keyentry'", null).use { c ->
++                if (c.moveToNext()) keyentrySql = c.getString(0) ?: ""
++            }
++            SystemLogger.info("KeystoreDb schema: tables=$tables")
++            SystemLogger.info("KeystoreDb keyentry: ${keyentrySql.replace('\n', ' ').trim()}")
++        } catch (e: Exception) {
++            SystemLogger.warning("KeystoreDb: schema probe failed", e)
++        }
++    }
++
++    private fun query(db: SQLiteDatabase, targets: Map<Int, String>): List<JSONObject> {
++        if (!tableExists(db, "blobentry")) {
++            // Without blobentry we cannot tell our keys from anyone else's, and listing every app key
++            // is exactly what we must not do — so surface nothing.
++            SystemLogger.warning("KeystoreDb: no blobentry table; cannot identify our keys")
++            return emptyList()
++        }
++
++        val hasMeta = tableExists(db, "keymetadata")
++        val uids = targets.keys.joinToString(",") // validated ints -> safe to inline
++        val createdCol =
++            if (hasMeta)
++                "(SELECT m.data FROM keymetadata m " +
++                    "WHERE m.keyentryid = k.id AND typeof(m.data) = 'integer' " +
++                    "AND m.data BETWEEN $TS_MIN AND $TS_MAX ORDER BY m.data ASC LIMIT 1)"
++            else "NULL"
++        val sql =
++            "SELECT k.id AS id, CAST(k.alias AS TEXT) AS alias, k.namespace AS uid, " +
++                "k.state AS state, $createdCol AS created " +
++                "FROM keyentry k " +
++                "WHERE k.domain = 0 AND k.namespace IN ($uids) AND k.alias IS NOT NULL " +
++                "AND EXISTS (SELECT 1 FROM blobentry b WHERE b.keyentryid = k.id " +
++                "AND substr(b.blob, 1, 9) = X'$MARKER_HEX') " +
++                "ORDER BY k.namespace, alias"
++
++        val rows = ArrayList<JSONObject>()
++        val ids = ArrayList<Long>()
++        db.rawQuery(sql, null).use { c ->
++            val iId = c.getColumnIndexOrThrow("id")
++            val iAlias = c.getColumnIndexOrThrow("alias")
++            val iUid = c.getColumnIndexOrThrow("uid")
++            val iState = c.getColumnIndexOrThrow("state")
++            val iCreated = c.getColumnIndexOrThrow("created")
++            while (c.moveToNext()) {
++                val id = c.getLong(iId)
++                val uid = c.getInt(iUid)
++                val o =
++                    JSONObject()
++                        // keystore2 assigns keyentry.id as a random 64-bit value, which overflows a
++                        // JS Number (2^53); carry it as a string so the WebUI round-trips it losslessly
++                        // and delete-by-id matches the same row this listing returned.
++                        .put("id", id.toString())
++                        .put("alias", c.getString(iAlias))
++                        .put("uid", uid)
++                        .put("package", targets[uid] ?: JSONObject.NULL)
++                        .put("state", c.getInt(iState))
++                if (!c.isNull(iCreated)) o.put("created", c.getLong(iCreated))
++                rows.add(o)
++                ids.add(id)
++            }
++        }
++
++        if (rows.isNotEmpty()) attributeKeys(db, rows, ids)
++        SystemLogger.info("KeystoreDb: ${rows.size} of our keys across ${targets.size} target uids")
++        return rows
++    }
++
++    /**
++     * Fill in each key's metadata that lives in its stored certificate chain: the signing algorithm of
++     * the generated key (the leaf certificate's public key) and the keybox that signed it (the leaf's
++     * issuer, or any chain subject, matched against [KeyboxInspector.signerIndex]). Fetches every blob of
++     * the listed keys in one pass; rows and [ids] are index-aligned. Best effort — a key whose certs
++     * don't parse simply gets neither field.
++     */
++    private fun attributeKeys(db: SQLiteDatabase, rows: List<JSONObject>, ids: List<Long>) {
++        val blobsById = HashMap<Long, MutableList<ByteArray>>()
++        val idList = ids.joinToString(",")
++        try {
++            db.rawQuery("SELECT keyentryid, blob FROM blobentry WHERE keyentryid IN ($idList)", null).use { c ->
++                while (c.moveToNext()) {
++                    val kid = c.getLong(0)
++                    val blob = c.getBlob(1) ?: continue
++                    blobsById.getOrPut(kid) { ArrayList() }.add(blob)
++                }
++            }
++        } catch (e: Exception) {
++            SystemLogger.warning("KeystoreDb: could not read blobs for key attribution", e)
++            return
++        }
++
++        val signers = KeyboxInspector.signerIndex()
++        val cf = CertificateFactory.getInstance("X.509")
++        for (i in rows.indices) {
++            val certs = parseCerts(blobsById[ids[i]], cf)
++            if (certs.isEmpty()) continue
++            val leaf = leafOf(certs)
++            if (leaf != null) rows[i].put("keyAlgorithm", keyAlgorithm(leaf))
++            matchKeybox(certs, leaf, signers)?.let { rows[i].put("keybox", it) }
++        }
++    }
++
++    /** Every X.509 cert across a key's non-marker blobs (a blob may hold one cert or a concatenated chain). */
++    private fun parseCerts(blobs: List<ByteArray>?, cf: CertificateFactory): List<X509Certificate> {
++        if (blobs == null) return emptyList()
++        val out = ArrayList<X509Certificate>()
++        for (blob in blobs) {
++            if (isMarked(blob)) continue // the key blob, not a cert
++            try {
++                cf.generateCertificates(ByteArrayInputStream(blob)).forEach {
++                    (it as? X509Certificate)?.let(out::add)
++                }
++            } catch (_: Exception) {}
++        }
++        return out
++    }
++
++    /** The end-entity (the generated key's cert): the one whose subject is no other cert's issuer. */
++    private fun leafOf(certs: List<X509Certificate>): X509Certificate? {
++        if (certs.isEmpty()) return null
++        val issuers = certs.map { KeyboxInspector.canonicalDn(it.issuerX500Principal) }.toHashSet()
++        return certs.firstOrNull { KeyboxInspector.canonicalDn(it.subjectX500Principal) !in issuers }
++            ?: certs.first()
++    }
++
++    /** The keybox that signed this chain: the leaf's issuer, else any chain cert that is a keybox subject. */
++    private fun matchKeybox(
++        certs: List<X509Certificate>,
++        leaf: X509Certificate?,
++        signers: Map<String, String>,
++    ): String? {
++        if (signers.isEmpty()) return null
++        if (leaf != null) signers[KeyboxInspector.canonicalDn(leaf.issuerX500Principal)]?.let { return it }
++        for (cert in certs) {
++            signers[KeyboxInspector.canonicalDn(cert.issuerX500Principal)]?.let { return it }
++            signers[KeyboxInspector.canonicalDn(cert.subjectX500Principal)]?.let { return it }
++        }
++        return null
++    }
++
++    /** Human-readable algorithm + size of a certificate's public key (i.e. the generated key). */
++    private fun keyAlgorithm(cert: X509Certificate): String =
++        when (val pk = cert.publicKey) {
++            is RSAPublicKey -> "RSA ${pk.modulus.bitLength()}"
++            is ECPublicKey -> "EC ${pk.params.curve.field.fieldSize}"
++            else -> pk.algorithm ?: "?"
++        }
++
++    private fun isMarked(blob: ByteArray): Boolean {
++        if (blob.size < 9) return false
++        // "TEESIMkm\0"
++        val m = byteArrayOf(0x54, 0x45, 0x45, 0x53, 0x49, 0x4D, 0x6B, 0x6D, 0x00)
++        for (i in m.indices) if (blob[i] != m[i]) return false
++        return true
++    }
++
++    /** True iff [id] is a Live target-app key whose blob still carries our marker (a delete precondition). */
++    private fun isOurTargetKey(db: SQLiteDatabase, id: Long, targets: Set<Int>): Boolean {
++        val uids = targets.joinToString(",")
++        return db.rawQuery(
++                "SELECT 1 FROM keyentry k WHERE k.id=? AND k.domain=0 AND k.namespace IN ($uids) " +
++                    "AND EXISTS (SELECT 1 FROM blobentry b WHERE b.keyentryid=k.id " +
++                    "AND substr(b.blob,1,9)=X'$MARKER_HEX')",
++                arrayOf(id.toString()),
++            )
++            .use { it.moveToNext() }
++    }
++
++    /** Names of every table that has a `keyentryid` column — the child rows a key delete must clear. */
++    private fun tablesWithColumn(db: SQLiteDatabase, column: String): List<String> {
++        val out = ArrayList<String>()
++        val tables = ArrayList<String>()
++        db.rawQuery("SELECT name FROM sqlite_master WHERE type='table'", null).use { c ->
++            while (c.moveToNext()) tables.add(c.getString(0))
++        }
++        for (t in tables) {
++            if (t == "keyentry") continue // deleted last, by its own id
++            try {
++                db.rawQuery("PRAGMA table_info(${quoteIdent(t)})", null).use { c ->
++                    val i = c.getColumnIndex("name")
++                    while (c.moveToNext()) {
++                        if (i >= 0 && c.getString(i) == column) {
++                            out.add(t)
++                            break
++                        }
++                    }
++                }
++            } catch (_: Exception) {}
++        }
++        return out
++    }
++
++    private fun quoteIdent(name: String): String = "\"" + name.replace("\"", "\"\"") + "\""
++
++    private fun tableExists(db: SQLiteDatabase, name: String): Boolean =
++        db.rawQuery("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", arrayOf(name)).use {
++            it.moveToNext()
++        }
++}
+diff --git a/app/src/main/java/org/matrix/teesim/LogTail.kt b/app/src/main/java/org/matrix/teesim/LogTail.kt
+new file mode 100644
+index 0000000..ab96260
+--- /dev/null
++++ b/app/src/main/java/org/matrix/teesim/LogTail.kt
+@@ -0,0 +1,112 @@
++package org.matrix.teesim
++
++import java.io.BufferedReader
++import java.io.InputStreamReader
++
++/**
++ * Tails logcat into a bounded ring buffer so the WebUI can poll recent lines cheaply (no logcat
++ * spawn per request). It keeps three things: every `TEESimulator` line (the daemon, the TA, and both
++ * native interceptors all log under that tag), every `avc` line (SELinux denials — the usual
++ * injection blocker), and, once the interceptor is injected, every line from the target keystore
++ * process, so the Logs panel shows what happens inside the process we hook rather than only our own
++ * output. The WebUI filters this stream by tag, level, and substring.
++ *
++ * logcat cannot select by pid in its filterspec, so we capture broadly (`TEESimulator:V *:I`) and
++ * keep only the matching lines here; [targetPid] is supplied by the [Injector].
++ */
++object LogTail {
++
++    private const val CAP = 4000
++
++    data class Line(val seq: Long, val level: Char, val tag: String, val text: String)
++
++    /** The injected keystore/keystore2 pid, set by [Injector]; -1 when none is live. */
++    @Volatile var targetPid: Int = -1
++
++    private val lock = Any()
++    private val buf = ArrayDeque<Line>(CAP)
++    private var seq = 0L
++
++    @Volatile private var started = false
++
++    // threadtime: "MM-DD HH:MM:SS.mmm  PID  TID L TAG: message" — capture pid, level, tag.
++    private val HEADER =
++        Regex("^\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\.\\d{3}\\s+(\\d+)\\s+\\d+\\s+([VDIWEF])\\s+(.*?):\\s")
++
++    // Carried across a continuation line (no header) so a kept multi-line message — a
++    // stack trace — keeps all of its lines. Touched only from the single pump thread.
++    private var lastKept = false
++    private var lastLevel = 'I'
++    private var lastTag = ""
++
++    fun start() {
++        if (started) return
++        started = true
++        Thread({ pump() }, "teesim-logtail").apply {
++            isDaemon = true
++            start()
++        }
++    }
++
++    private fun pump() {
++        while (true) {
++            try {
++                // TEESimulator at verbose; everything else at info+ so the target
++                // process's lines are emitted for add() to select.
++                val p =
++                    ProcessBuilder("logcat", "-v", "threadtime", "TEESimulator:V", "*:I")
++                        .redirectErrorStream(true)
++                        .start()
++                BufferedReader(InputStreamReader(p.inputStream, Charsets.UTF_8)).useLines { lines ->
++                    lines.forEach { add(it) }
++                }
++                p.waitFor()
++            } catch (e: Exception) {
++                SystemLogger.warning("LogTail: logcat pump failed; retrying", e)
++            }
++            // logcat exited (buffer reset, or it was killed) — pause briefly and reattach.
++            try {
++                Thread.sleep(1000)
++            } catch (_: InterruptedException) {
++                return
++            }
++        }
++    }
++
++    private fun add(raw: String) {
++        val m = HEADER.find(raw)
++        val keep: Boolean
++        val level: Char
++        val tag: String
++        if (m != null) {
++            val pid = m.groupValues[1].toIntOrNull() ?: -1
++            level = m.groupValues[2].firstOrNull() ?: 'I'
++            tag = m.groupValues[3].trim()
++            val pidNow = targetPid
++            keep = tag == "TEESimulator" || tag == "avc" || (pidNow > 0 && pid == pidNow)
++            lastKept = keep
++            lastLevel = level
++            lastTag = tag
++        } else {
++            // Continuation line (stack trace, "beginning of main" separator): follow the
++            // previous entry so a kept multi-line message stays whole.
++            keep = lastKept
++            level = lastLevel
++            tag = lastTag
++        }
++        if (!keep) return
++        synchronized(lock) {
++            if (buf.size >= CAP) buf.removeFirst()
++            buf.addLast(Line(++seq, level, tag, raw))
++        }
++    }
++
++    /** Lines with seq greater than [after], up to [max], plus the cursor to poll with next. */
++    fun snapshot(after: Long, max: Int): Pair<List<Line>, Long> {
++        synchronized(lock) {
++            val out = buf.asSequence().filter { it.seq > after }.take(max).toList()
++            val next = if (out.isNotEmpty()) out.last().seq else maxOf(after, seq)
++            return out to next
++        }
++    }
++}
+diff --git a/app/src/main/java/org/matrix/teesim/PackageWatch.kt b/app/src/main/java/org/matrix/teesim/PackageWatch.kt
+new file mode 100644
+index 0000000..4e74837
+--- /dev/null
++++ b/app/src/main/java/org/matrix/teesim/PackageWatch.kt
+@@ -0,0 +1,44 @@
++package org.matrix.teesim
++
++import android.content.BroadcastReceiver
++import android.content.Context
++import android.content.Intent
++import android.content.IntentFilter
++import android.os.Build
++
++/**
++ * Watches package add/replace/remove so uid resolution stays current: a target app installed after
++ * boot must get its uid mapped and pushed. Any relevant event triggers a re-resolve + push via
++ * [onChange].
++ */
++object PackageWatch {
++
++    fun start(context: Context, onChange: () -> Unit) {
++        val filter =
++            IntentFilter().apply {
++                addAction(Intent.ACTION_PACKAGE_ADDED)
++                addAction(Intent.ACTION_PACKAGE_REMOVED)
++                addAction(Intent.ACTION_PACKAGE_REPLACED)
++                addDataScheme("package")
++            }
++        val receiver =
++            object : BroadcastReceiver() {
++                override fun onReceive(ctx: Context?, intent: Intent?) {
++                    val pkg = intent?.data?.schemeSpecificPart
++                    SystemLogger.info("package event ${intent?.action} $pkg -> re-resolve")
++                    onChange()
++                }
++            }
++        try {
++            if (Build.VERSION.SDK_INT >= 34) {
++                context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
++            } else {
++                @Suppress("UnspecifiedRegisterReceiverFlag")
++                context.registerReceiver(receiver, filter)
++            }
++            SystemLogger.info("Watching package add/replace/remove")
++        } catch (e: Exception) {
++            SystemLogger.error("Failed to register package receiver", e)
++        }
++    }
++}
+diff --git a/app/src/main/java/org/matrix/teesim/Packages.kt b/app/src/main/java/org/matrix/teesim/Packages.kt
+new file mode 100644
+index 0000000..86f9941
+--- /dev/null
++++ b/app/src/main/java/org/matrix/teesim/Packages.kt
+@@ -0,0 +1,59 @@
++package org.matrix.teesim
++
++import android.content.Context
++import android.content.pm.IPackageManager
++import android.content.pm.PackageManager
++import android.os.Build
++import android.os.ServiceManager
++
++/**
++ * Package-name to uid resolution. Prefers the public [PackageManager] from the system context (it
++ * hides the per-version aidl flag drift); keeps an [IPackageManager] handle for the reverse uid to
++ * package-name mapping the legacy path needs.
++ */
++object Packages {
++
++    private lateinit var pm: PackageManager
++
++    fun init(context: Context) {
++        pm = context.packageManager
++    }
++
++    /** Resolve a package name to its app uid, or -1 when it is not installed. */
++    fun uidForPackage(pkg: String): Int =
++        try {
++            @Suppress("DEPRECATION") pm.getPackageUid(pkg, 0)
++        } catch (e: PackageManager.NameNotFoundException) {
++            -1
++        } catch (e: Exception) {
++            SystemLogger.warning("uidForPackage($pkg) failed", e)
++            -1
++        }
++
++    // --- IPackageManager (reverse mapping: uid -> package) -----------------------
++
++    @Volatile private var ipm: IPackageManager? = null
++
++    fun packageManagerService(): IPackageManager? {
++        ipm?.let {
++            return it
++        }
++        val binder =
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R)
++                ServiceManager.waitForService("package")
++            else ServiceManager.getService("package")
++        if (binder == null) {
++            SystemLogger.error("package service not available")
++            return null
++        }
++        return IPackageManager.Stub.asInterface(binder).also { ipm = it }
++    }
++
++    fun packagesForUid(uid: Int): Array<String> =
++        try {
++            packageManagerService()?.getPackagesForUid(uid) ?: emptyArray()
++        } catch (e: Exception) {
++            SystemLogger.warning("getPackagesForUid($uid) failed", e)
++            emptyArray()
++        }
++}
+diff --git a/app/src/main/java/org/matrix/teesim/Resolver.kt b/app/src/main/java/org/matrix/teesim/Resolver.kt
+new file mode 100644
+index 0000000..4c0ff5a
+--- /dev/null
++++ b/app/src/main/java/org/matrix/teesim/Resolver.kt
+@@ -0,0 +1,123 @@
++package org.matrix.teesim
++
++import java.io.File
++import java.util.Base64
++import java.util.concurrent.atomic.AtomicLong
++import org.json.JSONArray
++import org.json.JSONObject
++
++/**
++ * Turns a validated [ConfigStore.Config] plus the frozen [Harvester.Record], system properties and
++ * the clock into the full-replace `config` message the interceptor library parses in
++ * common/control.cpp ApplyConfig().
++ *
++ * Field names mirror control.cpp exactly: top level: type, epoch, bootInfo, profiles bootInfo:
++ * verifiedBootKey(b64), verifiedBootHash(b64), deviceLocked, verifiedBootState profile: id,
++ * keyboxB64, securityLevel(int), osVersion, osPatchLevel, vendorPatchLevel, bootPatchLevel,
++ * deviceIds{...}, packages[], uids[] uids[] is parallel to packages[] (same length, -1 where not
++ * installed).
++ */
++object Resolver {
++
++    private val b64 = Base64.getEncoder()
++    private val epochSeq = AtomicLong(System.currentTimeMillis())
++
++    /** Build the next config push, or throw if a keybox can't be read. */
++    fun resolve(config: ConfigStore.Config, harvest: Harvester.Record): JSONObject {
++        val msg = JSONObject()
++        msg.put("type", "config")
++        msg.put("epoch", epochSeq.incrementAndGet())
++
++        msg.put(
++            "bootInfo",
++            JSONObject().apply {
++                put("verifiedBootKey", b64.encodeToString(harvest.verifiedBootKey))
++                put("verifiedBootHash", b64.encodeToString(harvest.verifiedBootHash))
++                // Always present a locked, Verified boot state. Module users run
++                // unlocked bootloaders, and reporting the device's real state
++                // (unlocked / Unverified) fails attestation by construction. Only
++                // the boot key/hash come from the device (the Harvester guarantees
++                // they are non-zero — a real vbmeta digest or a stable fallback).
++                put("deviceLocked", true)
++                put("verifiedBootState", 0)
++            },
++        )
++
++        val profiles = JSONArray()
++        for (p in config.profiles) {
++            profiles.put(resolveProfile(p, harvest))
++        }
++        msg.put("profiles", profiles)
++        return msg
++    }
++
++    private fun resolveProfile(
++        p: ConfigStore.ProfileConfig,
++        harvest: Harvester.Record,
++    ): JSONObject {
++        val o = JSONObject()
++        o.put("id", p.id)
++
++        val keyboxBytes = File(Const.DATA_DIR, p.keybox).readBytes()
++        o.put("keyboxB64", b64.encodeToString(keyboxBytes))
++
++        // Security level is not a profile choice: it is the device's real level, harvested
++        // from the TEE (a key's actual level is what the app requested via its keystore
++        // security-level service, bounded by what the device offers — which for the keys we
++        // serve is this harvested TrustedEnvironment level).
++        o.put("securityLevel", harvest.attestationSecurityLevel)
++
++        // osVersion: system_property -> the harvested device value, omitted when absent;
++        // else the parsed literal, omitted when it can't be parsed. A missing osVersion is
++        // reported as "not set" rather than a synthesized default.
++        val osVersion =
++            when {
++                p.osVersion.isBlank() -> harvest.osVersion
++                p.osVersion.equals("system_property", true) -> DeviceProps.propOsVersion()
++                else -> DeviceProps.parseOsVersion(p.osVersion)
++            }
++        osVersion?.let { o.put("osVersion", it) }
++
++        // Patch levels via the mini-language; omit (=> not reported) when unresolved.
++        DeviceProps.resolvePatch(p.patchSystem, "system", harvest.osPatchLevel)?.let {
++            o.put("osPatchLevel", it)
++        }
++        DeviceProps.resolvePatch(p.patchVendor, "vendor", harvest.vendorPatchLevel)?.let {
++            o.put("vendorPatchLevel", it)
++        }
++        DeviceProps.resolvePatch(p.patchBoot, "boot", harvest.bootPatchLevel)?.let {
++            o.put("bootPatchLevel", it)
++        }
++
++        // Device IDs: an explicit profile value overrides; otherwise fall back to the real
++        // value captured at harvest, so an app's device-ID attestation request can be
++        // satisfied against the real ids. Omitted when neither is set (declines that id).
++        val ids = JSONObject()
++        putId(ids, "brand", p.brand, harvest.brand)
++        putId(ids, "device", p.device, harvest.device)
++        putId(ids, "product", p.product, harvest.product)
++        putId(ids, "serial", p.serial, harvest.serial)
++        putId(ids, "imei", p.imei, harvest.imei)
++        putId(ids, "imei2", p.imei2, harvest.imei2)
++        putId(ids, "meid", p.meid, harvest.meid)
++        putId(ids, "manufacturer", p.manufacturer, harvest.manufacturer)
++        putId(ids, "model", p.model, harvest.model)
++        if (ids.length() > 0) o.put("deviceIds", ids)
++
++        // packages[] with a parallel uids[] (-1 where not installed).
++        val packages = JSONArray()
++        val uids = JSONArray()
++        for (pkg in p.apps) {
++            packages.put(pkg)
++            uids.put(Packages.uidForPackage(pkg))
++        }
++        o.put("packages", packages)
++        o.put("uids", uids)
++        return o
++    }
++
++    private fun putId(o: JSONObject, key: String, override: String, harvested: String) {
++        val v = override.ifBlank { harvested }
++        if (v.isNotBlank()) o.put(key, v)
++    }
++}
+diff --git a/app/src/main/java/org/matrix/teesim/SystemLogger.kt b/app/src/main/java/org/matrix/teesim/SystemLogger.kt
+new file mode 100644
+index 0000000..4152575
+--- /dev/null
++++ b/app/src/main/java/org/matrix/teesim/SystemLogger.kt
+@@ -0,0 +1,32 @@
++package org.matrix.teesim
++
++import android.util.Log
++
++/** Centralised logging with a single tag, so logcat is easy to filter. */
++object SystemLogger {
++    private const val TAG = "TEESimulator"
++    private const val VERBOSE = false
++
++    fun verbose(message: String) {
++        if (VERBOSE) Log.v(TAG, message)
++    }
++
++    fun debug(message: String) {
++        Log.d(TAG, message)
++    }
++
++    fun info(message: String) {
++        Log.i(TAG, message)
++    }
++
++    fun warning(message: String, throwable: Throwable? = null) {
++        if (throwable != null) Log.w(TAG, message, throwable) else Log.w(TAG, message)
++    }
++
++    fun error(message: String, throwable: Throwable? = null) {
++        if (throwable != null) Log.e(TAG, message, throwable) else Log.e(TAG, message)
++    }
++}
++
++/** Lowercase hex, used for logging digests. */
++fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
+diff --git a/app/src/main/java/org/matrix/teesim/Updater.kt b/app/src/main/java/org/matrix/teesim/Updater.kt
+new file mode 100644
+index 0000000..d777e31
+--- /dev/null
++++ b/app/src/main/java/org/matrix/teesim/Updater.kt
+@@ -0,0 +1,188 @@
++package org.matrix.teesim
++
++import java.io.File
++import java.net.HttpURLConnection
++import java.net.URL
++import java.util.concurrent.TimeUnit
++import org.json.JSONArray
++import org.json.JSONObject
++
++/**
++ * Canary self-update. CI publishes rolling `canary-<code>` GitHub prereleases (keeping the
++ * newest five) with the Release/Debug module zips as assets. The daemon — which has root and
++ * network — checks GitHub, and on request downloads a build and hands it to the root manager
++ * to flash, so the WebUI needs neither a GitHub account nor external network access.
++ */
++object Updater {
++
++    private const val REPO = "JingMatrix/TEESimulator"
++    private const val API = "https://api.github.com/repos/$REPO/releases?per_page=30"
++
++    /** The installed module's versionCode (git commit count), read from its module.prop. */
++    private fun currentCode(): Int {
++        for (p in
++            listOf(
++                "/data/adb/modules/teesim/module.prop",
++                "/data/adb/modules_update/teesim/module.prop",
++            )) {
++            val f = File(p)
++            if (!f.isFile) continue
++            f.readLines().forEach {
++                if (it.startsWith("versionCode="))
++                    return it.substringAfter("=").trim().toIntOrNull() ?: 0
++            }
++        }
++        return 0
++    }
++
++    /** The installed module's version name, e.g. "v4.0 (17-abc1234-debug)", from its module.prop. */
++    private fun currentVersion(): String {
++        for (p in
++            listOf(
++                "/data/adb/modules/teesim/module.prop",
++                "/data/adb/modules_update/teesim/module.prop",
++            )) {
++            val f = File(p)
++            if (!f.isFile) continue
++            f.readLines().forEach {
++                if (it.startsWith("version=")) return it.substringAfter("=").trim()
++            }
++        }
++        return ""
++    }
++
++    private fun httpGet(url: String): String {
++        val c = URL(url).openConnection() as HttpURLConnection
++        c.connectTimeout = 15000
++        c.readTimeout = 20000
++        c.instanceFollowRedirects = true
++        c.setRequestProperty("Accept", "application/vnd.github+json")
++        c.setRequestProperty("User-Agent", "TEESimulator")
++        c.inputStream.use {
++            return it.readBytes().toString(Charsets.UTF_8)
++        }
++    }
++
++    private fun newestCanary(releases: JSONArray): Pair<Int, JSONObject>? {
++        var best: JSONObject? = null
++        var bestCode = -1
++        for (i in 0 until releases.length()) {
++            val r = releases.getJSONObject(i)
++            val tag = r.optString("tag_name")
++            if (!tag.startsWith("canary-")) continue
++            val code = tag.substringAfter("canary-").toIntOrNull() ?: continue
++            if (code > bestCode) {
++                bestCode = code
++                best = r
++            }
++        }
++        return best?.let { bestCode to it }
++    }
++
++    /**
++     * { ok, currentCode, installedVersion, latest:{ code, tag, name, notes, htmlUrl, commit,
++     * assets[] }|null, updateAvailable }.
++     */
++    fun status(): JSONObject {
++        return try {
++            val cur = currentCode()
++            val newest = newestCanary(JSONArray(httpGet(API)))
++            val latest =
++                newest?.let { (code, r) ->
++                    val assets = JSONArray()
++                    val ja = r.optJSONArray("assets") ?: JSONArray()
++                    for (i in 0 until ja.length()) {
++                        val a = ja.getJSONObject(i)
++                        assets.put(
++                            JSONObject().put("name", a.optString("name")).put("size", a.optLong("size"))
++                        )
++                    }
++                    JSONObject()
++                        .put("code", code)
++                        .put("tag", r.optString("tag_name"))
++                        .put("name", r.optString("name"))
++                        .put("notes", r.optString("body"))
++                        .put("htmlUrl", r.optString("html_url"))
++                        .put("commit", r.optString("target_commitish"))
++                        .put("assets", assets)
++                }
++            JSONObject()
++                .put("ok", true)
++                .put("currentCode", cur)
++                .put("installedVersion", currentVersion())
++                .put("latest", latest ?: JSONObject.NULL)
++                .put("updateAvailable", (newest?.first ?: -1) > cur)
++        } catch (e: Exception) {
++            SystemLogger.warning("Updater: status check failed", e)
++            JSONObject().put("ok", false).put("error", e.message ?: "network error")
++        }
++    }
++
++    /** Download the tag's <variant> zip and flash it via the detected root manager. */
++    fun install(tag: String, variant: String): JSONObject {
++        return try {
++            if (!tag.matches(Regex("^canary-\\d+$"))) return fail("bad tag")
++            val v = if (variant.equals("debug", true)) "Debug" else "Release"
++            val releases = JSONArray(httpGet(API))
++            var url: String? = null
++            for (i in 0 until releases.length()) {
++                val r = releases.getJSONObject(i)
++                if (r.optString("tag_name") != tag) continue
++                val ja = r.optJSONArray("assets") ?: JSONArray()
++                for (j in 0 until ja.length()) {
++                    val a = ja.getJSONObject(j)
++                    if (a.optString("name").endsWith("-$v.zip")) {
++                        url = a.optString("browser_download_url")
++                        break
++                    }
++                }
++            }
++            url ?: return fail("no $v asset for $tag")
++            val zip = File(Const.DATA_DIR, ".canary.zip")
++            download(url, zip)
++            val res = flash(zip)
++            zip.delete()
++            res
++        } catch (e: Exception) {
++            SystemLogger.error("Updater: install failed", e)
++            fail(e.message ?: "install error")
++        }
++    }
++
++    private fun download(url: String, dest: File) {
++        val c = URL(url).openConnection() as HttpURLConnection
++        c.instanceFollowRedirects = true
++        c.setRequestProperty("User-Agent", "TEESimulator")
++        c.connectTimeout = 15000
++        c.readTimeout = 120000
++        c.inputStream.use { input -> dest.outputStream().use { input.copyTo(it) } }
++    }
++
++    /** Try each known root manager's module-install CLI until one succeeds. */
++    private fun flash(zip: File): JSONObject {
++        val managers =
++            listOf(
++                listOf("ksud", "module", "install", zip.absolutePath),
++                listOf("magisk", "--install-module", zip.absolutePath),
++                listOf("/data/adb/ap/bin/apd", "module", "install", zip.absolutePath),
++                listOf("/data/adb/apd", "module", "install", zip.absolutePath),
++            )
++        var last = ""
++        for (cmd in managers) {
++            try {
++                val p = ProcessBuilder(cmd).redirectErrorStream(true).start()
++                val out = p.inputStream.bufferedReader().readText()
++                if (p.waitFor(120, TimeUnit.SECONDS) && p.exitValue() == 0) {
++                    SystemLogger.info("Updater: flashed via ${cmd[0]}")
++                    return JSONObject().put("ok", true).put("message", "Installed — reboot to apply.")
++                }
++                last = "${cmd[0]}: ${out.trim()}"
++            } catch (e: Exception) {
++                last = "${cmd[0]}: ${e.message}"
++            }
++        }
++        return fail("no root manager could install the zip ($last)")
++    }
++
++    private fun fail(msg: String) = JSONObject().put("ok", false).put("error", msg)
++}
+diff --git a/stub/build.gradle.kts b/stub/build.gradle.kts
+new file mode 100644
+index 0000000..70e870b
+--- /dev/null
++++ b/stub/build.gradle.kts
+@@ -0,0 +1,27 @@
++// Compile-only stubs for hidden framework APIs the daemon calls (ActivityThread,
++// ServiceManager, IPackageManager, SystemProperties, the keystore providers). These
++// classes exist on the device at runtime; here they only satisfy the compiler and
++// are never packaged (the app depends on this module with compileOnly).
++plugins {
++    alias(libs.plugins.android.library)
++    alias(libs.plugins.ktfmt)
++}
++
++ktfmt { kotlinLangStyle() }
++
++android {
++    namespace = "org.matrix.teesim.stub"
++    compileSdk = 36
++    buildToolsVersion = "36.0.0"
++    // Java-only: skip AGP's built-in Kotlin compilation and stdlib.
++    enableKotlin = false
++    defaultConfig { minSdk = 29 }
++
++    buildTypes { release { isMinifyEnabled = false } }
++
++    lint { abortOnError = false }
++    compileOptions {
++        sourceCompatibility = JavaVersion.VERSION_21
++        targetCompatibility = JavaVersion.VERSION_21
++    }
++}
+diff --git a/stub/src/main/AndroidManifest.xml b/stub/src/main/AndroidManifest.xml
+new file mode 100644
+index 0000000..8072ee0
+--- /dev/null
++++ b/stub/src/main/AndroidManifest.xml
+@@ -0,0 +1,2 @@
++<?xml version="1.0" encoding="utf-8"?>
++<manifest />
+diff --git a/stub/src/main/java/android/app/ActivityThread.java b/stub/src/main/java/android/app/ActivityThread.java
+new file mode 100644
+index 0000000..6f1d805
+--- /dev/null
++++ b/stub/src/main/java/android/app/ActivityThread.java
+@@ -0,0 +1,11 @@
++package android.app;
++
++public class ActivityThread {
++    public static ActivityThread systemMain() {
++        throw new UnsupportedOperationException("STUB!");
++    }
++
++    public ContextImpl getSystemContext() {
++        throw new UnsupportedOperationException("STUB!");
++    }
++}
+diff --git a/stub/src/main/java/android/app/ContextImpl.java b/stub/src/main/java/android/app/ContextImpl.java
+new file mode 100644
+index 0000000..62daab0
+--- /dev/null
++++ b/stub/src/main/java/android/app/ContextImpl.java
+@@ -0,0 +1,4 @@
++package android.app;
++
++public class ContextImpl {
++}
+diff --git a/stub/src/main/java/android/content/pm/IPackageManager.java b/stub/src/main/java/android/content/pm/IPackageManager.java
+new file mode 100644
+index 0000000..1d481d4
+--- /dev/null
++++ b/stub/src/main/java/android/content/pm/IPackageManager.java
+@@ -0,0 +1,17 @@
++package android.content.pm;
++
++import android.os.IBinder;
++
++public interface IPackageManager {
++    String[] getPackagesForUid(int uid);
++
++    PackageInfo getPackageInfo(String packageName, long flags, int userId);
++
++    PackageInfo getPackageInfo(String packageName, int flags, int userId);
++
++    class Stub {
++        public static IPackageManager asInterface(IBinder binder) {
++            throw new UnsupportedOperationException("STUB!");
++        }
++    }
++}
+diff --git a/stub/src/main/java/android/os/ServiceManager.java b/stub/src/main/java/android/os/ServiceManager.java
+new file mode 100644
+index 0000000..dbf09c0
+--- /dev/null
++++ b/stub/src/main/java/android/os/ServiceManager.java
+@@ -0,0 +1,19 @@
++package android.os;
++
++public class ServiceManager {
++    public static IBinder getService(String name) {
++        throw new UnsupportedOperationException("STUB!");
++    }
++
++    public static IBinder waitForService(String name) {
++        throw new UnsupportedOperationException("STUB!");
++    }
++
++    public static IBinder checkService(String name) {
++        throw new UnsupportedOperationException("STUB!");
++    }
++
++    public static String[] listServices() {
++        throw new UnsupportedOperationException("STUB!");
++    }
++}
+diff --git a/stub/src/main/java/android/os/SystemProperties.java b/stub/src/main/java/android/os/SystemProperties.java
+new file mode 100644
+index 0000000..3540fed
+--- /dev/null
++++ b/stub/src/main/java/android/os/SystemProperties.java
+@@ -0,0 +1,11 @@
++package android.os;
++
++public class SystemProperties {
++    public static String get(String key) {
++        throw new UnsupportedOperationException("STUB!");
++    }
++
++    public static String get(String key, String def) {
++        throw new UnsupportedOperationException("STUB!");
++    }
++}
+diff --git a/stub/src/main/java/android/security/keystore/AndroidKeyStoreProvider.java b/stub/src/main/java/android/security/keystore/AndroidKeyStoreProvider.java
+new file mode 100644
+index 0000000..960af02
+--- /dev/null
++++ b/stub/src/main/java/android/security/keystore/AndroidKeyStoreProvider.java
+@@ -0,0 +1,7 @@
++package android.security.keystore;
++
++public class AndroidKeyStoreProvider {
++    public static void install() {
++        throw new UnsupportedOperationException("STUB!");
++    }
++}
+diff --git a/stub/src/main/java/android/security/keystore2/AndroidKeyStoreProvider.java b/stub/src/main/java/android/security/keystore2/AndroidKeyStoreProvider.java
+new file mode 100644
+index 0000000..3fd50da
+--- /dev/null
++++ b/stub/src/main/java/android/security/keystore2/AndroidKeyStoreProvider.java
+@@ -0,0 +1,7 @@
++package android.security.keystore2;
++
++public class AndroidKeyStoreProvider {
++    public static void install() {
++        throw new UnsupportedOperationException("STUB!");
++    }
++}
+-- 
+2.45.1.windows.1
+

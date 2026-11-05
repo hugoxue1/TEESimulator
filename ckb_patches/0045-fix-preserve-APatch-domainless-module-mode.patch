@@ -1,0 +1,54 @@
+From 2a6c9dfd318e01c72aed3a3d451bf2547cfda58c Mon Sep 17 00:00:00 2001
+From: "Phase49.1-main-agent" <hugoxue@auto.ai>
+Date: Fri, 21 Aug 2026 21:29:06 +0800
+Subject: [PATCH 45/47] fix: preserve APatch domainless module mode
+
+---
+ docs/APatch_定制适配说明_2026-08-21.md |  6 ++++++
+ module/sepolicy.rule                   | 12 +++++-------
+ 2 files changed, 11 insertions(+), 7 deletions(-)
+
+diff --git a/docs/APatch_定制适配说明_2026-08-21.md b/docs/APatch_定制适配说明_2026-08-21.md
+index 2533da7..c07b920 100644
+--- a/docs/APatch_定制适配说明_2026-08-21.md
++++ b/docs/APatch_定制适配说明_2026-08-21.md
+@@ -28,6 +28,12 @@ TEESimulator 的 shell 服务最终还会执行一次 `app_process`。在定制
+ 
+ 所有参数都以独立 argv 传递，不经过 `su -c` 或拼接 shell 命令。优先选用 `app_process64`，不存在时才回退到 `app_process`。
+ 
++模块策略的控制端连接权限必须与上述运行域保持一致，使用
++`allow system_server keystore unix_stream_socket connectto`。不要保留上游面向通用 root 管理器的
++`allow magisk ...` 兼容规则：定制 APatch 会把任何活动模块中的 `magisk` 类型引用判定为 legacy-root
++依赖，将隐藏优先的 `minimal-v1` 降级为 `minimal-v0`，继而拒绝启动 IReZygisk domainless early-loader。
++该问题表现为 TEESimulator 正常运行，但 IReZygisk monitor、zygiskd 和插件均未加载。
++
+ ## 隐藏与权限边界
+ 
+ - 没有新增专用 SELinux 域；使用已有的 `system_server` 域作为精确过渡目标。
+diff --git a/module/sepolicy.rule b/module/sepolicy.rule
+index 7aa1622..a6d7712 100644
+--- a/module/sepolicy.rule
++++ b/module/sepolicy.rule
+@@ -2,14 +2,12 @@
+ # on 12+) and binds an abstract unix socket; the root control daemon connects to it
+ # to push the resolved config. Grant the keystore side the socket-server permissions.
+ #
+-# The daemon runs in the root manager's own already-privileged domain, which carries
+-# connectto, but that domain name differs per manager — so the connectto rules below
+-# are best-effort and may need adjustment on a given setup (DESIGN open question Q1).
+-# If the socket path proves unworkable on some manager, the daemon can fall back to a
+-# file the lib watches instead.
++# The APatch launcher moves the daemon into system_server before app_process starts,
++# so grant only that actual peer domain.  Do not reference the legacy Magisk root
++# domain here: custom APatch treats such a rule as a minimal-v1 incompatibility and
++# consequently cannot arm IReZygisk's domainless early loader.
+ allow keystore self unix_stream_socket { create bind listen accept getopt setopt read write shutdown }
+-allow su keystore unix_stream_socket connectto
+-allow magisk keystore unix_stream_socket connectto
++allow system_server keystore unix_stream_socket connectto
+ 
+ # The `inject` binary attaches to the keystore process with PTRACE_ATTACH (it runs
+ # in the crash_dump domain), and keystore then dlopen()s the interceptor .so that
+-- 
+2.45.1.windows.1
+

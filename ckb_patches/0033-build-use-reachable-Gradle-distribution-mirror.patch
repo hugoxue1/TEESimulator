@@ -1,0 +1,44 @@
+From 287d44ceaf714081f922536f82c019c9198288e6 Mon Sep 17 00:00:00 2001
+From: "Phase49.1-main-agent" <hugoxue@auto.ai>
+Date: Fri, 21 Aug 2026 19:44:46 +0800
+Subject: [PATCH 33/47] build: use reachable Gradle distribution mirror
+
+---
+ docs/APatch_定制适配说明_2026-08-21.md   | 2 ++
+ gradle/wrapper/gradle-wrapper.properties | 8 ++++----
+ 2 files changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/docs/APatch_定制适配说明_2026-08-21.md b/docs/APatch_定制适配说明_2026-08-21.md
+index ee9e0fa..b235d97 100644
+--- a/docs/APatch_定制适配说明_2026-08-21.md
++++ b/docs/APatch_定制适配说明_2026-08-21.md
+@@ -51,6 +51,8 @@ TEESimulator 的 shell 服务最终还会执行一次 `app_process`。在定制
+ python build_projects.py --project TEESimulator --type release
+ ```
+ 
++Windows 首次编译需要下载 Gradle 9.7。项目 Wrapper 使用已验证可访问的腾讯 Gradle 镜像，并为首次下载保留 120 秒连接超时与 3 次重试，避免 `services.gradle.org` 的 10 秒连接超时。
++
+ 本次代码修改没有执行编译、刷入或设备测试；由使用者自行完成。
+ 
+ ## 不要重复踩的坑
+diff --git a/gradle/wrapper/gradle-wrapper.properties b/gradle/wrapper/gradle-wrapper.properties
+index 69dd0d0..e3050d7 100644
+--- a/gradle/wrapper/gradle-wrapper.properties
++++ b/gradle/wrapper/gradle-wrapper.properties
+@@ -1,9 +1,9 @@
+ distributionBase=GRADLE_USER_HOME
+ distributionPath=wrapper/dists
+-distributionUrl=https\://services.gradle.org/distributions/gradle-9.7.0-bin.zip
+-networkTimeout=10000
+-retries=0
+-retryBackOffMs=500
++distributionUrl=https\://mirrors.cloud.tencent.com/gradle/gradle-9.7.0-bin.zip
++networkTimeout=120000
++retries=3
++retryBackOffMs=3000
+ validateDistributionUrl=true
+ zipStoreBase=GRADLE_USER_HOME
+ zipStorePath=wrapper/dists
+-- 
+2.45.1.windows.1
+

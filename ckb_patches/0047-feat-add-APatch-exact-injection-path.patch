@@ -1,0 +1,386 @@
+From baf1c32a09525458a5196de91b14d61aa9905774 Mon Sep 17 00:00:00 2001
+From: "Phase49.1-main-agent" <hugoxue@auto.ai>
+Date: Fri, 21 Aug 2026 22:50:14 +0800
+Subject: [PATCH 47/47] feat: add APatch exact injection path
+
+---
+ .../main/java/org/matrix/teesim/Injector.kt   |  61 +++++++++-
+ injector/README.md                            |   6 +-
+ injector/main.cpp                             | 111 +++++++++++++-----
+ module/customize.sh                           |  14 +++
+ 4 files changed, 158 insertions(+), 34 deletions(-)
+
+diff --git a/app/src/main/java/org/matrix/teesim/Injector.kt b/app/src/main/java/org/matrix/teesim/Injector.kt
+index a73a586..2df2da3 100644
+--- a/app/src/main/java/org/matrix/teesim/Injector.kt
++++ b/app/src/main/java/org/matrix/teesim/Injector.kt
+@@ -20,19 +20,29 @@ class Injector(private val moduleDir: File) {
+ 
+     private val injectBin = File(moduleDir, "$abi/inject")
+     private val libFile = File(moduleDir, "$abi/$libName")
++    private val suBin = File("/system/bin/su")
++    private val exactInjectMarker = File(moduleDir, ".apatch_exact_inject_v1")
++    private val exactInject = exactInjectMarker.isFile
+ 
+     @Volatile private var running = false
+     @Volatile private var lastPid = -1
+ 
+     fun start() {
+         if (running) return
+-        running = true
+         if (!injectBin.exists() || !libFile.exists()) {
+             SystemLogger.error(
+                 "injector: missing artifacts (inject=${injectBin.exists()} lib=${libFile.exists()}) " +
+                     "under ${moduleDir.absolutePath}/$abi"
+             )
+         }
++        if (exactInject && !apatchInjectCapable()) {
++            SystemLogger.error(
++                "injector: ${exactInjectMarker.name} is present but APatch exact injection is " +
++                    "unavailable; refusing legacy injection without sepolicy.rule"
++            )
++            return
++        }
++        running = true
+         injectBin.setExecutable(true, false)
+         Thread({ loop() }, "teesim-injector").apply {
+             isDaemon = true
+@@ -41,7 +51,10 @@ class Injector(private val moduleDir: File) {
+     }
+ 
+     private fun loop() {
+-        SystemLogger.info("injector: watching $procName (abi=$abi lib=$libName)")
++        SystemLogger.info(
++            "injector: watching $procName (abi=$abi lib=$libName mode=" +
++                if (exactInject) "apatch-exact)" else "legacy)"
++        )
+         var failures = 0
+         while (running) {
+             val pid = findPid(procName)
+@@ -100,13 +113,39 @@ class Injector(private val moduleDir: File) {
+ 
+     private fun inject(pid: Int): Boolean {
+         return try {
+-            val proc =
+-                ProcessBuilder(
++            if (exactInject && !apatchInjectCapable()) {
++                SystemLogger.error(
++                    "injector: APatch exact injection capability disappeared at runtime; " +
++                        "refusing legacy fallback"
++                )
++                return false
++            }
++            val command =
++                if (exactInject) {
++                    listOf(
++                        suBin.absolutePath,
++                        "--no-pty",
++                        "-p",
++                        "--inject-target",
++                        pid.toString(),
++                        "--inject-library",
++                        libFile.absolutePath,
++                        "--",
+                         injectBin.absolutePath,
+                         pid.toString(),
+                         libFile.absolutePath,
+                         "entry",
+                     )
++                } else {
++                    listOf(
++                        injectBin.absolutePath,
++                        pid.toString(),
++                        libFile.absolutePath,
++                        "entry",
++                    )
++                }
++            val proc =
++                ProcessBuilder(command)
+                     .redirectErrorStream(true)
+                     .start()
+             val output = proc.inputStream.bufferedReader().readText()
+@@ -119,6 +158,20 @@ class Injector(private val moduleDir: File) {
+         }
+     }
+ 
++    private fun apatchInjectCapable(): Boolean {
++        if (!suBin.canExecute()) return false
++        return try {
++            val proc =
++                ProcessBuilder(suBin.absolutePath, "--no-pty", "--inject-capable")
++                    .redirectErrorStream(true)
++                    .start()
++            proc.inputStream.bufferedReader().readText()
++            proc.waitFor() == 0
++        } catch (e: Exception) {
++            false
++        }
++    }
++
+     /** Return the pid whose /proc/<pid>/cmdline basename matches [name], else -1. */
+     private fun findPid(name: String): Int {
+         val proc = File("/proc")
+diff --git a/injector/README.md b/injector/README.md
+index d1e6400..f0c4c5e 100644
+--- a/injector/README.md
++++ b/injector/README.md
+@@ -41,7 +41,9 @@ Once `dlopen` succeeds the transferred fd has done its job; `RemoteLibraryHandle
+ 
+ ### Staging fallback
+ 
+-If the fd transfer fails — a seccomp filter blocks `recvmsg`/`SCM_RIGHTS`, or the functions won't resolve — `inject_via_staging` copies the library to `/data/local/tmp/lib<magic>.so`, `chmod`s it `0644`, and remote-calls plain `dlopen(path, RTLD_NOW)`. `ScopedFileDeleter` `unlink`s the file immediately after; the inode stays alive because the target has it mapped. This only works where the daemon's namespace is loose enough to `dlopen` a `/data/local/tmp` path — true on Android 10/11's `keystore`, **not** on `keystore2`, whose namespace rejects it. On keystore2, fd passing is the only path that works.
++For the legacy root-manager path, an fd-transfer failure may use `inject_via_staging`: it copies the library to `/data/local/tmp/lib<magic>.so`, `chmod`s it `0644`, and remote-calls plain `dlopen(path, RTLD_NOW)`. `ScopedFileDeleter` unlinks the file immediately after. This is only a compatibility fallback for managers that still load `sepolicy.rule`.
++
++The customised APatch path sets `APATCH_INJECT_LIBRARY_FD` to an inherited, APD-validated descriptor. In that mode `argv[2]` is display-only: the injector validates the inherited fd as a regular ELF DSO and never resolves or reopens the path. Failure of fd transfer or `android_dlopen_ext` fails closed; plain `dlopen(path)` and `/data/local/tmp` staging are forbidden.
+ 
+ ## Loading order and the entry contract
+ 
+@@ -62,7 +64,7 @@ LSPlt is linked in, but only `lsplt::MapInfo::Scan()` is used — it parses `/pr
+ 
+ ## Files
+ 
+-- [`main.cpp`](main.cpp) — the injection orchestration: `transfer_fd_to_remote`, `remote_dlopen`, `remote_find_entry`, `remote_call_entry`, `inject_via_staging`, and the RAII guards, plus `main`'s argument validation (`realpath` the library, check readability, parse pid).
++- [`main.cpp`](main.cpp) — the injection orchestration: `transfer_fd_to_remote`, `remote_dlopen`, `remote_find_entry`, `remote_call_entry`, `inject_via_staging`, and the RAII guards, plus `main`'s legacy path validation or exact-mode inherited-fd validation.
+ - [`utils.cpp`](utils.cpp) / [`include/utils.hpp`](include/utils.hpp) — the ptrace primitives: register get/set, remote memory read/write, stack pushing, `remote_call`, symbol/base/return-address resolution, `UniqueFd`, magic-string generation, and status/signal parsing. The header also declares helpers (`remote_mmap`, `switch_mnt_ns`, `do_syscall`, …) that aren't on the injection path — don't assume everything declared is exercised by `inject`.
+ - [`include/logging.hpp`](include/logging.hpp) — pulls in the shared [`logging.hpp`](include/logging.hpp) and sets `LOG_TAG`.
+ 
+diff --git a/injector/main.cpp b/injector/main.cpp
+index 61ba4b2..7de1ccc 100644
+--- a/injector/main.cpp
++++ b/injector/main.cpp
+@@ -15,6 +15,8 @@
+ #include <unistd.h>
+ 
+ #include <climits>
++#include <cstddef>
++#include <cstdint>
+ #include <csignal>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -225,7 +227,8 @@ private:
+  * @return An optional integer containing the transferred file descriptor in the
+  *  remote process, or std::nullopt if the transfer fails.
+  */
+-static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, struct user_regs_struct &regs,
++static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, int inherited_lib_fd,
++                                                struct user_regs_struct &regs,
+                                                 const std::vector<lsplt::MapInfo> &local_map,
+                                                 const std::vector<lsplt::MapInfo> &remote_map,
+                                                 uintptr_t libc_return_addr) {
+@@ -238,11 +241,17 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
+         return std::nullopt;
+     }
+ 
+-    // Open the local library file to get a file descriptor.
+-    UniqueFd local_lib_fd = open(lib_path, O_RDONLY | O_CLOEXEC);
+-    if (local_lib_fd == -1) {
+-        PLOGE("Failed to open library file: %s", lib_path);
+-        return std::nullopt;
++    // APatch exact injection supplies an already validated descriptor across
++    // exec.  Legacy managers still open the path here.
++    UniqueFd owned_lib_fd;
++    int local_lib_fd = inherited_lib_fd;
++    if (local_lib_fd < 0) {
++        owned_lib_fd = open(lib_path, O_RDONLY | O_CLOEXEC);
++        if (owned_lib_fd == -1) {
++            PLOGE("Failed to open library file: %s", lib_path);
++            return std::nullopt;
++        }
++        local_lib_fd = owned_lib_fd;
+     }
+ 
+     // Struct to hold addresses of remote libc functions needed for socket operations.
+@@ -391,7 +400,7 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
+         close_remote(remote_fd);
+         return std::nullopt;
+     }
+-    LOGD("Local FD %d sent to remote process.", local_lib_fd.operator const int &());
++    LOGD("Local FD %d sent to remote process.", local_lib_fd);
+ 
+     // Complete the remote recvmsg call. This will retrieve the return value.
+     auto recvmsg_result =
+@@ -422,7 +431,7 @@ static std::optional<int> transfer_fd_to_remote(int pid, const char *lib_path, s
+     }
+ 
+     int transferred_fd = *reinterpret_cast<int *>(CMSG_DATA(cmsg));
+-    LOGI("Successfully transferred FD %d to remote process, new remote FD: %d", local_lib_fd.operator const int &(),
++    LOGI("Successfully transferred FD %d to remote process, new remote FD: %d", local_lib_fd,
+          transferred_fd);
+ 
+     // Close the remote socket.
+@@ -500,14 +509,19 @@ static std::string get_remote_dlerror(int pid, struct user_regs_struct &regs,
+  * @return An optional uintptr_t containing the handle to the loaded library, or std::nullopt if loading fails.
+  */
+ static std::optional<uintptr_t> remote_dlopen(int pid, struct user_regs_struct &regs,
+-                                              const std::vector<lsplt::MapInfo> &local_map,
+-                                              const std::vector<lsplt::MapInfo> &remote_map, int lib_fd,
+-                                              const char *lib_path, uintptr_t libc_return_addr) {
++                                               const std::vector<lsplt::MapInfo> &local_map,
++                                               const std::vector<lsplt::MapInfo> &remote_map, int lib_fd,
++                                               const char *lib_path, uintptr_t libc_return_addr,
++                                               bool allow_path_fallback) {
+     LOGD("Attempting remote dlopen for library: %s with FD: %d", lib_path, lib_fd);
+ 
+     auto dlopen_addr = find_func_addr(local_map, remote_map, constants::kLibdlModule, "android_dlopen_ext");
+     if (!dlopen_addr) {
+         LOGE("Failed to find 'android_dlopen_ext' in remote '%s'.", constants::kLibdlModule);
++        if (!allow_path_fallback) {
++            LOGE("APatch exact injection requires the inherited-FD loader; path fallback is forbidden.");
++            return std::nullopt;
++        }
+         // Fallback to 'dlopen' if 'android_dlopen_ext' is not found.
+         // This is a common pattern for broader compatibility.
+         dlopen_addr = find_func_addr(local_map, remote_map, constants::kLibdlModule, "dlopen");
+@@ -526,9 +540,13 @@ static std::optional<uintptr_t> remote_dlopen(int pid, struct user_regs_struct &
+     dlext_info.flags = ANDROID_DLEXT_USE_LIBRARY_FD;
+     dlext_info.library_fd = lib_fd;
+ 
+-    // Push the dlext_info structure and library path string to the remote stack.
++    // The exact APatch path's argv library path is display-only.  Give bionic a
++    // stable logical name while ANDROID_DLEXT_USE_LIBRARY_FD supplies all bytes.
++    const char *load_name = allow_path_fallback ? lib_path : "libteesim-apatch-inherited.so";
++
++    // Push the dlext_info structure and logical library name to the remote stack.
+     uintptr_t remote_info = push_memory(pid, regs, &dlext_info, sizeof(dlext_info));
+-    uintptr_t remote_path = push_string(pid, regs, lib_path);
++    uintptr_t remote_path = push_string(pid, regs, load_name);
+ 
+     if (remote_info == 0 || remote_path == 0) {
+         LOGE("Failed to push dlopen arguments to remote memory.");
+@@ -836,7 +854,7 @@ private:
+  *  (Currently hardcoded to 'entry' internally but kept as param for future flexibility)
+  * @return True if injection was successful, false otherwise.
+  */
+-bool inject_library(int pid, const char *lib_path, const char *entry_name) {
++bool inject_library(int pid, const char *lib_path, const char *entry_name, int inherited_lib_fd) {
+     LOGI("Starting injection of library '%s' (entry: '%s') into process %d.", lib_path, entry_name, pid);
+ 
+     // 1. Ptrace attachment using RAII.
+@@ -899,7 +917,7 @@ bool inject_library(int pid, const char *lib_path, const char *entry_name) {
+ 
+         // 6. Attempt to transfer the library's file descriptor to the remote process.
+         int remote_fd = -1;
+-        auto lib_fd_opt = transfer_fd_to_remote(pid, lib_path, current_regs, local_map, remote_map,
++        auto lib_fd_opt = transfer_fd_to_remote(pid, lib_path, inherited_lib_fd, current_regs, local_map, remote_map,
+                                                 reinterpret_cast<uintptr_t>(libc_return_addr));
+         std::optional<RemoteLibraryHandle> remote_lib_guard;
+         std::optional<uintptr_t> handle_opt;
+@@ -911,15 +929,18 @@ bool inject_library(int pid, const char *lib_path, const char *entry_name) {
+ 
+             LOGD("FD Transfer successful (FD: %d). Attempting android_dlopen_ext...", remote_fd);
+             handle_opt = remote_dlopen(pid, current_regs, local_map, remote_map, remote_fd, lib_path,
+-                                       reinterpret_cast<uintptr_t>(libc_return_addr));
++                                       reinterpret_cast<uintptr_t>(libc_return_addr), inherited_lib_fd < 0);
+         } else {
+             LOGW("Failed to transfer library file descriptor for '%s' to target process %d.", lib_path, pid);
+         }
+ 
+-        // 7. Staging Fallback (Copy-Inject-Delete) if FD transfer failed.
+-        if (!handle_opt) {
++        // APatch exact injection is descriptor-only: reopening/staging the
++        // display path would escape the APD-validated file identity.
++        if (!handle_opt && inherited_lib_fd < 0) {
+             handle_opt = inject_via_staging(pid, current_regs, local_map, remote_map,
+                                             lib_path, reinterpret_cast<uintptr_t>(libc_return_addr));
++        } else if (!handle_opt) {
++            LOGE("APatch exact injection failed; legacy staging fallback is forbidden.");
+         }
+         if (!handle_opt || *handle_opt == 0) {
+             LOGE("Failed to load library '%s' in remote process %d.", lib_path, pid);
+@@ -984,16 +1005,50 @@ int main(int argc, char **argv) {
+     }
+     int pid = static_cast<int>(pid_long);
+ 
+-    // Resolve and validate library path.
++    // APatch exact injection passes a validated regular ELF descriptor in the
++    // environment.  In that mode argv[2] is display-only and must never be
++    // resolved, opened, or used for a staging fallback.
++    int inherited_lib_fd = -1;
++    const char *inherited_fd_env = getenv("APATCH_INJECT_LIBRARY_FD");
+     char resolved_path[inject::constants::kMaxPathLength];
+-    if (realpath(argv[2], resolved_path) == nullptr) {
+-        fprintf(stderr, "Error: Failed to resolve library path '%s': %s\n", argv[2], strerror(errno));
+-        return EXIT_FAILURE;
+-    }
+-
+-    if (access(resolved_path, R_OK) != 0) {
+-        fprintf(stderr, "Error: Library file '%s' is not readable: %s\n", resolved_path, strerror(errno));
+-        return EXIT_FAILURE;
++    const char *library_path = nullptr;
++    if (inherited_fd_env) {
++        errno = 0;
++        char *fd_end = nullptr;
++        long parsed_fd = strtol(inherited_fd_env, &fd_end, 10);
++        if (errno || !fd_end || *fd_end != '\0' || parsed_fd < 0 || parsed_fd > INT_MAX) {
++            fprintf(stderr, "Error: Invalid APATCH_INJECT_LIBRARY_FD.\n");
++            return EXIT_FAILURE;
++        }
++        inherited_lib_fd = static_cast<int>(parsed_fd);
++        int fd_flags = fcntl(inherited_lib_fd, F_GETFD);
++        struct stat st{};
++        unsigned char ident[EI_NIDENT]{};
++        uint16_t elf_type = 0;
++        const off_t type_offset = static_cast<off_t>(
++            sizeof(void *) == 8 ? offsetof(Elf64_Ehdr, e_type) : offsetof(Elf32_Ehdr, e_type));
++        if (fd_flags < 0 || (fd_flags & FD_CLOEXEC) || fstat(inherited_lib_fd, &st) != 0 ||
++            !S_ISREG(st.st_mode) || st.st_size < static_cast<off_t>(EI_NIDENT) ||
++            pread(inherited_lib_fd, ident, sizeof(ident), 0) != static_cast<ssize_t>(sizeof(ident)) ||
++            memcmp(ident, ELFMAG, SELFMAG) != 0 || ident[EI_DATA] != ELFDATA2LSB ||
++            ident[EI_CLASS] != (sizeof(void *) == 8 ? ELFCLASS64 : ELFCLASS32) ||
++            pread(inherited_lib_fd, &elf_type, sizeof(elf_type), type_offset) !=
++                static_cast<ssize_t>(sizeof(elf_type)) ||
++            elf_type != ET_DYN) {
++            fprintf(stderr, "Error: APatch inherited library FD is not a valid regular ELF DSO.\n");
++            return EXIT_FAILURE;
++        }
++        library_path = argv[2];
++    } else {
++        if (realpath(argv[2], resolved_path) == nullptr) {
++            fprintf(stderr, "Error: Failed to resolve library path '%s': %s\n", argv[2], strerror(errno));
++            return EXIT_FAILURE;
++        }
++        if (access(resolved_path, R_OK) != 0) {
++            fprintf(stderr, "Error: Library file '%s' is not readable: %s\n", resolved_path, strerror(errno));
++            return EXIT_FAILURE;
++        }
++        library_path = resolved_path;
+     }
+ 
+     // Validate entry name.
+@@ -1004,7 +1059,7 @@ int main(int argc, char **argv) {
+     }
+ 
+     LOGI("TEESimulator injector starting...");
+-    bool success = inject::inject_library(pid, resolved_path, entry_name);
++    bool success = inject::inject_library(pid, library_path, entry_name, inherited_lib_fd);
+ 
+     if (success) {
+         LOGI("Injection completed successfully.");
+diff --git a/module/customize.sh b/module/customize.sh
+index cbcd0c3..49bd275 100644
+--- a/module/customize.sh
++++ b/module/customize.sh
+@@ -26,6 +26,20 @@ if [ ! -f /data/adb/teesim/config.json ]; then
+   cp "$MODPATH/config.default.json" /data/adb/teesim/config.json
+ fi
+ 
++# The customised APatch can authorize one exact injector/keystore transaction
++# without loading a persistent SELinux policy.  Record that install-time choice
++# in the module directory and remove only the installed copy of sepolicy.rule.
++# Every other root manager keeps the compatibility policy unchanged.
++APATCH_INJECT_MARKER="$MODPATH/.apatch_exact_inject_v1"
++SU=/system/bin/su
++if [ -x "$SU" ] && "$SU" --no-pty --inject-capable >/dev/null 2>&1; then
++  rm -f "$MODPATH/sepolicy.rule"
++  : > "$APATCH_INJECT_MARKER"
++  ui_print "- Using APatch exact injection (no persistent SELinux policy)"
++else
++  rm -f "$APATCH_INJECT_MARKER"
++fi
++
+ # Ship only the ABI this device runs; the other ABI's native libraries are dead weight here.
+ case "$ARCH" in
+   arm64) rm -rf "$MODPATH/x86_64" ;;
+-- 
+2.45.1.windows.1
+

@@ -1,0 +1,1849 @@
+From f522c25f194f02311c59702747df5bb2ec66fe55 Mon Sep 17 00:00:00 2001
+From: JingMatrix <jingmatrix@gmail.com>
+Date: Sun, 9 Aug 2026 21:20:57 +0200
+Subject: [PATCH 08/47] Add the control channel and route by profile
+
+The interceptors become pure engines driven by the daemon over an abstract unix socket. common/control.cpp serves length-prefixed JSON config pushes, staged into one reference-TA instance per profile and swapped atomically; common/json is a small no-throw reader. keymint routes creation by ATTESTATION_APPLICATION_ID, keystore by uid, and operations run on a default TA since blobs are cross-decryptable. entry() now just starts the server and installs the hook.
+---
+ common/control.cpp           | 339 +++++++++++++++++++++++++++
+ common/control.h             |  77 +++++++
+ common/json.cpp              | 428 +++++++++++++++++++++++++++++++++++
+ common/json.hpp              |  78 +++++++
+ keymint/keymint_entry.cpp    |  76 +------
+ keymint/keymint_router.cpp   | 262 +++++++++++++++------
+ keystore/keystore_entry.cpp  |  63 +-----
+ keystore/keystore_router.cpp | 151 +++++++++---
+ 8 files changed, 1250 insertions(+), 224 deletions(-)
+ create mode 100644 common/control.cpp
+ create mode 100644 common/control.h
+ create mode 100644 common/json.cpp
+ create mode 100644 common/json.hpp
+
+diff --git a/common/control.cpp b/common/control.cpp
+new file mode 100644
+index 0000000..49c07ca
+--- /dev/null
++++ b/common/control.cpp
+@@ -0,0 +1,339 @@
++// The control-channel server: it owns the abstract unix socket @teesim, accepts
++// the daemon's connection, and turns each pushed "config" message into calls on
++// the router's staging API. See control.h for the protocol shape.
++//
++// Pure POSIX + the JSON reader + the staging API, so the same object file links
++// into both interceptors (which are built with -fno-exceptions/-fno-rtti); it
++// touches no binder or android headers beyond the property read.
++
++#include "control.h"
++
++#include <pthread.h>
++#include <sys/socket.h>
++#include <sys/system_properties.h>
++#include <sys/un.h>
++#include <unistd.h>
++
++#include <cerrno>
++#include <cstddef>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++#include "json.hpp"
++#include "logging.hpp"
++
++namespace {
++
++// Abstract socket: sun_path[0] == '\0', then these bytes. One daemon, one
++// keystore, so a single well-known name suffices.
++constexpr const char kSocketName[] = "teesim";
++constexpr size_t kSocketNameLen = sizeof(kSocketName) - 1;
++constexpr size_t kMaxFrame = 8u * 1024 * 1024;
++
++// Decode standard base64 (padding optional; whitespace ignored). Returns false
++// on any invalid character.
++bool Base64Decode(const std::string &in, std::vector<uint8_t> &out) {
++  auto val = [](char c) -> int {
++    if (c >= 'A' && c <= 'Z') return c - 'A';
++    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
++    if (c >= '0' && c <= '9') return c - '0' + 52;
++    if (c == '+') return 62;
++    if (c == '/') return 63;
++    return -1;
++  };
++  out.clear();
++  out.reserve(in.size() / 4 * 3 + 3);
++  uint32_t buf = 0;
++  int bits = 0;
++  for (char c : in) {
++    if (c == '=') break;
++    if (c == '\n' || c == '\r' || c == ' ' || c == '\t') continue;
++    int v = val(c);
++    if (v < 0) return false;
++    buf = (buf << 6) | static_cast<uint32_t>(v);
++    bits += 6;
++    if (bits >= 8) {
++      bits -= 8;
++      out.push_back(static_cast<uint8_t>((buf >> bits) & 0xFF));
++    }
++  }
++  return true;
++}
++
++int AndroidApi() {
++  char buf[PROP_VALUE_MAX] = {0};
++  if (__system_property_get("ro.build.version.sdk", buf) > 0) return atoi(buf);
++  return 0;
++}
++
++bool ReadFull(int fd, void *p, size_t n) {
++  uint8_t *b = static_cast<uint8_t *>(p);
++  while (n > 0) {
++    ssize_t r = read(fd, b, n);
++    if (r <= 0) return false;
++    b += r;
++    n -= static_cast<size_t>(r);
++  }
++  return true;
++}
++
++bool WriteFull(int fd, const void *p, size_t n) {
++  const uint8_t *b = static_cast<const uint8_t *>(p);
++  while (n > 0) {
++    ssize_t w = write(fd, b, n);
++    if (w <= 0) return false;
++    b += w;
++    n -= static_cast<size_t>(w);
++  }
++  return true;
++}
++
++// One length-prefixed frame: [u32 big-endian length][UTF-8 JSON].
++bool ReadFrame(int fd, std::string &out) {
++  uint8_t hdr[4];
++  if (!ReadFull(fd, hdr, 4)) return false;
++  uint32_t len = (uint32_t(hdr[0]) << 24) | (uint32_t(hdr[1]) << 16) |
++                 (uint32_t(hdr[2]) << 8) | uint32_t(hdr[3]);
++  if (len == 0 || len > kMaxFrame) return false;
++  out.resize(len);
++  return ReadFull(fd, &out[0], len);
++}
++
++bool WriteFrame(int fd, const std::string &payload) {
++  uint32_t len = static_cast<uint32_t>(payload.size());
++  uint8_t hdr[4] = {uint8_t(len >> 24), uint8_t(len >> 16), uint8_t(len >> 8),
++                    uint8_t(len)};
++  return WriteFull(fd, hdr, 4) && WriteFull(fd, payload.data(), payload.size());
++}
++
++// Owns the decoded byte spans a TsProfile points into, for the lifetime of one
++// teesim_cfg_add_profile call.
++struct ProfileStorage {
++  std::string id;
++  std::vector<uint8_t> keybox;
++  std::vector<std::string> pkg_strings;
++  std::vector<const char *> pkg_ptrs;
++  std::vector<int32_t> uids;
++  std::string brand, device, product, serial, imei, imei2, meid, manufacturer, model;
++  TsDeviceIds ids{};
++  bool has_ids = false;
++};
++
++// Populate a TsDeviceIds from an optional "deviceIds" object, keeping the string
++// bytes in `s`. Returns true if at least one id is present.
++bool FillDeviceIds(const tjson::Value &obj, ProfileStorage &s) {
++  auto field = [&](const char *key, std::string &dst, const uint8_t *&ptr, size_t &len) {
++    const tjson::Value *v = obj.get(key);
++    if (v && v->is_string()) dst = v->as_string();
++    ptr = reinterpret_cast<const uint8_t *>(dst.data());
++    len = dst.size();
++  };
++  field("brand", s.brand, s.ids.brand, s.ids.brand_len);
++  field("device", s.device, s.ids.device, s.ids.device_len);
++  field("product", s.product, s.ids.product, s.ids.product_len);
++  field("serial", s.serial, s.ids.serial, s.ids.serial_len);
++  field("imei", s.imei, s.ids.imei, s.ids.imei_len);
++  field("imei2", s.imei2, s.ids.imei2, s.ids.imei2_len);
++  field("meid", s.meid, s.ids.meid, s.ids.meid_len);
++  field("manufacturer", s.manufacturer, s.ids.manufacturer, s.ids.manufacturer_len);
++  field("model", s.model, s.ids.model, s.ids.model_len);
++  return !(s.brand.empty() && s.device.empty() && s.product.empty() &&
++           s.serial.empty() && s.imei.empty() && s.imei2.empty() && s.meid.empty() &&
++           s.manufacturer.empty() && s.model.empty());
++}
++
++// Apply one parsed "config" message. Writes the ack counts through the outparams.
++void ApplyConfig(const tjson::Value &msg, uint64_t &epoch, int &applied, int &total) {
++  epoch = 0;
++  applied = 0;
++  total = 0;
++  if (const tjson::Value *e = msg.get("epoch")) epoch = static_cast<uint64_t>(e->as_int(0));
++
++  // Device-wide boot info.
++  std::vector<uint8_t> vb_key, vb_hash;
++  TsBootInfo boot{};
++  if (const tjson::Value *bi = msg.get("bootInfo")) {
++    if (const tjson::Value *k = bi->get("verifiedBootKey")) Base64Decode(k->as_string(), vb_key);
++    if (const tjson::Value *h = bi->get("verifiedBootHash")) Base64Decode(h->as_string(), vb_hash);
++    boot.device_locked = bi->get("deviceLocked") ? bi->get("deviceLocked")->as_bool(true) : true;
++    boot.verified_boot_state =
++        bi->get("verifiedBootState") ? int32_t(bi->get("verifiedBootState")->as_int(0)) : 0;
++  } else {
++    boot.device_locked = true;
++  }
++  boot.verified_boot_key = vb_key.data();
++  boot.verified_boot_key_len = vb_key.size();
++  boot.verified_boot_hash = vb_hash.data();
++  boot.verified_boot_hash_len = vb_hash.size();
++  teesim_cfg_begin(&boot);
++
++  const tjson::Value *profiles = msg.get("profiles");
++  if (profiles && profiles->is_array()) {
++    total = static_cast<int>(profiles->size());
++    for (size_t i = 0; i < profiles->size(); ++i) {
++      const tjson::Value &pj = profiles->at(i);
++      ProfileStorage s;
++      s.id = pj.get("id") ? pj.get("id")->as_string() : std::string();
++      if (const tjson::Value *kb = pj.get("keyboxB64")) {
++        if (!Base64Decode(kb->as_string(), s.keybox)) {
++          LOGE("control: profile %s has an undecodable keybox", s.id.c_str());
++          continue;
++        }
++      }
++      if (const tjson::Value *pkgs = pj.get("packages")) {
++        for (size_t j = 0; j < pkgs->size(); ++j) s.pkg_strings.push_back(pkgs->at(j).as_string());
++      }
++      s.pkg_ptrs.reserve(s.pkg_strings.size());
++      for (const auto &p : s.pkg_strings) s.pkg_ptrs.push_back(p.c_str());
++      if (const tjson::Value *uids = pj.get("uids")) {
++        for (size_t j = 0; j < uids->size(); ++j)
++          s.uids.push_back(static_cast<int32_t>(uids->at(j).as_int(-1)));
++      }
++      if (const tjson::Value *ids = pj.get("deviceIds")) s.has_ids = FillDeviceIds(*ids, s);
++
++      TsProfile tp{};
++      tp.id = s.id.c_str();
++      tp.keybox = s.keybox.data();
++      tp.keybox_len = s.keybox.size();
++      tp.security_level = pj.get("securityLevel") ? int32_t(pj.get("securityLevel")->as_int(1)) : 1;
++      tp.os_version = pj.get("osVersion") ? uint32_t(pj.get("osVersion")->as_int(0)) : 0;
++      tp.os_patchlevel = pj.get("osPatchLevel") ? uint32_t(pj.get("osPatchLevel")->as_int(0)) : 0;
++      tp.vendor_patchlevel =
++          pj.get("vendorPatchLevel") ? uint32_t(pj.get("vendorPatchLevel")->as_int(0)) : 0;
++      tp.boot_patchlevel =
++          pj.get("bootPatchLevel") ? uint32_t(pj.get("bootPatchLevel")->as_int(0)) : 0;
++      tp.ids = s.has_ids ? &s.ids : nullptr;
++      tp.packages = s.pkg_ptrs.data();
++      tp.n_packages = static_cast<int>(s.pkg_ptrs.size());
++      tp.uids = s.uids.data();
++      tp.n_uids = static_cast<int>(s.uids.size());
++
++      if (teesim_cfg_add_profile(&tp)) ++applied;
++    }
++  }
++  char err[128] = {0};
++  int committed = teesim_cfg_commit(epoch, err, sizeof(err));
++  if (committed < 0) LOGE("control: commit failed: %s", err);
++}
++
++std::string BuildHello() {
++  std::string s = "{\"type\":\"hello\",\"role\":\"lib\",\"protocol\":1,\"hook\":\"";
++  s += teesim_hook_name();
++  s += "\",\"androidApi\":";
++  s += std::to_string(AndroidApi());
++  s += ",\"keystorePid\":";
++  s += std::to_string(getpid());
++  s += "}";
++  return s;
++}
++
++std::string BuildAck(uint64_t epoch, int applied, int total) {
++  std::string s = "{\"type\":\"ack\",\"epoch\":";
++  s += std::to_string(epoch);
++  s += ",\"ok\":true,\"profilesApplied\":";
++  s += std::to_string(applied);
++  s += ",\"profilesFailed\":";
++  s += std::to_string(total - applied);
++  s += "}";
++  return s;
++}
++
++// Serve one accepted daemon connection until it closes.
++void HandleConnection(int fd) {
++  // Auth: only root (the daemon) may push config.
++  struct ucred cred{};
++  socklen_t clen = sizeof(cred);
++  if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &clen) != 0 || cred.uid != 0) {
++    LOGE("control: rejecting non-root peer uid=%d", cred.uid);
++    close(fd);
++    return;
++  }
++  WriteFrame(fd, BuildHello());
++
++  std::string frame;
++  while (ReadFrame(fd, frame)) {
++    tjson::Value msg;
++    if (!tjson::parse(frame.data(), frame.size(), msg)) {
++      LOGE("control: dropping unparseable frame (%zu bytes)", frame.size());
++      continue;
++    }
++    const tjson::Value *type = msg.get("type");
++    std::string t = type ? type->as_string() : std::string();
++    if (t == "config") {
++      uint64_t epoch = 0;
++      int applied = 0, total = 0;
++      ApplyConfig(msg, epoch, applied, total);
++      WriteFrame(fd, BuildAck(epoch, applied, total));
++      LOGI("control: applied config epoch=%llu profiles=%d/%d",
++           static_cast<unsigned long long>(epoch), applied, total);
++    } else if (t == "ping") {
++      const tjson::Value *e = msg.get("epoch");
++      std::string pong = "{\"type\":\"pong\",\"epoch\":";
++      pong += std::to_string(e ? e->as_int(0) : 0);
++      pong += "}";
++      WriteFrame(fd, pong);
++    }
++    // "hello" and unknown types are ignored (forward-compat).
++  }
++  close(fd);
++}
++
++void *ServerThread(void *) {
++  int srv = socket(AF_UNIX, SOCK_STREAM, 0);
++  if (srv < 0) {
++    LOGE("control: socket() failed: %s", strerror(errno));
++    return nullptr;
++  }
++  struct sockaddr_un addr{};
++  addr.sun_family = AF_UNIX;
++  addr.sun_path[0] = '\0';  // abstract namespace
++  memcpy(addr.sun_path + 1, kSocketName, kSocketNameLen);
++  socklen_t alen = static_cast<socklen_t>(offsetof(struct sockaddr_un, sun_path) + 1 + kSocketNameLen);
++
++  // The previous keystore may still own the name for a moment after a restart.
++  for (int attempt = 0; attempt < 10; ++attempt) {
++    if (bind(srv, reinterpret_cast<struct sockaddr *>(&addr), alen) == 0) break;
++    if (attempt == 9) {
++      LOGE("control: bind(@teesim) failed: %s", strerror(errno));
++      close(srv);
++      return nullptr;
++    }
++    sleep(1);
++  }
++  if (listen(srv, 4) != 0) {
++    LOGE("control: listen() failed: %s", strerror(errno));
++    close(srv);
++    return nullptr;
++  }
++  LOGI("control: listening on @%s (hook=%s)", kSocketName, teesim_hook_name());
++
++  for (;;) {
++    int fd = accept(srv, nullptr, nullptr);
++    if (fd < 0) {
++      if (errno == EINTR) continue;
++      LOGE("control: accept() failed: %s", strerror(errno));
++      break;
++    }
++    HandleConnection(fd);  // one connection at a time; the daemon is the sole client
++  }
++  close(srv);
++  return nullptr;
++}
++
++}  // namespace
++
++extern "C" void teesim_control_start(void) {
++  static bool started = false;
++  if (started) return;
++  started = true;
++  pthread_t t;
++  if (pthread_create(&t, nullptr, ServerThread, nullptr) == 0) {
++    pthread_detach(t);
++  } else {
++    LOGE("control: pthread_create failed");
++    started = false;
++  }
++}
+diff --git a/common/control.h b/common/control.h
+new file mode 100644
+index 0000000..87512c3
+--- /dev/null
++++ b/common/control.h
+@@ -0,0 +1,77 @@
++// The daemon <-> lib control channel, and the config-staging API the routers
++// implement. The daemon resolves configuration against the live device and
++// pushes it here over an abstract unix socket; the lib is a pure engine that
++// never reads files, a clock, or package data.
++//
++// A push is applied as: teesim_cfg_begin(boot); add_profile() x N; commit(epoch).
++// commit atomically swaps the live profile set and routing tables, so the
++// AIBinder_transact / ioctl hooks keep serving the previous config until the
++// instant the new one is ready.
++#ifndef TEESIM_CONTROL_H
++#define TEESIM_CONTROL_H
++
++#include <stddef.h>
++#include <stdint.h>
++#include <stdbool.h>
++
++#include "teesim_km.h"  // TsDeviceIds
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Device-wide verified-boot info. Same for every profile and frozen by the
++// daemon (it feeds the KEK derivation), so blobs stay decryptable across reboots.
++// verified_boot_state: 0 Verified, 1 SelfSigned, 2 Unverified, 3 Failed.
++typedef struct {
++  const uint8_t *verified_boot_key;
++  size_t verified_boot_key_len;
++  const uint8_t *verified_boot_hash;
++  size_t verified_boot_hash_len;
++  bool device_locked;
++  int32_t verified_boot_state;
++} TsBootInfo;
++
++// One fully-resolved profile from a config push. All strings/bytes are borrowed
++// for the duration of the teesim_cfg_add_profile call only.
++typedef struct {
++  const char *id;
++  const uint8_t *keybox;
++  size_t keybox_len;
++  int32_t security_level;  // 0 Software, 1 TEE, 2 StrongBox
++  uint32_t os_version;
++  uint32_t os_patchlevel;
++  uint32_t vendor_patchlevel;
++  uint32_t boot_patchlevel;
++  const TsDeviceIds *ids;  // NULL if the profile provisions no device IDs
++  const char *const *packages;  // for keystore2 name-match
++  int n_packages;
++  const int32_t *uids;  // for keystore1 uid-match (may be shorter than packages)
++  int n_uids;
++} TsProfile;
++
++// --- staging API, implemented by each router ---------------------------------
++
++// Start a new staging generation with the device-wide boot info (copied).
++void teesim_cfg_begin(const TsBootInfo *boot);
++// Build one profile's TA and stage its routing. Returns false if the profile
++// failed to build (e.g. a bad keybox); such a profile is skipped, its apps fall
++// through to real hardware, and the rest of the push still applies.
++bool teesim_cfg_add_profile(const TsProfile *p);
++// Atomically swap the staged profile set live. Returns the number of profiles
++// applied, or -1 on a hard failure. `err` receives a short message on failure.
++int teesim_cfg_commit(uint64_t epoch, char *err, size_t err_len);
++// Which hook this lib is, for the hello message: "keymint" or "keystore1".
++const char *teesim_hook_name(void);
++
++// --- control server, implemented in common/control.cpp -----------------------
++
++// Bind the abstract socket @teesim, listen, and serve config pushes on a
++// detached thread. Idempotent; safe to call once from entry().
++void teesim_control_start(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif  // TEESIM_CONTROL_H
+diff --git a/common/json.cpp b/common/json.cpp
+new file mode 100644
+index 0000000..def5508
+--- /dev/null
++++ b/common/json.cpp
+@@ -0,0 +1,428 @@
++#include "json.hpp"
++
++#include <cstdlib>
++#include <cstring>
++
++namespace tjson {
++
++namespace {
++
++// Shared fallbacks handed out by the total accessors. They are const, so the
++// aliasing is harmless.
++const Value kNull;
++const std::string kEmptyString;
++
++// Encodes a Unicode code point as UTF-8 and appends it to out. cp is always a
++// valid scalar value (<= 0x10FFFF, no surrogates) by the time this is called.
++void append_utf8(std::string &out, uint32_t cp) {
++    if (cp <= 0x7F) {
++        out.push_back(static_cast<char>(cp));
++    } else if (cp <= 0x7FF) {
++        out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
++        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
++    } else if (cp <= 0xFFFF) {
++        out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
++        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
++        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
++    } else {
++        out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
++        out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
++        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
++        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
++    }
++}
++
++} // namespace
++
++// A recursive-descent parser over a bounded byte buffer. Every read is guarded
++// against the end of the buffer, and recursion depth is passed down explicitly
++// so the container parsers can reject documents nested beyond kMaxDepth.
++struct Parser {
++    const char *p;
++    size_t n;
++    size_t i = 0;
++
++    static constexpr int kMaxDepth = 200;
++
++    bool eof() const { return i >= n; }
++
++    void skip_ws() {
++        while (i < n) {
++            char c = p[i];
++            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
++                ++i;
++            } else {
++                break;
++            }
++        }
++    }
++
++    // Matches a bare literal (true / false / null) starting at the cursor.
++    bool match_literal(const char *lit) {
++        size_t l = std::strlen(lit);
++        if (i + l > n || std::memcmp(p + i, lit, l) != 0) {
++            return false;
++        }
++        i += l;
++        return true;
++    }
++
++    // Reads exactly four hex digits into out, advancing the cursor on success.
++    bool read_hex4(uint32_t &out) {
++        if (i + 4 > n) {
++            return false;
++        }
++        uint32_t v = 0;
++        for (int k = 0; k < 4; ++k) {
++            char c = p[i + k];
++            v <<= 4;
++            if (c >= '0' && c <= '9') {
++                v |= static_cast<uint32_t>(c - '0');
++            } else if (c >= 'a' && c <= 'f') {
++                v |= static_cast<uint32_t>(c - 'a' + 10);
++            } else if (c >= 'A' && c <= 'F') {
++                v |= static_cast<uint32_t>(c - 'A' + 10);
++            } else {
++                return false;
++            }
++        }
++        i += 4;
++        out = v;
++        return true;
++    }
++
++    // Parses a JSON string, with the cursor sitting on the opening quote.
++    bool parse_string(std::string &out) {
++        ++i; // consume opening quote
++        while (true) {
++            if (eof()) {
++                return false; // unterminated string
++            }
++            unsigned char c = static_cast<unsigned char>(p[i]);
++            if (c == '"') {
++                ++i;
++                return true;
++            }
++            if (c == '\\') {
++                ++i;
++                if (eof()) {
++                    return false;
++                }
++                char e = p[i++];
++                switch (e) {
++                case '"': out.push_back('"'); break;
++                case '\\': out.push_back('\\'); break;
++                case '/': out.push_back('/'); break;
++                case 'b': out.push_back('\b'); break;
++                case 'f': out.push_back('\f'); break;
++                case 'n': out.push_back('\n'); break;
++                case 'r': out.push_back('\r'); break;
++                case 't': out.push_back('\t'); break;
++                case 'u': {
++                    uint32_t cp;
++                    if (!read_hex4(cp)) {
++                        return false;
++                    }
++                    if (cp >= 0xD800 && cp <= 0xDBFF) {
++                        // High surrogate: must be followed by \uXXXX low surrogate.
++                        if (i + 2 > n || p[i] != '\\' || p[i + 1] != 'u') {
++                            return false;
++                        }
++                        i += 2;
++                        uint32_t lo;
++                        if (!read_hex4(lo)) {
++                            return false;
++                        }
++                        if (lo < 0xDC00 || lo > 0xDFFF) {
++                            return false;
++                        }
++                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
++                    } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
++                        return false; // lone low surrogate
++                    }
++                    append_utf8(out, cp);
++                    break;
++                }
++                default:
++                    return false; // invalid escape
++                }
++            } else if (c < 0x20) {
++                return false; // raw control character
++            } else {
++                // Any other byte, including UTF-8 continuation bytes, passes
++                // through verbatim.
++                out.push_back(static_cast<char>(c));
++                ++i;
++            }
++        }
++    }
++
++    // Parses a JSON number, with the cursor on '-' or a digit.
++    bool parse_number(Value &out) {
++        size_t start = i;
++
++        if (i < n && p[i] == '-') {
++            ++i;
++        }
++        // Integer part: a lone 0, or a nonzero digit followed by more digits.
++        if (eof()) {
++            return false;
++        }
++        if (p[i] == '0') {
++            ++i;
++        } else if (p[i] >= '1' && p[i] <= '9') {
++            ++i;
++            while (i < n && p[i] >= '0' && p[i] <= '9') {
++                ++i;
++            }
++        } else {
++            return false;
++        }
++
++        bool is_int = true;
++
++        if (i < n && p[i] == '.') {
++            is_int = false;
++            ++i;
++            if (i >= n || p[i] < '0' || p[i] > '9') {
++                return false; // need at least one fractional digit
++            }
++            while (i < n && p[i] >= '0' && p[i] <= '9') {
++                ++i;
++            }
++        }
++
++        if (i < n && (p[i] == 'e' || p[i] == 'E')) {
++            is_int = false;
++            ++i;
++            if (i < n && (p[i] == '+' || p[i] == '-')) {
++                ++i;
++            }
++            if (i >= n || p[i] < '0' || p[i] > '9') {
++                return false; // need at least one exponent digit
++            }
++            while (i < n && p[i] >= '0' && p[i] <= '9') {
++                ++i;
++            }
++        }
++
++        std::string tok(p + start, i - start);
++        out.type_ = Value::Number;
++
++        if (is_int) {
++            bool neg = tok[0] == '-';
++            size_t k = neg ? 1 : 0;
++            int64_t val = 0;
++            bool overflow = false;
++            for (; k < tok.size(); ++k) {
++                int d = tok[k] - '0';
++                if (val > (INT64_MAX - d) / 10) {
++                    overflow = true;
++                    break;
++                }
++                val = val * 10 + d;
++            }
++            if (!overflow) {
++                out.int_ = neg ? -val : val;
++                out.int_exact_ = true;
++                out.dbl_ = static_cast<double>(out.int_);
++                return true;
++            }
++            // Fall through to the double path for integers too large for int64.
++        }
++
++        out.int_exact_ = false;
++        out.dbl_ = std::strtod(tok.c_str(), nullptr);
++        out.int_ = static_cast<int64_t>(out.dbl_);
++        return true;
++    }
++
++    bool parse_array(Value &out, int depth) {
++        ++i; // consume '['
++        out.type_ = Value::Array;
++        skip_ws();
++        if (eof()) {
++            return false;
++        }
++        if (p[i] == ']') {
++            ++i;
++            return true;
++        }
++        while (true) {
++            Value v;
++            if (!parse_value(v, depth + 1)) {
++                return false;
++            }
++            out.arr_.push_back(std::move(v));
++            skip_ws();
++            if (eof()) {
++                return false;
++            }
++            if (p[i] == ',') {
++                ++i;
++                continue;
++            }
++            if (p[i] == ']') {
++                ++i;
++                return true;
++            }
++            return false;
++        }
++    }
++
++    bool parse_object(Value &out, int depth) {
++        ++i; // consume '{'
++        out.type_ = Value::Object;
++        skip_ws();
++        if (eof()) {
++            return false;
++        }
++        if (p[i] == '}') {
++            ++i;
++            return true;
++        }
++        while (true) {
++            skip_ws();
++            if (eof() || p[i] != '"') {
++                return false;
++            }
++            std::string key;
++            if (!parse_string(key)) {
++                return false;
++            }
++            skip_ws();
++            if (eof() || p[i] != ':') {
++                return false;
++            }
++            ++i;
++            Value v;
++            if (!parse_value(v, depth + 1)) {
++                return false;
++            }
++            // Last occurrence of a duplicate key wins.
++            bool replaced = false;
++            for (auto &kv : out.obj_) {
++                if (kv.first == key) {
++                    kv.second = std::move(v);
++                    replaced = true;
++                    break;
++                }
++            }
++            if (!replaced) {
++                out.obj_.emplace_back(std::move(key), std::move(v));
++            }
++            skip_ws();
++            if (eof()) {
++                return false;
++            }
++            if (p[i] == ',') {
++                ++i;
++                continue;
++            }
++            if (p[i] == '}') {
++                ++i;
++                return true;
++            }
++            return false;
++        }
++    }
++
++    bool parse_value(Value &out, int depth) {
++        if (depth > kMaxDepth) {
++            return false;
++        }
++        skip_ws();
++        if (eof()) {
++            return false;
++        }
++        char c = p[i];
++        switch (c) {
++        case '{':
++            return parse_object(out, depth);
++        case '[':
++            return parse_array(out, depth);
++        case '"':
++            out.type_ = Value::String;
++            return parse_string(out.str_);
++        case 't':
++            if (!match_literal("true")) {
++                return false;
++            }
++            out.type_ = Value::Bool;
++            out.bool_ = true;
++            return true;
++        case 'f':
++            if (!match_literal("false")) {
++                return false;
++            }
++            out.type_ = Value::Bool;
++            out.bool_ = false;
++            return true;
++        case 'n':
++            if (!match_literal("null")) {
++                return false;
++            }
++            out.type_ = Value::Null;
++            return true;
++        default:
++            if (c == '-' || (c >= '0' && c <= '9')) {
++                return parse_number(out);
++            }
++            return false;
++        }
++    }
++};
++
++const Value *Value::get(const std::string &key) const {
++    if (type_ != Object) {
++        return nullptr;
++    }
++    for (const auto &kv : obj_) {
++        if (kv.first == key) {
++            return &kv.second;
++        }
++    }
++    return nullptr;
++}
++
++size_t Value::size() const {
++    return type_ == Array ? arr_.size() : 0;
++}
++
++const Value &Value::at(size_t i) const {
++    if (type_ != Array || i >= arr_.size()) {
++        return kNull;
++    }
++    return arr_[i];
++}
++
++bool Value::as_bool(bool def) const {
++    return type_ == Bool ? bool_ : def;
++}
++
++int64_t Value::as_int(int64_t def) const {
++    return type_ == Number ? int_ : def;
++}
++
++double Value::as_double(double def) const {
++    return type_ == Number ? dbl_ : def;
++}
++
++const std::string &Value::as_string() const {
++    return type_ == String ? str_ : kEmptyString;
++}
++
++bool parse(const char *data, size_t len, Value &out) {
++    out = Value();
++    if (data == nullptr) {
++        return false;
++    }
++    Parser ps{data, len};
++    if (!ps.parse_value(out, 0)) {
++        return false;
++    }
++    ps.skip_ws();
++    return ps.eof(); // reject trailing garbage after the top-level value
++}
++
++} // namespace tjson
+diff --git a/common/json.hpp b/common/json.hpp
+new file mode 100644
+index 0000000..cf0b1ed
+--- /dev/null
++++ b/common/json.hpp
+@@ -0,0 +1,78 @@
++#ifndef TJSON_JSON_HPP
++#define TJSON_JSON_HPP
++
++// A tiny, dependency-free JSON reader for use inside a native Android library.
++//
++// This parser is built to link into code compiled with -fno-exceptions and
++// -fno-rtti. It never throws, never aborts, and never over-reads its input:
++// every malformed, truncated, or hostile document is rejected by returning
++// false from parse(). Accessors are total functions that fall back to a
++// caller-supplied default (or a shared empty/null instance) whenever the
++// underlying type does not match, so callers never need to check before asking.
++
++#include <cstddef>
++#include <cstdint>
++#include <string>
++#include <utility>
++#include <vector>
++
++namespace tjson {
++
++// An immutable node of a parsed JSON document. A Value owns its children, so a
++// single root keeps the whole tree alive; copying a Value deep-copies it.
++class Value {
++public:
++    enum Type { Null, Bool, Number, String, Array, Object };
++
++    Value() = default;
++
++    Type type() const { return type_; }
++    bool is_null() const { return type_ == Null; }
++    bool is_bool() const { return type_ == Bool; }
++    bool is_number() const { return type_ == Number; }
++    bool is_string() const { return type_ == String; }
++    bool is_array() const { return type_ == Array; }
++    bool is_object() const { return type_ == Object; }
++
++    // Object lookup. Returns nullptr when this Value is not an object or the key
++    // is absent. When a document repeats a key, the last occurrence wins.
++    const Value *get(const std::string &key) const;
++
++    // Array access. size() is 0 for anything that is not an array. at(i) returns
++    // a reference to a shared static Null value when i is out of range or this
++    // Value is not an array, so the result is always safe to dereference.
++    size_t size() const;
++    const Value &at(size_t i) const;
++
++    // Scalar accessors. Each returns the supplied default (or a reference to a
++    // shared empty string) when the stored type does not match the request.
++    bool as_bool(bool def = false) const;
++    int64_t as_int(int64_t def = 0) const;
++    double as_double(double def = 0.0) const;
++    const std::string &as_string() const;
++
++private:
++    friend struct Parser;
++
++    Type type_ = Null;
++    bool bool_ = false;
++    // For a Number, dbl_ always holds the value. int_exact_ records whether the
++    // source token was an integer that fit in int64_t, in which case int_ holds
++    // the exact value (so digits like 20250805 survive without double rounding).
++    bool int_exact_ = false;
++    int64_t int_ = 0;
++    double dbl_ = 0.0;
++    std::string str_;
++    std::vector<Value> arr_;
++    std::vector<std::pair<std::string, Value>> obj_;
++};
++
++// Parses len bytes of UTF-8 JSON. On success returns true and populates out; on
++// any syntax error returns false and leaves out unspecified. Safe on arbitrary,
++// malformed, or truncated input: no over-read, no crash, no allocation on a null
++// pointer. Nesting is capped, so pathological input cannot exhaust the stack.
++bool parse(const char *data, size_t len, Value &out);
++
++} // namespace tjson
++
++#endif // TJSON_JSON_HPP
+diff --git a/keymint/keymint_entry.cpp b/keymint/keymint_entry.cpp
+index 8403a9b..04e6cc7 100644
+--- a/keymint/keymint_entry.cpp
++++ b/keymint/keymint_entry.cpp
+@@ -1,77 +1,21 @@
+-// Injection entry point for the KeyMint interceptor.
++// Injection entry point for the KeyMint interceptor (Android 12+).
+ //
+-// The injector loads this library into keystore2 and calls entry(). We read the
+-// keybox and target list from the module configuration, build the TA, and install
+-// the AIBinder_transact hook. If the keybox is missing we install nothing, so a
+-// misconfigured module is a no-op rather than a hazard.
+-
+-#include <fstream>
+-#include <sstream>
+-#include <string>
+-#include <vector>
++// The daemon injects this library into keystore2 and calls entry(). We install
++// the AIBinder_transact hook in an unconfigured, forward-everything state and
++// start the control server; the daemon then connects over @teesim and pushes the
++// resolved profile set. Nothing is read from disk here — the lib is a pure
++// engine driven entirely by control-channel pushes.
+ 
++#include "control.h"
+ #include "logging.hpp"
+ 
+-extern "C" bool teesim_router_init(const char* keybox_xml, size_t len);
+-extern "C" void teesim_router_configure(bool target_all, const char* const* pkgs, int n);
++// keymint_hook.cpp
+ extern "C" bool teesim_hook_install();
+ 
+-namespace {
+-
+-// keystore2 runs unprivileged, so these paths must be readable by it; the module
+-// is responsible for placing the configuration where keystore2 can reach it.
+-constexpr const char* kKeyboxPath = "/data/adb/teesim/keybox.xml";
+-constexpr const char* kTargetPath = "/data/adb/teesim/target.txt";
+-
+-std::string ReadFile(const char* path) {
+-  std::ifstream f(path, std::ios::binary);
+-  if (!f) return {};
+-  std::stringstream ss;
+-  ss << f.rdbuf();
+-  return ss.str();
+-}
+-
+-// Extract package names from target.txt, ignoring comments, blank lines, keybox
+-// selectors ("[file.xml]") and any trailing mode suffix ('!' or '?').
+-std::vector<std::string> ParseTargets(const std::string& text) {
+-  std::vector<std::string> out;
+-  std::stringstream ss(text);
+-  std::string line;
+-  while (std::getline(ss, line)) {
+-    // Trim whitespace.
+-    size_t b = line.find_first_not_of(" \t\r\n");
+-    if (b == std::string::npos) continue;
+-    size_t e = line.find_last_not_of(" \t\r\n");
+-    line = line.substr(b, e - b + 1);
+-    if (line.empty() || line[0] == '#' || line[0] == '[') continue;
+-    if (line.back() == '!' || line.back() == '?') line.pop_back();
+-    if (!line.empty()) out.push_back(line);
+-  }
+-  return out;
+-}
+-
+-}  // namespace
+-
+ extern "C" [[gnu::visibility("default")]] bool entry(void* /*handle*/) {
+   LOGI("TEESimulator KeyMint interceptor loading");
+-
+-  std::string keybox = ReadFile(kKeyboxPath);
+-  if (keybox.empty()) {
+-    LOGE("No keybox at %s; not installing interceptor", kKeyboxPath);
+-    return false;
+-  }
+-  if (!teesim_router_init(keybox.c_str(), keybox.size())) {
+-    LOGE("TA init failed (bad keybox?)");
+-    return false;
+-  }
+-
+-  std::vector<std::string> targets = ParseTargets(ReadFile(kTargetPath));
+-  std::vector<const char*> ptrs;
+-  ptrs.reserve(targets.size());
+-  for (const auto& t : targets) ptrs.push_back(t.c_str());
+-  teesim_router_configure(false, ptrs.data(), static_cast<int>(ptrs.size()));
+-
++  teesim_control_start();
+   bool ok = teesim_hook_install();
+-  LOGI("TEESimulator KeyMint interceptor installed=%d targets=%zu", ok, targets.size());
++  LOGI("TEESimulator KeyMint interceptor installed=%d (awaiting config push)", ok);
+   return ok;
+ }
+diff --git a/keymint/keymint_router.cpp b/keymint/keymint_router.cpp
+index 6caf75c..5f386d2 100644
+--- a/keymint/keymint_router.cpp
++++ b/keymint/keymint_router.cpp
+@@ -17,6 +17,7 @@
+ #include <string>
+ #include <vector>
+ 
++#include "control.h"
+ #include "logging.hpp"
+ #include "teesim_km.h"
+ 
+@@ -37,12 +38,33 @@ constexpr uint32_t kTagBignum = 0x80000000u;
+ constexpr uint32_t kTagBytes = 0x90000000u;
+ constexpr uint32_t kTagUlongRep = 0xA0000000u;
+ 
+-::Ta* g_ta = nullptr;
++// A TA is reference-counted so an in-flight operation keeps its profile's TA
++// alive even if a config reload swaps or drops that profile underneath it.
++using TaPtr = std::shared_ptr<::Ta>;
++TaPtr WrapTa(::Ta* ta) {
++  return TaPtr(ta, [](::Ta* t) {
++    if (t) teesim_km_destroy(t);
++  });
++}
++
++// A configured profile: its TA and the package names routed to it.
++struct Profile {
++  std::string id;
++  TaPtr ta;
++  std::vector<std::string> packages;
++};
+ 
+-// Targeting configuration.
++// Live routing, swapped atomically by teesim_cfg_commit under g_cfg_mu.
+ std::mutex g_cfg_mu;
+-bool g_target_all = false;
+-std::vector<std::string> g_targets;
++std::vector<Profile> g_profiles;
++TaPtr g_default_ta;  // serves ops on our blobs; any profile's TA decrypts them
++
++// Staging state built up by teesim_cfg_begin/add_profile before the swap.
++std::vector<Profile> g_staging;
++std::vector<uint8_t> g_stage_vb_key;
++std::vector<uint8_t> g_stage_vb_hash;
++bool g_stage_locked = true;
++int32_t g_stage_vb_state = 0;
+ 
+ // RAII guard: mark the current thread as forwarding to the real HAL.
+ struct ForwardGuard {
+@@ -50,6 +72,31 @@ struct ForwardGuard {
+   ~ForwardGuard() { teesim_hook_set_forwarding(false); }
+ };
+ 
++// The profile TA whose packages match this request's ATTESTATION_APPLICATION_ID,
++// or null if the request is not for any target app.
++TaPtr ProfileForRequest(const std::vector<KeyParameter>& params) {
++  std::lock_guard<std::mutex> lk(g_cfg_mu);
++  if (g_profiles.empty()) return nullptr;
++  for (const auto& p : params) {
++    if (p.tag != Tag::ATTESTATION_APPLICATION_ID) continue;
++    if (p.value.getTag() != KeyParameterValue::blob) continue;
++    const auto& id = p.value.get<KeyParameterValue::blob>();
++    std::string hay(id.begin(), id.end());
++    for (const auto& prof : g_profiles) {
++      for (const auto& pkg : prof.packages) {
++        if (hay.find(pkg) != std::string::npos) return prof.ta;
++      }
++    }
++  }
++  return nullptr;
++}
++
++// The TA used for operations on an existing blob of ours (begin/upgrade/etc.).
++TaPtr DefaultTa() {
++  std::lock_guard<std::mutex> lk(g_cfg_mu);
++  return g_default_ta;
++}
++
+ // --- AIDL KeyParameter <-> flat KmParam --------------------------------------
+ 
+ KmParam ToKm(const KeyParameter& kp) {
+@@ -209,38 +256,20 @@ bool IsOurs(const std::vector<uint8_t>& blob) {
+   return teesim_km_is_marked(blob.data(), blob.size());
+ }
+ 
+-// Decide whether a generate/import request is for a target app, by matching the
+-// configured package names inside the ATTESTATION_APPLICATION_ID value. A request
+-// with no attestation application id (i.e. no attestation) is never a target.
+-bool IsTargetRequest(const std::vector<KeyParameter>& params) {
+-  std::lock_guard<std::mutex> lk(g_cfg_mu);
+-  if (g_target_all) return true;
+-  if (g_targets.empty()) return false;
+-  for (const auto& p : params) {
+-    if (p.tag != Tag::ATTESTATION_APPLICATION_ID) continue;
+-    if (p.value.getTag() != KeyParameterValue::blob) continue;
+-    const auto& id = p.value.get<KeyParameterValue::blob>();
+-    std::string hay(id.begin(), id.end());
+-    for (const auto& t : g_targets) {
+-      if (hay.find(t) != std::string::npos) return true;
+-    }
+-  }
+-  return false;
+-}
+-
+ // --- IKeyMintOperation -------------------------------------------------------
+ 
+ class TeesimKeyMintOperation : public BnKeyMintOperation {
+  public:
+-  explicit TeesimKeyMintOperation(int64_t op_handle) : op_handle_(op_handle) {}
++  TeesimKeyMintOperation(TaPtr ta, int64_t op_handle)
++      : ta_(std::move(ta)), op_handle_(op_handle) {}
+   ~TeesimKeyMintOperation() override {
+-    if (!finished_) teesim_km_abort(g_ta, op_handle_);
++    if (!finished_) teesim_km_abort(ta_.get(), op_handle_);
+   }
+ 
+   ndk::ScopedAStatus updateAad(const std::vector<uint8_t>& input,
+                                const std::optional<HardwareAuthToken>&,
+                                const std::optional<secureclock::TimeStampToken>&) override {
+-    return Status(teesim_km_update_aad(g_ta, op_handle_, input.data(), input.size()));
++    return Status(teesim_km_update_aad(ta_.get(), op_handle_, input.data(), input.size()));
+   }
+ 
+   ndk::ScopedAStatus update(const std::vector<uint8_t>& input,
+@@ -249,7 +278,7 @@ class TeesimKeyMintOperation : public BnKeyMintOperation {
+                             std::vector<uint8_t>* out) override {
+     uint8_t* buf = nullptr;
+     size_t len = 0;
+-    int32_t rc = teesim_km_update(g_ta, op_handle_, input.data(), input.size(), &buf, &len);
++    int32_t rc = teesim_km_update(ta_.get(), op_handle_, input.data(), input.size(), &buf, &len);
+     if (rc != 0) return Status(rc);
+     out->assign(buf, buf + len);
+     teesim_km_free_buf(buf, len);
+@@ -268,7 +297,8 @@ class TeesimKeyMintOperation : public BnKeyMintOperation {
+     size_t sig_len = signature ? signature->size() : 0;
+     uint8_t* buf = nullptr;
+     size_t len = 0;
+-    int32_t rc = teesim_km_finish(g_ta, op_handle_, in_ptr, in_len, sig_ptr, sig_len, &buf, &len);
++    int32_t rc =
++        teesim_km_finish(ta_.get(), op_handle_, in_ptr, in_len, sig_ptr, sig_len, &buf, &len);
+     finished_ = true;
+     if (rc != 0) return Status(rc);
+     out->assign(buf, buf + len);
+@@ -278,10 +308,11 @@ class TeesimKeyMintOperation : public BnKeyMintOperation {
+ 
+   ndk::ScopedAStatus abort() override {
+     finished_ = true;
+-    return Status(teesim_km_abort(g_ta, op_handle_));
++    return Status(teesim_km_abort(ta_.get(), op_handle_));
+   }
+ 
+  private:
++  TaPtr ta_;
+   int64_t op_handle_;
+   bool finished_ = false;
+ };
+@@ -309,30 +340,58 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
+   ndk::ScopedAStatus generateKey(const std::vector<KeyParameter>& keyParams,
+                                  const std::optional<AttestationKey>& attestationKey,
+                                  KeyCreationResult* out) override {
+-    if (real_ && !IsTargetRequest(keyParams)) {
+-      LOGI("generateKey: forwarding to real HAL (not a target)");
+-      ForwardGuard g;
+-      return real_->generateKey(keyParams, attestationKey, out);
++    TaPtr ta = ProfileForRequest(keyParams);
++    if (!ta) {
++      if (real_) {
++        LOGI("generateKey: forwarding to real HAL (not a target)");
++        ForwardGuard g;
++        return real_->generateKey(keyParams, attestationKey, out);
++      }
++      return Status(-100);
++    }
++    // A supplied attest key we did not mint is a real-hardware blob our TA cannot parse;
++    // forward the whole request so the real HAL attests it, rather than feeding a foreign
++    // blob to the TA (which fails as InvalidKeyBlob).
++    if (attestationKey && !IsOurs(attestationKey->keyBlob)) {
++      if (real_) {
++        LOGI("generateKey: attest key is not ours; forwarding to real HAL");
++        ForwardGuard g;
++        return real_->generateKey(keyParams, attestationKey, out);
++      }
++      return Status(-100);
+     }
+     LOGI("generateKey: simulating for target app");
+-    return Simulate(keyParams, attestationKey, out);
++    return Simulate(ta.get(), keyParams, attestationKey, out);
+   }
+ 
+   ndk::ScopedAStatus importKey(const std::vector<KeyParameter>& keyParams, KeyFormat keyFormat,
+                                const std::vector<uint8_t>& keyData,
+                                const std::optional<AttestationKey>& attestationKey,
+                                KeyCreationResult* out) override {
+-    if (real_ && !IsTargetRequest(keyParams)) {
+-      ForwardGuard g;
+-      return real_->importKey(keyParams, keyFormat, keyData, attestationKey, out);
++    TaPtr ta = ProfileForRequest(keyParams);
++    if (!ta) {
++      if (real_) {
++        ForwardGuard g;
++        return real_->importKey(keyParams, keyFormat, keyData, attestationKey, out);
++      }
++      return Status(-100);
++    }
++    // As in generateKey: a foreign attest key can't be used by our TA — forward instead.
++    if (attestationKey && !IsOurs(attestationKey->keyBlob)) {
++      if (real_) {
++        LOGI("importKey: attest key is not ours; forwarding to real HAL");
++        ForwardGuard g;
++        return real_->importKey(keyParams, keyFormat, keyData, attestationKey, out);
++      }
++      return Status(-100);
+     }
+     auto km = ToKmVec(keyParams);
+     auto ak = MakeAttestKey(attestationKey);
+     TsCreationResult* res = nullptr;
+-    int32_t rc = teesim_km_import_key(g_ta, km.data(), km.size(), static_cast<int32_t>(keyFormat),
+-                                      keyData.data(), keyData.size(), ak.blob, ak.blob_len,
+-                                      ak.params.data(), ak.params.size(), ak.issuer, ak.issuer_len,
+-                                      &res);
++    int32_t rc = teesim_km_import_key(ta.get(), km.data(), km.size(), static_cast<int32_t>(level_),
++                                      static_cast<int32_t>(keyFormat), keyData.data(), keyData.size(),
++                                      ak.blob, ak.blob_len, ak.params.data(), ak.params.size(),
++                                      ak.issuer, ak.issuer_len, &res);
+     if (rc != 0) return Status(rc);
+     FillCreationResult(res, out);
+     teesim_km_free_result(res);
+@@ -343,13 +402,18 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
+                            const std::vector<KeyParameter>& params,
+                            const std::optional<HardwareAuthToken>& authToken,
+                            BeginResult* out) override {
+-    if (real_ && !IsOurs(keyBlob)) {
+-      ForwardGuard g;
+-      return real_->begin(purpose, keyBlob, params, authToken, out);
++    if (!IsOurs(keyBlob)) {
++      if (real_) {
++        ForwardGuard g;
++        return real_->begin(purpose, keyBlob, params, authToken, out);
++      }
++      return Status(-100);
+     }
++    TaPtr ta = DefaultTa();
++    if (!ta) return Status(-100);
+     auto km = ToKmVec(params);
+     TsBeginResult* res = nullptr;
+-    int32_t rc = teesim_km_begin(g_ta, static_cast<int32_t>(purpose), keyBlob.data(),
++    int32_t rc = teesim_km_begin(ta.get(), static_cast<int32_t>(purpose), keyBlob.data(),
+                                  keyBlob.size(), km.data(), km.size(), &res);
+     if (rc != 0) return Status(rc);
+     out->challenge = teesim_km_begin_challenge(res);
+@@ -362,29 +426,39 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
+     }
+     int64_t op_handle = teesim_km_begin_op_handle(res);
+     teesim_km_free_begin(res);
+-    out->operation = ndk::SharedRefBase::make<TeesimKeyMintOperation>(op_handle);
++    out->operation = ndk::SharedRefBase::make<TeesimKeyMintOperation>(ta, op_handle);
+     return ndk::ScopedAStatus::ok();
+   }
+ 
+   ndk::ScopedAStatus deleteKey(const std::vector<uint8_t>& keyBlob) override {
+-    if (real_ && !IsOurs(keyBlob)) {
+-      ForwardGuard g;
+-      return real_->deleteKey(keyBlob);
++    if (!IsOurs(keyBlob)) {
++      if (real_) {
++        ForwardGuard g;
++        return real_->deleteKey(keyBlob);
++      }
++      return ndk::ScopedAStatus::ok();
+     }
+-    return Status(teesim_km_delete_key(g_ta, keyBlob.data(), keyBlob.size()));
++    TaPtr ta = DefaultTa();
++    if (!ta) return ndk::ScopedAStatus::ok();
++    return Status(teesim_km_delete_key(ta.get(), keyBlob.data(), keyBlob.size()));
+   }
+ 
+   ndk::ScopedAStatus upgradeKey(const std::vector<uint8_t>& keyBlobToUpgrade,
+                                 const std::vector<KeyParameter>& upgradeParams,
+                                 std::vector<uint8_t>* out) override {
+-    if (real_ && !IsOurs(keyBlobToUpgrade)) {
+-      ForwardGuard g;
+-      return real_->upgradeKey(keyBlobToUpgrade, upgradeParams, out);
++    if (!IsOurs(keyBlobToUpgrade)) {
++      if (real_) {
++        ForwardGuard g;
++        return real_->upgradeKey(keyBlobToUpgrade, upgradeParams, out);
++      }
++      return Status(-100);
+     }
++    TaPtr ta = DefaultTa();
++    if (!ta) return Status(-100);
+     auto km = ToKmVec(upgradeParams);
+     uint8_t* buf = nullptr;
+     size_t len = 0;
+-    int32_t rc = teesim_km_upgrade_key(g_ta, keyBlobToUpgrade.data(), keyBlobToUpgrade.size(),
++    int32_t rc = teesim_km_upgrade_key(ta.get(), keyBlobToUpgrade.data(), keyBlobToUpgrade.size(),
+                                        km.data(), km.size(), &buf, &len);
+     if (rc != 0) return Status(rc);
+     out->assign(buf, buf + len);
+@@ -396,12 +470,17 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
+                                            const std::vector<uint8_t>& appId,
+                                            const std::vector<uint8_t>& appData,
+                                            std::vector<KeyCharacteristics>* out) override {
+-    if (real_ && !IsOurs(keyBlob)) {
+-      ForwardGuard g;
+-      return real_->getKeyCharacteristics(keyBlob, appId, appData, out);
++    if (!IsOurs(keyBlob)) {
++      if (real_) {
++        ForwardGuard g;
++        return real_->getKeyCharacteristics(keyBlob, appId, appData, out);
++      }
++      return Status(-100);
+     }
++    TaPtr ta = DefaultTa();
++    if (!ta) return Status(-100);
+     TsCharacteristics* res = nullptr;
+-    int32_t rc = teesim_km_get_key_characteristics(g_ta, keyBlob.data(), keyBlob.size(),
++    int32_t rc = teesim_km_get_key_characteristics(ta.get(), keyBlob.data(), keyBlob.size(),
+                                                    appId.data(), appId.size(), appData.data(),
+                                                    appData.size(), &res);
+     if (rc != 0) return Status(rc);
+@@ -500,15 +579,15 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
+     return a;
+   }
+ 
+-  ndk::ScopedAStatus Simulate(const std::vector<KeyParameter>& keyParams,
++  ndk::ScopedAStatus Simulate(::Ta* ta, const std::vector<KeyParameter>& keyParams,
+                               const std::optional<AttestationKey>& attestationKey,
+                               KeyCreationResult* out) {
+     auto km = ToKmVec(keyParams);
+     auto ak = MakeAttestKey(attestationKey);
+     TsCreationResult* res = nullptr;
+-    int32_t rc = teesim_km_generate_key(g_ta, km.data(), km.size(), ak.blob, ak.blob_len,
+-                                        ak.params.data(), ak.params.size(), ak.issuer,
+-                                        ak.issuer_len, &res);
++    int32_t rc = teesim_km_generate_key(ta, km.data(), km.size(), static_cast<int32_t>(level_),
++                                        ak.blob, ak.blob_len, ak.params.data(), ak.params.size(),
++                                        ak.issuer, ak.issuer_len, &res);
+     if (rc != 0) return Status(rc);
+     FillCreationResult(res, out);
+     teesim_km_free_result(res);
+@@ -523,23 +602,55 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
+ 
+ // --- C entry points ----------------------------------------------------------
+ 
+-extern "C" bool teesim_router_init(const char* keybox_xml, size_t len) {
+-  if (g_ta) return true;
+-  g_ta = teesim_km_init(reinterpret_cast<const uint8_t*>(keybox_xml), len);
+-  return g_ta != nullptr;
++extern "C" const char* teesim_hook_name(void) { return "keymint"; }
++
++// Config-staging API (see common/control.h). teesim_cfg_begin/add_profile run on
++// the control thread before the swap; only teesim_cfg_commit touches live tables.
++extern "C" void teesim_cfg_begin(const TsBootInfo* boot) {
++  g_staging.clear();
++  g_stage_vb_key.assign(boot->verified_boot_key,
++                        boot->verified_boot_key + boot->verified_boot_key_len);
++  g_stage_vb_hash.assign(boot->verified_boot_hash,
++                         boot->verified_boot_hash + boot->verified_boot_hash_len);
++  g_stage_locked = boot->device_locked;
++  g_stage_vb_state = boot->verified_boot_state;
++}
++
++extern "C" bool teesim_cfg_add_profile(const TsProfile* p) {
++  ::Ta* ta = teesim_km_init_ex(p->keybox, p->keybox_len, p->security_level, p->os_version,
++                               p->os_patchlevel, p->vendor_patchlevel, p->boot_patchlevel,
++                               g_stage_vb_key.data(), g_stage_vb_key.size(), g_stage_vb_hash.data(),
++                               g_stage_vb_hash.size(), g_stage_locked, g_stage_vb_state, p->ids);
++  if (!ta) {
++    LOGE("keymint: profile %s failed to build (bad keybox?)", p->id ? p->id : "?");
++    return false;
++  }
++  Profile prof;
++  prof.id = p->id ? p->id : "";
++  prof.ta = WrapTa(ta);
++  for (int i = 0; i < p->n_packages && p->packages; ++i) {
++    if (p->packages[i]) prof.packages.emplace_back(p->packages[i]);
++  }
++  g_staging.push_back(std::move(prof));
++  return true;
+ }
+ 
+-extern "C" void teesim_router_configure(bool target_all, const char* const* pkgs, int n) {
++extern "C" int teesim_cfg_commit(uint64_t /*epoch*/, char* /*err*/, size_t /*err_len*/) {
+   std::lock_guard<std::mutex> lk(g_cfg_mu);
+-  g_target_all = target_all;
+-  g_targets.clear();
+-  for (int i = 0; i < n && pkgs; ++i) {
+-    if (pkgs[i]) g_targets.emplace_back(pkgs[i]);
+-  }
++  g_profiles = std::move(g_staging);
++  g_staging.clear();
++  g_default_ta = g_profiles.empty() ? nullptr : g_profiles.front().ta;
++  return static_cast<int>(g_profiles.size());
+ }
+ 
+ // Create a local device wrapping the real HAL binder (may be null). Returns an
+ // AIBinder* whose ownership passes to the caller (release with AIBinder_decStrong).
++//
++// `security_level` is only a fallback: the device's real level is derived here
++// from the wrapped HAL's own getHardwareInfo(), so we report StrongBox only when a
++// real StrongBox HAL exists. This runs once per proxy (the caller caches the
++// result), and the ForwardGuard keeps this getHardwareInfo from looping back
++// through the interceptor. Any failure leaves the passed fallback in place.
+ extern "C" AIBinder* teesim_router_new_device(int32_t security_level, AIBinder* real_binder) {
+   std::shared_ptr<IKeyMintDevice> real;
+   if (real_binder) {
+@@ -547,6 +658,13 @@ extern "C" AIBinder* teesim_router_new_device(int32_t security_level, AIBinder*
+     AIBinder_incStrong(real_binder);  // keep our own reference
+     real = IKeyMintDevice::fromBinder(sp);
+   }
++  if (real) {
++    ForwardGuard g;
++    KeyMintHardwareInfo hw;
++    if (real->getHardwareInfo(&hw).isOk()) {
++      security_level = static_cast<int32_t>(hw.securityLevel);
++    }
++  }
+   auto dev = ndk::SharedRefBase::make<TeesimKeyMintDevice>(
+       static_cast<SecurityLevel>(security_level), std::move(real));
+   ndk::SpAIBinder b = dev->asBinder();
+diff --git a/keystore/keystore_entry.cpp b/keystore/keystore_entry.cpp
+index ad4bc88..c3b3895 100644
+--- a/keystore/keystore_entry.cpp
++++ b/keystore/keystore_entry.cpp
+@@ -1,21 +1,17 @@
+ // Injection entry point for the legacy keystore interceptor (Android 10/11).
+ //
+-// The injector loads this into the keystore daemon and calls entry(). We build the
+-// TA from the keybox, resolve the configured target packages to their uids, install
+-// the libbinder ioctl hook, and register the app-facing keystore service so its
+-// transactions are handed to our handler.
++// The daemon injects this into the keystore daemon and calls entry(). We install
++// the libbinder ioctl hook, register the app-facing keystore service so its
++// transactions reach our handler, and start the control server. The profile set
++// arrives from the daemon over @teesim; nothing is read from disk here.
+ 
+ #include <binder/IServiceManager.h>
+ #include <binder/Parcel.h>
+ 
+-#include <fstream>
+ #include <functional>
+-#include <sstream>
+-#include <string>
+-#include <vector>
+ 
++#include "control.h"
+ #include "logging.hpp"
+-#include "teesim_km.h"
+ 
+ using namespace android;
+ using TransactionHandler =
+@@ -25,56 +21,11 @@ using TransactionHandler =
+ bool teesim_intercept_service(const sp<IBinder>& service, TransactionHandler handler);
+ bool teesim_install_binder_hook();
+ // keystore_router.cpp
+-extern "C" void teesim_ks_set_ta(Ta* ta);
+-extern "C" void teesim_ks_add_target(int uid, const char* pkg);
+ extern "C" bool teesim_ks_handle(uint32_t code, const Parcel& data, Parcel* reply, status_t& result);
+ 
+-namespace {
+-
+-constexpr const char* kKeyboxPath = "/data/adb/teesim/keybox.xml";
+-
+-std::string ReadFile(const char* path) {
+-  std::ifstream f(path, std::ios::binary);
+-  if (!f) return {};
+-  std::stringstream ss;
+-  ss << f.rdbuf();
+-  return ss.str();
+-}
+-
+-// The unprivileged keystore cannot read the system package list, so service.sh
+-// resolves the target packages to uids as root and writes them here, one
+-// "<uid> <package>" per line, for us to register.
+-void RegisterTargets() {
+-  std::stringstream ss(ReadFile("/data/adb/teesim/targets.uid"));
+-  std::string line;
+-  while (std::getline(ss, line)) {
+-    std::istringstream ls(line);
+-    int uid = 0;
+-    std::string pkg;
+-    if (ls >> uid >> pkg) {
+-      teesim_ks_add_target(uid, pkg.c_str());
+-      LOGI("keystore: target uid %d -> %s", uid, pkg.c_str());
+-    }
+-  }
+-}
+-
+-}  // namespace
+-
+ extern "C" [[gnu::visibility("default")]] bool entry(void* /*handle*/) {
+   LOGI("keystore interceptor loading");
+-
+-  std::string keybox = ReadFile(kKeyboxPath);
+-  if (keybox.empty()) {
+-    LOGE("keystore: no keybox at %s", kKeyboxPath);
+-    return false;
+-  }
+-  Ta* ta = teesim_km_init(reinterpret_cast<const uint8_t*>(keybox.data()), keybox.size());
+-  if (!ta) {
+-    LOGE("keystore: TA init failed (bad keybox?)");
+-    return false;
+-  }
+-  teesim_ks_set_ta(ta);
+-  RegisterTargets();
++  teesim_control_start();
+ 
+   if (!teesim_install_binder_hook()) {
+     LOGE("keystore: failed to install the binder hook");
+@@ -86,6 +37,6 @@ extern "C" [[gnu::visibility("default")]] bool entry(void* /*handle*/) {
+     return false;
+   }
+   bool ok = teesim_intercept_service(service, &teesim_ks_handle);
+-  LOGI("keystore interceptor installed=%d", ok);
++  LOGI("keystore interceptor installed=%d (awaiting config push)", ok);
+   return ok;
+ }
+diff --git a/keystore/keystore_router.cpp b/keystore/keystore_router.cpp
+index 6fa6d61..1e20bdf 100644
+--- a/keystore/keystore_router.cpp
++++ b/keystore/keystore_router.cpp
+@@ -27,10 +27,12 @@
+ #include <ctime>
+ #include <cstring>
+ #include <map>
++#include <memory>
+ #include <mutex>
+ #include <set>
+ #include <vector>
+ 
++#include "control.h"
+ #include "logging.hpp"
+ #include "teesim_km.h"
+ 
+@@ -79,32 +81,73 @@ struct PendingKey {
+   std::vector<KmParam> params;  // key parameters from generateKey
+ };
+ 
+-Ta* g_ta = nullptr;
++// A TA is reference-counted so an in-flight operation keeps its profile's TA
++// alive even if a config reload swaps or drops that profile underneath it.
++using TaPtr = std::shared_ptr<Ta>;
++TaPtr WrapTa(Ta* ta) {
++  return TaPtr(ta, [](Ta* t) {
++    if (t) teesim_km_destroy(t);
++  });
++}
++
++// A configured profile: its TA and the target uids, each mapped to its package
++// name (needed to synthesise the attestation application id).
++struct Profile {
++  std::string id;
++  TaPtr ta;
++  std::map<int, std::string> uids;  // uid -> package name
++};
++
++// Live routing, swapped atomically by teesim_cfg_commit under g_cfg_mutex.
++std::mutex g_cfg_mutex;
++std::vector<Profile> g_profiles;
++TaPtr g_default_ta;  // serves ops on our blobs; any profile's TA decrypts them
++
++// Staging state built up by teesim_cfg_begin/add_profile before the swap.
++std::vector<Profile> g_staging;
++std::vector<uint8_t> g_stage_vb_key;
++std::vector<uint8_t> g_stage_vb_hash;
++bool g_stage_locked = true;
++int32_t g_stage_vb_state = 0;
++
+ std::mutex g_keys_mutex;
+ std::map<std::string, PendingKey> g_keys;
+ 
+ // An in-flight crypto operation. The token returned to the caller identifies the
+-// TA operation handle for the follow-up update/finish/abort calls.
++// TA operation handle and the TA it runs on, for follow-up update/finish/abort.
+ class OpToken : public BBinder {};
+ struct Operation {
+   sp<IBinder> token;  // keeps the token binder alive while the operation runs
+   int64_t op_handle;
++  TaPtr ta;
+ };
+ std::mutex g_ops_mutex;
+ std::map<IBinder*, Operation> g_ops;
+ 
+-std::mutex g_targets_mutex;
+-std::map<int, std::string> g_target_uids;  // uid -> package name
++// The profile TA serving this uid, or null if the uid is not a target.
++TaPtr ProfileForUid(int uid) {
++  std::lock_guard<std::mutex> lk(g_cfg_mutex);
++  for (const auto& prof : g_profiles) {
++    if (prof.uids.count(uid)) return prof.ta;
++  }
++  return nullptr;
++}
+ 
+-bool IsTarget(int uid) {
+-  std::lock_guard<std::mutex> lk(g_targets_mutex);
+-  return g_target_uids.count(uid) > 0;
++// The TA used for operations on an existing blob of ours.
++TaPtr DefaultTa() {
++  std::lock_guard<std::mutex> lk(g_cfg_mutex);
++  return g_default_ta;
+ }
+ 
++bool IsTarget(int uid) { return ProfileForUid(uid) != nullptr; }
++
+ std::string PackageForUid(int uid) {
+-  std::lock_guard<std::mutex> lk(g_targets_mutex);
+-  auto it = g_target_uids.find(uid);
+-  return it == g_target_uids.end() ? std::string() : it->second;
++  std::lock_guard<std::mutex> lk(g_cfg_mutex);
++  for (const auto& prof : g_profiles) {
++    auto it = prof.uids.find(uid);
++    if (it != prof.uids.end()) return it->second;
++  }
++  return std::string();
+ }
+ 
+ // AttestationApplicationId ::= SEQUENCE { packages SET OF SEQUENCE { name
+@@ -378,14 +421,19 @@ void AddRequiredTags(std::vector<KmParam>& params, int uid,
+ // caller supplies (the challenge). Returns a result the caller must free, or null.
+ TsCreationResult* ImportKey(const PendingKey& k, int uid, const std::vector<KmParam>& extra,
+                             bool with_attestation) {
++  TaPtr ta = ProfileForUid(uid);
++  if (!ta) ta = DefaultTa();
++  if (!ta) return nullptr;
+   std::vector<KmParam> params = k.params;
+   params.insert(params.end(), extra.begin(), extra.end());
+   std::vector<uint8_t> app_id;
+   AddRequiredTags(params, uid, app_id, with_attestation);
+   TsCreationResult* res = nullptr;
+-  int32_t rc = teesim_km_import_key(g_ta, params.data(), params.size(), KEY_FORMAT_PKCS8,
+-                                    k.pkcs8.data(), k.pkcs8.size(), nullptr, 0, nullptr, 0,
+-                                    nullptr, 0, &res);
++  // The legacy Keystore HAL path has no wrapped KeyMint HAL to derive a level
++  // from, so -1 keeps the TA's configured default security level.
++  int32_t rc = teesim_km_import_key(ta.get(), params.data(), params.size(), /*security_level=*/-1,
++                                    KEY_FORMAT_PKCS8, k.pkcs8.data(), k.pkcs8.size(), nullptr, 0,
++                                    nullptr, 0, nullptr, 0, &res);
+   if (rc != 0 || !res) {
+     LOGE("keystore: TA import_key failed rc=%d", rc);
+     return nullptr;
+@@ -581,8 +629,11 @@ bool HandleBegin(int uid, Parcel& in, Parcel* reply) {
+     blob = it->second.ta_blob;
+   }
+ 
++  TaPtr ta = ProfileForUid(uid);
++  if (!ta) ta = DefaultTa();
++  if (!ta) return false;
+   TsBeginResult* res = nullptr;
+-  int32_t rc = teesim_km_begin(g_ta, purpose, blob.data(), blob.size(), op_params.data(),
++  int32_t rc = teesim_km_begin(ta.get(), purpose, blob.data(), blob.size(), op_params.data(),
+                                op_params.size(), &res);
+   if (rc != 0 || !res) {
+     LOGE("keystore: TA begin failed rc=%d", rc);
+@@ -594,7 +645,7 @@ bool HandleBegin(int uid, Parcel& in, Parcel* reply) {
+   sp<IBinder> token = sp<OpToken>::make();
+   {
+     std::lock_guard<std::mutex> lk(g_ops_mutex);
+-    g_ops[token.get()] = {token, op_handle};
++    g_ops[token.get()] = {token, op_handle, ta};
+   }
+   LOGI("keystore: begin purpose=%d alias=%s", purpose, String8(alias).c_str());
+ 
+@@ -605,12 +656,13 @@ bool HandleBegin(int uid, Parcel& in, Parcel* reply) {
+   return true;
+ }
+ 
+-// Look up the TA operation handle for a token the caller passes back.
+-bool OpHandleFor(const sp<IBinder>& token, int64_t* op_handle, bool erase) {
++// Look up the TA operation handle and its TA for a token the caller passes back.
++bool OpFor(const sp<IBinder>& token, int64_t* op_handle, TaPtr* ta, bool erase) {
+   std::lock_guard<std::mutex> lk(g_ops_mutex);
+   auto it = g_ops.find(token.get());
+   if (it == g_ops.end()) return false;
+   *op_handle = it->second.op_handle;
++  *ta = it->second.ta;
+   if (erase) g_ops.erase(it);
+   return true;
+ }
+@@ -632,11 +684,12 @@ bool HandleUpdate(int /*uid*/, Parcel& in, Parcel* reply) {
+   std::vector<uint8_t> input = ReadByteArray(in);
+ 
+   int64_t op_handle = 0;
+-  if (!OpHandleFor(token, &op_handle, /*erase=*/false)) return false;  // not ours; forward
++  TaPtr ta;
++  if (!OpFor(token, &op_handle, &ta, /*erase=*/false)) return false;  // not ours; forward
+ 
+   uint8_t* out = nullptr;
+   size_t out_len = 0;
+-  int32_t rc = teesim_km_update(g_ta, op_handle, input.data(), input.size(), &out, &out_len);
++  int32_t rc = teesim_km_update(ta.get(), op_handle, input.data(), input.size(), &out, &out_len);
+   std::vector<uint8_t> output;
+   if (rc == 0 && out) {
+     output.assign(out, out + out_len);
+@@ -658,11 +711,12 @@ bool HandleFinish(int /*uid*/, Parcel& in, Parcel* reply) {
+   std::vector<uint8_t> signature = ReadByteArray(in);          // supplied for verify
+ 
+   int64_t op_handle = 0;
+-  if (!OpHandleFor(token, &op_handle, /*erase=*/true)) return false;  // not ours; forward
++  TaPtr ta;
++  if (!OpFor(token, &op_handle, &ta, /*erase=*/true)) return false;  // not ours; forward
+ 
+   uint8_t* out = nullptr;
+   size_t out_len = 0;
+-  int32_t rc = teesim_km_finish(g_ta, op_handle, nullptr, 0, signature.data(), signature.size(),
++  int32_t rc = teesim_km_finish(ta.get(), op_handle, nullptr, 0, signature.data(), signature.size(),
+                                 &out, &out_len);
+   std::vector<uint8_t> output;
+   if (rc == 0 && out) {
+@@ -682,8 +736,9 @@ bool HandleAbort(int /*uid*/, Parcel& in, Parcel* reply) {
+   sp<IBinder> cb = in.readStrongBinder();
+   sp<IBinder> token = in.readStrongBinder();
+   int64_t op_handle = 0;
+-  if (!OpHandleFor(token, &op_handle, /*erase=*/true)) return false;  // not ours; forward
+-  teesim_km_abort(g_ta, op_handle);
++  TaPtr ta;
++  if (!OpFor(token, &op_handle, &ta, /*erase=*/true)) return false;  // not ours; forward
++  teesim_km_abort(ta.get(), op_handle);
+ 
+   static const String16 kCb("android.security.keystore.IKeystoreResponseCallback");
+   InvokeCallback(cb, kCb, [](Parcel& p) { WriteKeystoreResponse(p, KS_NO_ERROR); });
+@@ -693,11 +748,49 @@ bool HandleAbort(int /*uid*/, Parcel& in, Parcel* reply) {
+ 
+ }  // namespace
+ 
+-// Provide the TA the router uses; ownership stays with the caller.
+-extern "C" void teesim_ks_set_ta(Ta* ta) { g_ta = ta; }
+-extern "C" void teesim_ks_add_target(int uid, const char* pkg) {
+-  std::lock_guard<std::mutex> lk(g_targets_mutex);
+-  g_target_uids[uid] = pkg ? pkg : "";
++extern "C" const char* teesim_hook_name(void) { return "keystore1"; }
++
++// Config-staging API (see common/control.h). teesim_cfg_begin/add_profile run on
++// the control thread; only teesim_cfg_commit touches the live routing tables.
++extern "C" void teesim_cfg_begin(const TsBootInfo* boot) {
++  g_staging.clear();
++  g_stage_vb_key.assign(boot->verified_boot_key,
++                        boot->verified_boot_key + boot->verified_boot_key_len);
++  g_stage_vb_hash.assign(boot->verified_boot_hash,
++                         boot->verified_boot_hash + boot->verified_boot_hash_len);
++  g_stage_locked = boot->device_locked;
++  g_stage_vb_state = boot->verified_boot_state;
++}
++
++extern "C" bool teesim_cfg_add_profile(const TsProfile* p) {
++  Ta* ta = teesim_km_init_ex(p->keybox, p->keybox_len, p->security_level, p->os_version,
++                             p->os_patchlevel, p->vendor_patchlevel, p->boot_patchlevel,
++                             g_stage_vb_key.data(), g_stage_vb_key.size(), g_stage_vb_hash.data(),
++                             g_stage_vb_hash.size(), g_stage_locked, g_stage_vb_state, p->ids);
++  if (!ta) {
++    LOGE("keystore: profile %s failed to build (bad keybox?)", p->id ? p->id : "?");
++    return false;
++  }
++  Profile prof;
++  prof.id = p->id ? p->id : "";
++  prof.ta = WrapTa(ta);
++  // uids[] is aligned 1:1 with packages[]; -1 marks a package that is not installed.
++  for (int i = 0; i < p->n_uids && p->uids; ++i) {
++    if (p->uids[i] < 0) continue;
++    const char* pkg =
++        (i < p->n_packages && p->packages && p->packages[i]) ? p->packages[i] : "";
++    prof.uids[p->uids[i]] = pkg;
++  }
++  g_staging.push_back(std::move(prof));
++  return true;
++}
++
++extern "C" int teesim_cfg_commit(uint64_t /*epoch*/, char* /*err*/, size_t /*err_len*/) {
++  std::lock_guard<std::mutex> lk(g_cfg_mutex);
++  g_profiles = std::move(g_staging);
++  g_staging.clear();
++  g_default_ta = g_profiles.empty() ? nullptr : g_profiles.front().ta;
++  return static_cast<int>(g_profiles.size());
+ }
+ 
+ // The interception handler installed for the keystore service binder.
+@@ -716,8 +809,6 @@ extern "C" bool teesim_ks_handle(uint32_t code, const Parcel& data, Parcel* repl
+     default:
+       return false;
+   }
+-  if (!g_ta) return false;
+-
+   int uid = IPCThreadState::self()->getCallingUid();
+   if (!IsTarget(uid)) return false;
+   Reader r(data);
+-- 
+2.45.1.windows.1
+

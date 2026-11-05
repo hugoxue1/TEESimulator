@@ -1,0 +1,323 @@
+From 7d6ceb224b4693229653d69d50b4c2b08627f89a Mon Sep 17 00:00:00 2001
+From: JingMatrix <jingmatrix@gmail.com>
+Date: Sun, 9 Aug 2026 13:32:39 +0200
+Subject: [PATCH 02/47] Build without device libraries
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The interceptor is a shared object loaded into keystore2, which already holds
+libbinder_ndk and libcrypto, so it need not link a device's copies. libbinder_ndk
+and liblog come from the NDK sysroot, and libcrypto is given a build-time stub of
+empty functions carrying the right SONAME — keystore2's real libcrypto shadows it
+at runtime. The TA becomes a static library only, so it never links libcrypto
+either, and libcrypto.syms lists the symbols the stub must provide. With no device
+in the loop, any ABI cross-builds here.
+---
+ CMakeLists.txt            |  36 ++++++++++---
+ keymint/libcrypto.syms    | 107 ++++++++++++++++++++++++++++++++++++++
+ rust/build.sh             |  55 +++++++++-----------
+ rust/teesim-km/Cargo.toml |   4 +-
+ 4 files changed, 164 insertions(+), 38 deletions(-)
+ create mode 100644 keymint/libcrypto.syms
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ef87345..1baff8d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,5 +1,5 @@
+ cmake_minimum_required(VERSION 3.22)
+-project(teesim LANGUAGES CXX)
++project(teesim LANGUAGES C CXX)
+ 
+ set(CMAKE_CXX_STANDARD 20)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
+@@ -9,10 +9,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+ # low min-SDK; the symbols we use are present on the devices we target.
+ add_compile_definitions(__ANDROID_UNAVAILABLE_SYMBOLS_ARE_WEAK__)
+ 
+-# External inputs. The library links the platform BoringSSL and libbinder_ndk,
+-# resolved at runtime inside keystore2; at build time it links copies for the
+-# target ABI (pulled from a device) and BoringSSL headers for the Rust bindings.
+-set(DEVICE_LIB_DIR "" CACHE PATH "Directory holding the target ABI's libbinder_ndk.so and libcrypto.so")
++# External inputs. libbinder_ndk and liblog come from the NDK sysroot; BoringSSL is
++# resolved at runtime inside keystore2, so only its headers (for the Rust bindings)
++# are needed at build time. The build depends on no device, so any ABI cross-builds.
+ set(BORINGSSL_DIR "${CMAKE_SOURCE_DIR}/third_party/boringssl" CACHE PATH "BoringSSL source directory containing include/")
+ set(ANDROID_API_LEVEL "34" CACHE STRING "Android platform level for the Rust build")
+ 
+@@ -82,20 +81,41 @@ add_custom_command(
+     OUTPUT ${RUST_A}
+     COMMAND ${CMAKE_COMMAND} -E env
+             ABI=${ANDROID_ABI} API=${ANDROID_API_LEVEL} NDK_HOME=${ANDROID_NDK}
+-            BORINGSSL=${BORINGSSL_DIR} LIBDIR=${DEVICE_LIB_DIR}
++            BORINGSSL=${BORINGSSL_DIR}
+             bash ${CMAKE_SOURCE_DIR}/rust/build.sh
+     VERBATIM USES_TERMINAL)
+ add_custom_target(rust_ta DEPENDS ${RUST_A})
+ 
++# --- Build-time stub for the platform BoringSSL -----------------------------
++# The TA calls BoringSSL, which lives inside keystore2 and is not part of the NDK.
++# Link a stub libcrypto.so of empty functions so the interceptor gets a NEEDED
++# entry with the right SONAME; keystore2's real libcrypto provides the symbols at
++# runtime. The stub is a build artifact and is never shipped. libcrypto.syms lists
++# the symbols we reference; a new BoringSSL call absent from it fails the link.
++set(CRYPTO_STUB_C ${CMAKE_BINARY_DIR}/libcrypto_stub.c)
++file(STRINGS ${CMAKE_SOURCE_DIR}/keymint/libcrypto.syms _crypto_syms)
++set(_stub_body "")
++foreach(_s ${_crypto_syms})
++  string(APPEND _stub_body "void ${_s}(void){}\n")
++endforeach()
++file(WRITE ${CRYPTO_STUB_C} "${_stub_body}")
++add_library(crypto_stub SHARED ${CRYPTO_STUB_C})
++set_target_properties(crypto_stub PROPERTIES OUTPUT_NAME crypto)
++target_link_options(crypto_stub PRIVATE -nostdlib -Wl,-soname,libcrypto.so)
++
+ # --- The injected interceptor library ---------------------------------------
+ add_library(teesim_keymint SHARED
+     keymint/keymint_router.cpp keymint/keymint_hook.cpp keymint/keymint_entry.cpp)
+ add_dependencies(teesim_keymint rust_ta)
+ target_include_directories(teesim_keymint PRIVATE
+     keymint injector/include rust/teesim-km/include ${LSPLT_JNI}/include)
+-target_link_directories(teesim_keymint PRIVATE ${DEVICE_LIB_DIR})
+-target_link_libraries(teesim_keymint PRIVATE keymint_aidl lsplt ${RUST_A} binder_ndk crypto log)
++# libbinder_ndk and liblog come from the NDK sysroot; libcrypto from the stub above.
++# All three are shadowed at runtime by the copies keystore2 has loaded.
++target_link_libraries(teesim_keymint PRIVATE keymint_aidl lsplt ${RUST_A} crypto_stub binder_ndk log)
+ target_link_options(teesim_keymint PRIVATE
+     -static-libstdc++
++    # Binder/log calls newer than the min-SDK are absent from the NDK stub; let them
++    # stay undefined here and resolve at runtime against keystore2's own libraries.
++    -Wl,-z,undefs
+     -Wl,--version-script=${CMAKE_SOURCE_DIR}/keymint/exports.map
+     -Wl,--gc-sections)
+diff --git a/keymint/libcrypto.syms b/keymint/libcrypto.syms
+new file mode 100644
+index 0000000..718b3c3
+--- /dev/null
++++ b/keymint/libcrypto.syms
+@@ -0,0 +1,107 @@
++BN_CTX_free
++BN_CTX_new
++BN_bin2bn
++BN_free
++CMAC_CTX_free
++CMAC_CTX_new
++CMAC_Final
++CMAC_Init
++CMAC_Update
++CRYPTO_memcmp
++ECDSA_SIG_free
++ECDSA_do_sign
++EC_GROUP_free
++EC_GROUP_new_by_curve_name
++EC_KEY_free
++EC_KEY_generate_key
++EC_KEY_get0_public_key
++EC_KEY_new
++EC_KEY_set_group
++EC_POINT_point2oct
++ERR_func_error_string
++ERR_get_error_line_data
++ERR_lib_error_string
++ERR_reason_error_string
++EVP_CIPHER_CTX_block_size
++EVP_CIPHER_CTX_cipher
++EVP_CIPHER_CTX_ctrl
++EVP_CIPHER_CTX_free
++EVP_CIPHER_CTX_iv_length
++EVP_CIPHER_CTX_key_length
++EVP_CIPHER_CTX_new
++EVP_CIPHER_CTX_set_key_length
++EVP_CIPHER_CTX_set_padding
++EVP_CIPHER_iv_length
++EVP_CIPHER_key_length
++EVP_CipherFinal
++EVP_CipherUpdate
++EVP_DecryptInit_ex
++EVP_DigestSign
++EVP_DigestSignFinal
++EVP_DigestSignInit
++EVP_DigestUpdate
++EVP_EncryptInit_ex
++EVP_MD_CTX_create
++EVP_MD_CTX_destroy
++EVP_MD_CTX_free
++EVP_MD_CTX_new
++EVP_PKEY_CTX_free
++EVP_PKEY_CTX_new
++EVP_PKEY_CTX_new_id
++EVP_PKEY_CTX_set_rsa_mgf1_md
++EVP_PKEY_CTX_set_rsa_oaep_md
++EVP_PKEY_CTX_set_rsa_padding
++EVP_PKEY_CTX_set_rsa_pss_saltlen
++EVP_PKEY_decrypt
++EVP_PKEY_decrypt_init
++EVP_PKEY_derive
++EVP_PKEY_derive_init
++EVP_PKEY_derive_set_peer
++EVP_PKEY_free
++EVP_PKEY_get_raw_private_key
++EVP_PKEY_get_raw_public_key
++EVP_PKEY_keygen
++EVP_PKEY_keygen_init
++EVP_PKEY_new
++EVP_PKEY_new_raw_private_key
++EVP_PKEY_set1_EC_KEY
++EVP_PKEY_set1_RSA
++EVP_aes_128_cbc
++EVP_aes_128_ctr
++EVP_aes_128_ecb
++EVP_aes_128_gcm
++EVP_aes_192_cbc
++EVP_aes_192_ctr
++EVP_aes_192_ecb
++EVP_aes_192_gcm
++EVP_aes_256_cbc
++EVP_aes_256_ctr
++EVP_aes_256_ecb
++EVP_aes_256_gcm
++EVP_des_ede3
++EVP_des_ede3_cbc
++EVP_md5
++EVP_sha1
++EVP_sha224
++EVP_sha256
++EVP_sha384
++EVP_sha512
++HMAC_CTX_free
++HMAC_CTX_new
++HMAC_Final
++HMAC_Init_ex
++HMAC_Update
++RAND_add
++RAND_bytes
++RSA_free
++RSA_generate_key_ex
++RSA_new
++RSA_private_encrypt
++RSA_size
++SHA256
++d2i_ECPrivateKey
++d2i_PUBKEY
++d2i_RSAPrivateKey
++i2d_ECDSA_SIG
++i2d_ECPrivateKey
++i2d_RSAPrivateKey
+diff --git a/rust/build.sh b/rust/build.sh
+index 188ab53..fa06f12 100755
+--- a/rust/build.sh
++++ b/rust/build.sh
+@@ -1,15 +1,13 @@
+ #!/usr/bin/env bash
+-# Build libteesim_km for Android against the platform BoringSSL.
++# Build libteesim_km.a for one Android ABI.
+ #
+-# The crate links the device's libcrypto.so dynamically, so the build needs
+-# BoringSSL headers (openssl-sys bindgens the FFI from them) and a libcrypto.so
+-# of the target ABI to satisfy the linker. Configure via environment:
++# The crate is a static library that resolves BoringSSL at runtime inside
++# keystore2, so the build needs only BoringSSL's headers (openssl-sys bindgens the
++# FFI from them) — no libcrypto.so of any ABI. Configure via environment:
+ #   NDK_HOME   Android NDK (default: newest under $ANDROID_HOME/ndk)
+ #   ABI        Android ABI (default: arm64-v8a)
+ #   API        platform level (default: 34)
+ #   BORINGSSL  BoringSSL source dir with include/ (cloned if unset/missing)
+-#   LIBDIR     dir with libcrypto.so for $ABI (pulled from $DEVICE if unset)
+-#   DEVICE     adb serial to pull libcrypto.so from
+ set -euo pipefail
+ 
+ HERE="$(cd "$(dirname "$0")" && pwd)"
+@@ -18,10 +16,10 @@ ABI="${ABI:-arm64-v8a}"
+ API="${API:-34}"
+ 
+ case "$ABI" in
+-  arm64-v8a)   TRIPLE=aarch64-linux-android;   DEVLIB=/system/lib64 ;;
+-  armeabi-v7a) TRIPLE=armv7-linux-androideabi; DEVLIB=/system/lib ;;
+-  x86_64)      TRIPLE=x86_64-linux-android;    DEVLIB=/system/lib64 ;;
+-  x86)         TRIPLE=i686-linux-android;      DEVLIB=/system/lib ;;
++  arm64-v8a)   TRIPLE=aarch64-linux-android ;;
++  armeabi-v7a) TRIPLE=armv7-linux-androideabi ;;
++  x86_64)      TRIPLE=x86_64-linux-android ;;
++  x86)         TRIPLE=i686-linux-android ;;
+   *) echo "unknown ABI: $ABI" >&2; exit 1 ;;
+ esac
+ ENVPREFIX="$(echo "$TRIPLE" | tr '[:lower:]-' '[:upper:]_')"
+@@ -32,41 +30,40 @@ fi
+ [ -d "$NDK_HOME" ] || { echo "NDK not found; set NDK_HOME" >&2; exit 1; }
+ export ANDROID_NDK_HOME="$NDK_HOME" ANDROID_NDK="$NDK_HOME"
+ 
+-# Adapt the reference BoringSSL backend to build under Cargo (openssl-sys) rather
+-# than Soong (bssl-sys). Applied to the submodule working tree, idempotently.
+-PATCH="$HERE/patches/kmr-crypto-boring.patch"
+-if git -C "$ROOT/third_party/keymint" apply -p1 --reverse --check "$PATCH" 2>/dev/null; then
+-  :
+-else
+-  git -C "$ROOT/third_party/keymint" apply -p1 "$PATCH"
+-fi
++# Adapt the reference TA to build under Cargo rather than Soong: the BoringSSL
++# backend (openssl-sys vs bssl-sys, kmr-crypto-boring.patch) and a per-request
++# attestation security level (kmr-ta-seclevel.patch). Each patch is applied to the
++# submodule working tree, idempotently — skipped when it already reverse-applies,
++# i.e. is already present.
++for PATCH in "$HERE"/patches/*.patch; do
++  if git -C "$ROOT/third_party/keymint" apply -p1 --reverse --check "$PATCH" 2>/dev/null; then
++    :
++  else
++    git -C "$ROOT/third_party/keymint" apply -p1 "$PATCH"
++  fi
++done
+ 
+-BORINGSSL="${BORINGSSL:-$HERE/.boringssl-src}"
++BORINGSSL="${BORINGSSL:-$ROOT/third_party/boringssl}"
+ if [ ! -f "$BORINGSSL/include/openssl/base.h" ]; then
+   git clone --depth 1 https://boringssl.googlesource.com/boringssl "$BORINGSSL"
+ fi
+ 
+-LIBDIR="${LIBDIR:-$HERE/.dynlibs/$ABI}"
+-if [ ! -f "$LIBDIR/libcrypto.so" ]; then
+-  [ -n "${DEVICE:-}" ] || { echo "no libcrypto.so and no DEVICE to pull from" >&2; exit 1; }
+-  mkdir -p "$LIBDIR"
+-  adb connect "$DEVICE" >/dev/null 2>&1 || true
+-  adb -s "$DEVICE" pull "$DEVLIB/libcrypto.so" "$LIBDIR/libcrypto.so"
+-fi
+-
+ if [ -z "${LIBCLANG_PATH:-}" ]; then
+   for p in /usr/lib /usr/lib64 /usr/lib/llvm/lib /usr/lib/x86_64-linux-gnu; do
+     [ -e "$p/libclang.so" ] && export LIBCLANG_PATH="$p" && break
+   done
+ fi
+ 
++# Point openssl-sys straight at the BoringSSL headers so it neither vendors OpenSSL
++# nor probes the host. The static library records a link directive for libcrypto
++# but never links it; the interceptor's shared object leaves it to runtime.
+ export OPENSSL_NO_VENDOR=1
+ export "${ENVPREFIX}_OPENSSL_INCLUDE_DIR=$BORINGSSL/include"
+-export "${ENVPREFIX}_OPENSSL_LIB_DIR=$LIBDIR"
++export "${ENVPREFIX}_OPENSSL_LIB_DIR=$BORINGSSL"
+ export "${ENVPREFIX}_OPENSSL_STATIC=0"
+ export "${ENVPREFIX}_OPENSSL_LIBS=crypto"
+ 
+ cd "$HERE"
+ cargo ndk -t "$ABI" --platform "$API" --bindgen build --release -p teesim-km
+ 
+-echo "Output: $HERE/target/$TRIPLE/release/libteesim_km.{so,a}"
++echo "Output: $HERE/target/$TRIPLE/release/libteesim_km.a"
+diff --git a/rust/teesim-km/Cargo.toml b/rust/teesim-km/Cargo.toml
+index 3f1e727..f0ba4b9 100644
+--- a/rust/teesim-km/Cargo.toml
++++ b/rust/teesim-km/Cargo.toml
+@@ -7,7 +7,9 @@ publish = false
+ description = "In-process KeyMint TA (kmr-ta) and C ABI for the native interceptor."
+ 
+ [lib]
+-crate-type = ["cdylib", "staticlib", "rlib"]
++# A static library only: it is linked into the interceptor's shared object, which
++# resolves BoringSSL at runtime inside keystore2, so nothing here links libcrypto.
++crate-type = ["staticlib"]
+ 
+ [dependencies]
+ kmr-ta = { path = "../../third_party/keymint/ta" }
+-- 
+2.45.1.windows.1
+

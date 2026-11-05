@@ -1,0 +1,1117 @@
+From 7fd2c95c387f24cc5ec254eafcaa1390dc9c44d7 Mon Sep 17 00:00:00 2001
+From: JingMatrix <jingmatrix@gmail.com>
+Date: Mon, 10 Aug 2026 14:04:30 +0200
+Subject: [PATCH 16/47] Implement patch mode and per-level attestation identity
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The per-profile operation mode gained a config field earlier; wire it through
+and act on it in the router.
+
+Patch mode (the default) forwards generateKey to the real HAL, keeps the real
+hardware key blob untouched, and re-signs only the attestation leaf under the
+keybox with the root of trust patched to locked/Verified. The key stays
+hardware-backed and its authentic KeyMint attestation content survives; only the
+root of trust and signing root change. The re-sign lives in the TA
+(teesim_km_patch_attestation / resign.rs): x509-cert rebuilds the leaf and a small
+DER splice replaces the RootOfTrust under its high-number [704] context tag, signed
+by the same BoringSSL backend and keybox key generation uses. Generation stays the
+fallback and PatchAttest falls back to it when the real HAL declines.
+
+A level needs working hardware to patch: keystore2 resolves separate TEE and
+StrongBox KeyMint proxies (both hooked), and a broken StrongBox — offered but unable
+to attest, as on an unlocked dev unit — forces generation at that level via a
+harvested strongBoxAvailable flag.
+
+The record's security level and KeyMint version now follow the requesting HAL. One
+TA serves both proxies, so before each creation the router passes the proxy's level
+and the TA overrides hw_info.security_level and aidl_version for that one request,
+restoring them after. Both versions are harvested from throwaway keys at each level;
+a broken StrongBox reuses the TEE version. The aidl_version getter/setter is added to
+kmr-ta via the seclevel patch.
+---
+ .../main/java/org/matrix/teesim/Harvester.kt  |  41 ++-
+ .../main/java/org/matrix/teesim/Resolver.kt   |  22 +-
+ common/control.cpp                            |  12 +
+ common/control.h                              |   4 +
+ keymint/keymint_router.cpp                    |  97 ++++++-
+ keystore/keystore_router.cpp                  |   7 +-
+ rust/patches/kmr-ta-seclevel.patch            |  22 +-
+ rust/teesim-km/Cargo.toml                     |   4 +
+ rust/teesim-km/include/teesim_km.h            |  12 +-
+ rust/teesim-km/src/attest.rs                  |  12 +
+ rust/teesim-km/src/capi.rs                    |  27 ++
+ rust/teesim-km/src/ffi.rs                     |   4 +
+ rust/teesim-km/src/lib.rs                     |  38 ++-
+ rust/teesim-km/src/ops.rs                     |  39 +--
+ rust/teesim-km/src/resign.rs                  | 262 ++++++++++++++++++
+ 15 files changed, 555 insertions(+), 48 deletions(-)
+ create mode 100644 rust/teesim-km/src/resign.rs
+
+diff --git a/app/src/main/java/org/matrix/teesim/Harvester.kt b/app/src/main/java/org/matrix/teesim/Harvester.kt
+index d0bdb2e..226db85 100644
+--- a/app/src/main/java/org/matrix/teesim/Harvester.kt
++++ b/app/src/main/java/org/matrix/teesim/Harvester.kt
+@@ -88,6 +88,9 @@ object Harvester {
+         // When a TrustedEnvironment is present StrongBox is always OFFERED regardless; this only
+         // decides whether StrongBox keys can be patched (real hardware) or must be generated.
+         val strongBoxAvailable: Boolean,
++        // KeyMint HAL version (attestationVersion) probed at StrongBox; the TEE value when StrongBox
++        // has no real hardware. Keys attested at StrongBox report this instead of the TEE version.
++        val strongBoxAttestationVersion: Int,
+         val attestationVersion: Int,
+         val keymasterVersion: Int,
+         val osVersion: Int?, // encoded major*10000+minor*100+sub
+@@ -288,24 +291,37 @@ object Harvester {
+     private fun tryHarvest(): Record? {
+         val leaf = generateAndFetchLeaf() ?: return null
+         return try {
+-            parse(leaf).copy(strongBoxAvailable = probeStrongBox())
++            val rec = parse(leaf)
++            val sb = probeStrongBox()
++            rec.copy(
++                strongBoxAvailable = sb.available,
++                // Fall back to the TEE version when StrongBox has no real hardware to harvest.
++                strongBoxAttestationVersion = sb.attestationVersion ?: rec.attestationVersion,
++            )
+         } catch (e: Exception) {
+             SystemLogger.error("Failed to parse harvested attestation", e)
+             null
+         }
+     }
+ 
++    /** Outcome of the StrongBox probe: whether it works and, if so, its harvested HAL version. */
++    private data class StrongBoxProbe(val available: Boolean, val attestationVersion: Int?)
++
+     /**
+-     * Whether the device can produce a StrongBox-backed attested key, probed once by generating a
+-     * throwaway StrongBox key. A device with a TrustedEnvironment but a broken/absent StrongBox
+-     * (e.g. an unlocked dev unit) reports false — the resolver still offers StrongBox, but routes
+-     * such keys through generation rather than patch.
++     * Probe StrongBox once by generating a throwaway StrongBox-backed attested key, capturing whether
++     * it works and the attestationVersion it reports. A device with a TrustedEnvironment but a
++     * broken/absent StrongBox (e.g. an unlocked dev unit) reports unavailable — the resolver still
++     * offers StrongBox, but routes such keys through generation (at the TEE version) rather than patch.
+      */
+-    private fun probeStrongBox(): Boolean {
+-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return false
+-        val ok = tryLeaf(withDeviceIds = false, strongBox = true) != null
+-        SystemLogger.info("Harvest: StrongBox-backed key generation available = $ok")
+-        return ok
++    private fun probeStrongBox(): StrongBoxProbe {
++        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return StrongBoxProbe(false, null)
++        val leaf = tryLeaf(withDeviceIds = false, strongBox = true)
++        val version = leaf?.let { runCatching { parse(it).attestationVersion }.getOrNull() }
++        val available = leaf != null
++        SystemLogger.info(
++            "Harvest: StrongBox-backed key generation available = $available (attestationVersion=$version)"
++        )
++        return StrongBoxProbe(available, version)
+     }
+ 
+     /**
+@@ -457,6 +473,7 @@ object Harvester {
+             attestationSecurityLevel = attestSecLevel,
+             keymasterSecurityLevel = keymasterSecLevel,
+             strongBoxAvailable = false, // set by tryHarvest's probe via copy()
++            strongBoxAttestationVersion = attestVersion, // replaced by the StrongBox probe in tryHarvest
+             attestationVersion = attestVersion,
+             keymasterVersion = keymasterVersion,
+             osVersion = osVersion,
+@@ -582,6 +599,7 @@ object Harvester {
+             attestationSecurityLevel = Const.SECLEVEL_TEE,
+             keymasterSecurityLevel = Const.SECLEVEL_TEE,
+             strongBoxAvailable = false, // no working TEE ⇒ no StrongBox either
++            strongBoxAttestationVersion = 300,
+             attestationVersion = 300,
+             keymasterVersion = 300,
+             osVersion = osVersion,
+@@ -659,6 +677,7 @@ object Harvester {
+             put("attestationSecurityLevel", r.attestationSecurityLevel)
+             put("keymasterSecurityLevel", r.keymasterSecurityLevel)
+             put("strongBoxAvailable", r.strongBoxAvailable)
++            put("strongBoxAttestationVersion", r.strongBoxAttestationVersion)
+             put("attestationVersion", r.attestationVersion)
+             put("keymasterVersion", r.keymasterVersion)
+             put("osVersion", r.osVersion ?: JSONObject.NULL)
+@@ -689,6 +708,8 @@ object Harvester {
+             attestationSecurityLevel = o.optInt("attestationSecurityLevel", Const.SECLEVEL_TEE),
+             keymasterSecurityLevel = o.optInt("keymasterSecurityLevel", Const.SECLEVEL_TEE),
+             strongBoxAvailable = o.optBoolean("strongBoxAvailable", false),
++            strongBoxAttestationVersion =
++                o.optInt("strongBoxAttestationVersion", o.optInt("attestationVersion", 300)),
+             attestationVersion = o.optInt("attestationVersion", 300),
+             keymasterVersion = o.optInt("keymasterVersion", 300),
+             osVersion = o.optIntOrNull("osVersion"),
+diff --git a/app/src/main/java/org/matrix/teesim/Resolver.kt b/app/src/main/java/org/matrix/teesim/Resolver.kt
+index 4c0ff5a..83ee1e9 100644
+--- a/app/src/main/java/org/matrix/teesim/Resolver.kt
++++ b/app/src/main/java/org/matrix/teesim/Resolver.kt
+@@ -12,10 +12,11 @@ import org.json.JSONObject
+  * common/control.cpp ApplyConfig().
+  *
+  * Field names mirror control.cpp exactly: top level: type, epoch, bootInfo, profiles bootInfo:
+- * verifiedBootKey(b64), verifiedBootHash(b64), deviceLocked, verifiedBootState profile: id,
+- * keyboxB64, securityLevel(int), osVersion, osPatchLevel, vendorPatchLevel, bootPatchLevel,
+- * deviceIds{...}, packages[], uids[] uids[] is parallel to packages[] (same length, -1 where not
+- * installed).
++ * verifiedBootKey(b64), verifiedBootHash(b64), deviceLocked, verifiedBootState, strongBoxAvailable,
++ * attestVersionTee, attestVersionStrongBox profile: id, keyboxB64, mode, securityLevel(int),
++ * osVersion, osPatchLevel, vendorPatchLevel,
++ * bootPatchLevel, deviceIds{...}, packages[], uids[] uids[] is parallel to packages[] (same length,
++ * -1 where not installed).
+  */
+ object Resolver {
+ 
+@@ -40,6 +41,15 @@ object Resolver {
+                 // they are non-zero — a real vbmeta digest or a stable fallback).
+                 put("deviceLocked", true)
+                 put("verifiedBootState", 0)
++                // Whether the device's StrongBox can really produce a hardware-backed attested key
++                // (probed at harvest). It gates patch mode at the StrongBox level: when false, keys
++                // requested at StrongBox fall back to generation even in a patch profile.
++                put("strongBoxAvailable", harvest.strongBoxAvailable)
++                // Harvested KeyMint HAL version at each level, so a generated key claims the real
++                // device's attestation/keymint version rather than the TA's default. StrongBox reuses
++                // the TEE value when it has no real hardware to harvest.
++                put("attestVersionTee", harvest.attestationVersion)
++                put("attestVersionStrongBox", harvest.strongBoxAttestationVersion)
+             },
+         )
+ 
+@@ -61,6 +71,10 @@ object Resolver {
+         val keyboxBytes = File(Const.DATA_DIR, p.keybox).readBytes()
+         o.put("keyboxB64", b64.encodeToString(keyboxBytes))
+ 
++        // Operation mode: "patch" re-signs the real hardware attestation, "generation" mints the whole
++        // key in our TA. The router still forces generation for a level whose hardware is unavailable.
++        o.put("mode", p.mode)
++
+         // Security level is not a profile choice: it is the device's real level, harvested
+         // from the TEE (a key's actual level is what the app requested via its keystore
+         // security-level service, bounded by what the device offers — which for the keys we
+diff --git a/common/control.cpp b/common/control.cpp
+index 49c07ca..6a2d532 100644
+--- a/common/control.cpp
++++ b/common/control.cpp
+@@ -113,6 +113,7 @@ bool WriteFrame(int fd, const std::string &payload) {
+ // teesim_cfg_add_profile call.
+ struct ProfileStorage {
+   std::string id;
++  std::string mode;
+   std::vector<uint8_t> keybox;
+   std::vector<std::string> pkg_strings;
+   std::vector<const char *> pkg_ptrs;
+@@ -161,8 +162,17 @@ void ApplyConfig(const tjson::Value &msg, uint64_t &epoch, int &applied, int &to
+     boot.device_locked = bi->get("deviceLocked") ? bi->get("deviceLocked")->as_bool(true) : true;
+     boot.verified_boot_state =
+         bi->get("verifiedBootState") ? int32_t(bi->get("verifiedBootState")->as_int(0)) : 0;
++    boot.strongbox_available =
++        bi->get("strongBoxAvailable") ? bi->get("strongBoxAvailable")->as_bool(false) : false;
++    boot.attest_version_tee =
++        bi->get("attestVersionTee") ? int32_t(bi->get("attestVersionTee")->as_int(400)) : 400;
++    boot.attest_version_strongbox = bi->get("attestVersionStrongBox")
++                                        ? int32_t(bi->get("attestVersionStrongBox")->as_int(400))
++                                        : boot.attest_version_tee;
+   } else {
+     boot.device_locked = true;
++    boot.attest_version_tee = 400;
++    boot.attest_version_strongbox = 400;
+   }
+   boot.verified_boot_key = vb_key.data();
+   boot.verified_boot_key_len = vb_key.size();
+@@ -177,6 +187,7 @@ void ApplyConfig(const tjson::Value &msg, uint64_t &epoch, int &applied, int &to
+       const tjson::Value &pj = profiles->at(i);
+       ProfileStorage s;
+       s.id = pj.get("id") ? pj.get("id")->as_string() : std::string();
++      s.mode = pj.get("mode") ? pj.get("mode")->as_string() : std::string();
+       if (const tjson::Value *kb = pj.get("keyboxB64")) {
+         if (!Base64Decode(kb->as_string(), s.keybox)) {
+           LOGE("control: profile %s has an undecodable keybox", s.id.c_str());
+@@ -198,6 +209,7 @@ void ApplyConfig(const tjson::Value &msg, uint64_t &epoch, int &applied, int &to
+       tp.id = s.id.c_str();
+       tp.keybox = s.keybox.data();
+       tp.keybox_len = s.keybox.size();
++      tp.mode = s.mode.empty() ? nullptr : s.mode.c_str();
+       tp.security_level = pj.get("securityLevel") ? int32_t(pj.get("securityLevel")->as_int(1)) : 1;
+       tp.os_version = pj.get("osVersion") ? uint32_t(pj.get("osVersion")->as_int(0)) : 0;
+       tp.os_patchlevel = pj.get("osPatchLevel") ? uint32_t(pj.get("osPatchLevel")->as_int(0)) : 0;
+diff --git a/common/control.h b/common/control.h
+index 87512c3..793ad99 100644
+--- a/common/control.h
++++ b/common/control.h
+@@ -30,6 +30,9 @@ typedef struct {
+   size_t verified_boot_hash_len;
+   bool device_locked;
+   int32_t verified_boot_state;
++  bool strongbox_available;  // device can produce a real StrongBox-backed key; gates patch at that level
++  int32_t attest_version_tee;        // harvested KeyMint HAL version at TEE (attestationVersion)
++  int32_t attest_version_strongbox;  // harvested KeyMint HAL version at StrongBox (TEE value if broken)
+ } TsBootInfo;
+ 
+ // One fully-resolved profile from a config push. All strings/bytes are borrowed
+@@ -38,6 +41,7 @@ typedef struct {
+   const char *id;
+   const uint8_t *keybox;
+   size_t keybox_len;
++  const char *mode;  // "patch" | "generation"; NULL defaults to generation
+   int32_t security_level;  // 0 Software, 1 TEE, 2 StrongBox
+   uint32_t os_version;
+   uint32_t os_patchlevel;
+diff --git a/keymint/keymint_router.cpp b/keymint/keymint_router.cpp
+index cb42fbc..313ecd0 100644
+--- a/keymint/keymint_router.cpp
++++ b/keymint/keymint_router.cpp
+@@ -47,17 +47,20 @@ TaPtr WrapTa(::Ta* ta) {
+   });
+ }
+ 
+-// A configured profile: its TA and the package names routed to it.
++// A configured profile: its TA, the package names routed to it, and whether it patches the real
++// hardware attestation (patch mode) or mints the whole key in the TA (generation mode).
+ struct Profile {
+   std::string id;
+   TaPtr ta;
+   std::vector<std::string> packages;
++  bool patch_mode = false;
+ };
+ 
+ // Live routing, swapped atomically by teesim_cfg_commit under g_cfg_mu.
+ std::mutex g_cfg_mu;
+ std::vector<Profile> g_profiles;
+ TaPtr g_default_ta;  // serves ops on our blobs; any profile's TA decrypts them
++bool g_strongbox_ok = false;  // device can patch real StrongBox keys; else StrongBox forces generation
+ 
+ // Staging state built up by teesim_cfg_begin/add_profile before the swap.
+ std::vector<Profile> g_staging;
+@@ -65,6 +68,9 @@ std::vector<uint8_t> g_stage_vb_key;
+ std::vector<uint8_t> g_stage_vb_hash;
+ bool g_stage_locked = true;
+ int32_t g_stage_vb_state = 0;
++bool g_stage_strongbox_ok = false;
++int32_t g_stage_attest_version_tee = 400;
++int32_t g_stage_attest_version_strongbox = 400;
+ 
+ // RAII guard: mark the current thread as forwarding to the real HAL.
+ struct ForwardGuard {
+@@ -72,11 +78,16 @@ struct ForwardGuard {
+   ~ForwardGuard() { teesim_hook_set_forwarding(false); }
+ };
+ 
+-// The profile TA whose packages match this request's ATTESTATION_APPLICATION_ID,
+-// or null if the request is not for any target app.
+-TaPtr ProfileForRequest(const std::vector<KeyParameter>& params) {
++// The profile matched to this request by its ATTESTATION_APPLICATION_ID: the TA to serve it with and
++// whether that profile is in patch mode. `ta` is null when the request is not for any target app.
++struct RequestTarget {
++  TaPtr ta;
++  bool patch_mode = false;
++};
++
++RequestTarget ProfileForRequest(const std::vector<KeyParameter>& params) {
+   std::lock_guard<std::mutex> lk(g_cfg_mu);
+-  if (g_profiles.empty()) return nullptr;
++  if (g_profiles.empty()) return {};
+   for (const auto& p : params) {
+     if (p.tag != Tag::ATTESTATION_APPLICATION_ID) continue;
+     if (p.value.getTag() != KeyParameterValue::blob) continue;
+@@ -84,11 +95,11 @@ TaPtr ProfileForRequest(const std::vector<KeyParameter>& params) {
+     std::string hay(id.begin(), id.end());
+     for (const auto& prof : g_profiles) {
+       for (const auto& pkg : prof.packages) {
+-        if (hay.find(pkg) != std::string::npos) return prof.ta;
++        if (hay.find(pkg) != std::string::npos) return {prof.ta, prof.patch_mode};
+       }
+     }
+   }
+-  return nullptr;
++  return {};
+ }
+ 
+ // The TA used for operations on an existing blob of ours (begin/upgrade/etc.).
+@@ -340,8 +351,8 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
+   ndk::ScopedAStatus generateKey(const std::vector<KeyParameter>& keyParams,
+                                  const std::optional<AttestationKey>& attestationKey,
+                                  KeyCreationResult* out) override {
+-    TaPtr ta = ProfileForRequest(keyParams);
+-    if (!ta) {
++    RequestTarget t = ProfileForRequest(keyParams);
++    if (!t.ta) {
+       if (real_) {
+         LOGI("generateKey: forwarding to real HAL (not a target)");
+         ForwardGuard g;
+@@ -360,15 +371,24 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
+       }
+       return Status(-100);
+     }
++    // Patch mode: let the real hardware generate the key and attest it, then keep its blob and only
++    // re-sign the attestation under the keybox with a patched root of trust. It needs working hardware
++    // at this level to forward to — a StrongBox that cannot attest (g_strongbox_ok=false), or no real
++    // HAL at all, falls back to generation.
++    if (t.patch_mode && real_ && (level_ != SecurityLevel::STRONGBOX || g_strongbox_ok)) {
++      LOGI("generateKey: patch mode (re-signing real hardware attestation) for target app");
++      return PatchAttest(t.ta.get(), keyParams, out);
++    }
+     LOGI("generateKey: simulating for target app");
+-    return Simulate(ta.get(), keyParams, attestationKey, out);
++    return Simulate(t.ta.get(), keyParams, attestationKey, out);
+   }
+ 
+   ndk::ScopedAStatus importKey(const std::vector<KeyParameter>& keyParams, KeyFormat keyFormat,
+                                const std::vector<uint8_t>& keyData,
+                                const std::optional<AttestationKey>& attestationKey,
+                                KeyCreationResult* out) override {
+-    TaPtr ta = ProfileForRequest(keyParams);
++    RequestTarget t = ProfileForRequest(keyParams);
++    TaPtr ta = t.ta;
+     if (!ta) {
+       if (real_) {
+         ForwardGuard g;
+@@ -534,7 +554,12 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
+   ndk::ScopedAStatus deviceLocked(bool passwordOnly,
+                                   const std::optional<secureclock::TimeStampToken>& tst) override {
+     ForwardGuard g;
++    // deviceLocked is deprecated in the AIDL but still part of the interface we implement, so we
++    // relay it verbatim; suppress the deprecation warning for the one forwarding call.
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+     return real_ ? real_->deviceLocked(passwordOnly, tst) : ndk::ScopedAStatus::ok();
++#pragma clang diagnostic pop
+   }
+   ndk::ScopedAStatus earlyBootEnded() override {
+     ForwardGuard g;
+@@ -579,6 +604,48 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
+     return a;
+   }
+ 
++  // Patch mode: the real hardware generates and attests the key; we keep its genuine, hardware-backed
++  // key blob and re-sign only the attestation chain under the keybox, with the root of trust patched
++  // to locked/Verified. The kept blob is unmarked, so later operations on the key forward to the real
++  // HAL. Falls back to generation if the real HAL declines or returns no attestation to re-sign.
++  ndk::ScopedAStatus PatchAttest(::Ta* ta, const std::vector<KeyParameter>& keyParams,
++                                 KeyCreationResult* out) {
++    KeyCreationResult real;
++    {
++      ForwardGuard g;
++      auto st = real_->generateKey(keyParams, std::nullopt, &real);
++      if (!st.isOk()) {
++        LOGW("patch: real generateKey failed (%d); generating instead", st.getServiceSpecificError());
++        return Simulate(ta, keyParams, std::nullopt, out);
++      }
++    }
++    if (real.certificateChain.empty()) {
++      LOGW("patch: real attestation returned no certificates; generating instead");
++      return Simulate(ta, keyParams, std::nullopt, out);
++    }
++    const auto& leaf = real.certificateChain.front().encodedCertificate;
++    TsCreationResult* res = nullptr;
++    int32_t rc = teesim_km_patch_attestation(ta, leaf.data(), leaf.size(), &res);
++    if (rc != 0) {
++      LOGW("patch: re-signing the real attestation failed (%d); generating instead", rc);
++      return Simulate(ta, keyParams, std::nullopt, out);
++    }
++    // Keep the real hardware key blob and characteristics; swap in the keybox-rooted, RoT-patched
++    // chain we just built.
++    out->keyBlob = real.keyBlob;
++    out->keyCharacteristics = std::move(real.keyCharacteristics);
++    size_t n = teesim_km_result_num_certs(res);
++    out->certificateChain.resize(n);
++    for (size_t i = 0; i < n; ++i) {
++      const uint8_t* c = nullptr;
++      size_t clen = 0;
++      teesim_km_result_cert(res, i, &c, &clen);
++      out->certificateChain[i].encodedCertificate.assign(c, c + clen);
++    }
++    teesim_km_free_result(res);
++    return ndk::ScopedAStatus::ok();
++  }
++
+   ndk::ScopedAStatus Simulate(::Ta* ta, const std::vector<KeyParameter>& keyParams,
+                               const std::optional<AttestationKey>& attestationKey,
+                               KeyCreationResult* out) {
+@@ -614,13 +681,17 @@ extern "C" void teesim_cfg_begin(const TsBootInfo* boot) {
+                          boot->verified_boot_hash + boot->verified_boot_hash_len);
+   g_stage_locked = boot->device_locked;
+   g_stage_vb_state = boot->verified_boot_state;
++  g_stage_strongbox_ok = boot->strongbox_available;
++  g_stage_attest_version_tee = boot->attest_version_tee;
++  g_stage_attest_version_strongbox = boot->attest_version_strongbox;
+ }
+ 
+ extern "C" bool teesim_cfg_add_profile(const TsProfile* p) {
+   ::Ta* ta = teesim_km_init_ex(p->keybox, p->keybox_len, p->security_level, p->os_version,
+                                p->os_patchlevel, p->vendor_patchlevel, p->boot_patchlevel,
+                                g_stage_vb_key.data(), g_stage_vb_key.size(), g_stage_vb_hash.data(),
+-                               g_stage_vb_hash.size(), g_stage_locked, g_stage_vb_state, p->ids);
++                               g_stage_vb_hash.size(), g_stage_locked, g_stage_vb_state,
++                               g_stage_attest_version_tee, g_stage_attest_version_strongbox, p->ids);
+   if (!ta) {
+     LOGE("keymint: profile %s failed to build (bad keybox?)", p->id ? p->id : "?");
+     return false;
+@@ -628,6 +699,7 @@ extern "C" bool teesim_cfg_add_profile(const TsProfile* p) {
+   Profile prof;
+   prof.id = p->id ? p->id : "";
+   prof.ta = WrapTa(ta);
++  prof.patch_mode = p->mode && std::string(p->mode) == "patch";
+   for (int i = 0; i < p->n_packages && p->packages; ++i) {
+     if (p->packages[i]) prof.packages.emplace_back(p->packages[i]);
+   }
+@@ -640,6 +712,7 @@ extern "C" int teesim_cfg_commit(uint64_t /*epoch*/, char* /*err*/, size_t /*err
+   g_profiles = std::move(g_staging);
+   g_staging.clear();
+   g_default_ta = g_profiles.empty() ? nullptr : g_profiles.front().ta;
++  g_strongbox_ok = g_stage_strongbox_ok;
+   return static_cast<int>(g_profiles.size());
+ }
+ 
+diff --git a/keystore/keystore_router.cpp b/keystore/keystore_router.cpp
+index 1e20bdf..6da6c3e 100644
+--- a/keystore/keystore_router.cpp
++++ b/keystore/keystore_router.cpp
+@@ -109,6 +109,8 @@ std::vector<uint8_t> g_stage_vb_key;
+ std::vector<uint8_t> g_stage_vb_hash;
+ bool g_stage_locked = true;
+ int32_t g_stage_vb_state = 0;
++int32_t g_stage_attest_version_tee = 400;
++int32_t g_stage_attest_version_strongbox = 400;
+ 
+ std::mutex g_keys_mutex;
+ std::map<std::string, PendingKey> g_keys;
+@@ -760,13 +762,16 @@ extern "C" void teesim_cfg_begin(const TsBootInfo* boot) {
+                          boot->verified_boot_hash + boot->verified_boot_hash_len);
+   g_stage_locked = boot->device_locked;
+   g_stage_vb_state = boot->verified_boot_state;
++  g_stage_attest_version_tee = boot->attest_version_tee;
++  g_stage_attest_version_strongbox = boot->attest_version_strongbox;
+ }
+ 
+ extern "C" bool teesim_cfg_add_profile(const TsProfile* p) {
+   Ta* ta = teesim_km_init_ex(p->keybox, p->keybox_len, p->security_level, p->os_version,
+                              p->os_patchlevel, p->vendor_patchlevel, p->boot_patchlevel,
+                              g_stage_vb_key.data(), g_stage_vb_key.size(), g_stage_vb_hash.data(),
+-                             g_stage_vb_hash.size(), g_stage_locked, g_stage_vb_state, p->ids);
++                             g_stage_vb_hash.size(), g_stage_locked, g_stage_vb_state,
++                             g_stage_attest_version_tee, g_stage_attest_version_strongbox, p->ids);
+   if (!ta) {
+     LOGE("keystore: profile %s failed to build (bad keybox?)", p->id ? p->id : "?");
+     return false;
+diff --git a/rust/patches/kmr-ta-seclevel.patch b/rust/patches/kmr-ta-seclevel.patch
+index 8ca53a7..db37017 100644
+--- a/rust/patches/kmr-ta-seclevel.patch
++++ b/rust/patches/kmr-ta-seclevel.patch
+@@ -1,8 +1,8 @@
+ diff --git a/ta/src/lib.rs b/ta/src/lib.rs
+-index a0efe49..7f9b165 100644
++index a0efe49..f2601f7 100644
+ --- a/ta/src/lib.rs
+ +++ b/ta/src/lib.rs
+-@@ -353,6 +353,19 @@ impl KeyMintTa {
++@@ -353,6 +353,37 @@ impl KeyMintTa {
+          self.hw_info.security_level == SecurityLevel::Strongbox
+      }
+  
+@@ -18,6 +18,24 @@ index a0efe49..7f9b165 100644
+ +    pub fn set_security_level(&mut self, security_level: SecurityLevel) {
+ +        self.hw_info.security_level = security_level;
+ +    }
+++
+++    /// Return the KeyMint HAL version reported in attestation records
+++    /// (attestationVersion / keymintVersion).
+++    pub fn aidl_version(&self) -> i32 {
+++        self.aidl_version as i32
+++    }
+++
+++    /// Override the KeyMint HAL version reported in attestation records, so a
+++    /// generated key can claim the version of the real HAL at the level it was
+++    /// requested through. Values map to the nearest HAL version (100/200/300/400).
+++    pub fn set_aidl_version(&mut self, version: i32) {
+++        self.aidl_version = match version {
+++            v if v >= 400 => KeyMintHalVersion::V4,
+++            v if v >= 300 => KeyMintHalVersion::V3,
+++            v if v >= 200 => KeyMintHalVersion::V2,
+++            _ => KeyMintHalVersion::V1,
+++        };
+++    }
+ +
+      /// Indicate whether the current device has secure storage available.
+      fn secure_storage_available(&self) -> kmr_common::tag::SecureStorage {
+diff --git a/rust/teesim-km/Cargo.toml b/rust/teesim-km/Cargo.toml
+index 04e0992..dc5ab86 100644
+--- a/rust/teesim-km/Cargo.toml
++++ b/rust/teesim-km/Cargo.toml
+@@ -26,3 +26,7 @@ libc = "0.2"
+ 
+ roxmltree = "0.20"
+ base64 = "0.22"
++
++# X.509 assembly for patch mode: re-signing the real hardware attestation leaf under the keybox.
++# Pinned to the versions the vendored kmr-ta/kmr-common already use; x509-cert re-exports der/spki.
++x509-cert = "0.2"
+diff --git a/rust/teesim-km/include/teesim_km.h b/rust/teesim-km/include/teesim_km.h
+index d321052..2c964b8 100644
+--- a/rust/teesim-km/include/teesim_km.h
++++ b/rust/teesim-km/include/teesim_km.h
+@@ -55,13 +55,16 @@ Ta *teesim_km_init(const uint8_t *keybox_ptr, size_t keybox_len);
+ // encodings match KeyMint: os_version = major*10000+minor*100+sub; os_patchlevel
+ // = YYYYMM; vendor/boot patchlevel = YYYYMMDD. security_level: 0 Software, 1 TEE,
+ // 2 StrongBox. verified_boot_state: 0 Verified, 1 SelfSigned, 2 Unverified,
+-// 3 Failed. `ids` may be NULL. Returns null on failure (e.g. a bad keybox).
++// 3 Failed. attest_version_tee/strongbox are the harvested KeyMint HAL versions
++// (attestationVersion; 100/200/300/400) reported by keys attested at each level.
++// `ids` may be NULL. Returns null on failure (e.g. a bad keybox).
+ Ta *teesim_km_init_ex(const uint8_t *keybox_ptr, size_t keybox_len,
+                       int32_t security_level, uint32_t os_version,
+                       uint32_t os_patchlevel, uint32_t vendor_patchlevel,
+                       uint32_t boot_patchlevel, const uint8_t *vb_key,
+                       size_t vb_key_len, const uint8_t *vb_hash, size_t vb_hash_len,
+                       bool device_locked, int32_t verified_boot_state,
++                      int32_t attest_version_tee, int32_t attest_version_strongbox,
+                       const TsDeviceIds *ids);
+ void teesim_km_destroy(Ta *handle);
+ bool teesim_km_is_marked(const uint8_t *blob_ptr, size_t blob_len);
+@@ -83,6 +86,13 @@ int32_t teesim_km_generate_key(Ta *ta, const KmParam *params, size_t n_params,
+                                size_t ak_n_params, const uint8_t *ak_issuer,
+                                size_t ak_issuer_len, TsCreationResult **out);
+ 
++// Patch mode: re-sign a real hardware attestation leaf under this profile's keybox with the
++// profile's locked/Verified root of trust. `leaf` is the DER leaf from the real HAL's chain; its
++// public key and attestation content are preserved. On success *out holds the new certificate chain
++// [patched leaf, keybox chain] (empty key blob / characteristics), read via the result accessors.
++int32_t teesim_km_patch_attestation(Ta *ta, const uint8_t *leaf, size_t leaf_len,
++                                    TsCreationResult **out);
++
+ int32_t teesim_km_import_key(Ta *ta, const KmParam *params, size_t n_params,
+                              int32_t security_level, int32_t key_format,
+                              const uint8_t *key_data, size_t key_data_len,
+diff --git a/rust/teesim-km/src/attest.rs b/rust/teesim-km/src/attest.rs
+index 6311dfd..35b5e95 100644
+--- a/rust/teesim-km/src/attest.rs
++++ b/rust/teesim-km/src/attest.rs
+@@ -13,17 +13,29 @@ use kmr_wire::keymint::{self, EcCurve};
+ use roxmltree::Document;
+ 
+ /// Per-algorithm signing key material plus its certificate chain.
++#[derive(Clone)]
+ struct AlgoInfo {
+     key: KeyMaterial,
+     chain: Vec<keymint::Certificate>,
+ }
+ 
+ /// Signing information for the asymmetric key types we attest with.
++#[derive(Clone)]
+ pub struct CertSignInfo {
+     rsa: AlgoInfo,
+     ec: AlgoInfo,
+ }
+ 
++impl CertSignInfo {
++    /// The batch signing key and its keybox certificate chain for one algorithm (EC when `ec` is
++    /// true, else RSA). Patch mode re-signs a real attestation leaf with this key and appends this
++    /// chain, matching the algorithm of the key being attested.
++    pub fn batch(&self, ec: bool) -> (KeyMaterial, &[keymint::Certificate]) {
++        let a = if ec { &self.ec } else { &self.rsa };
++        (a.key.clone(), &a.chain)
++    }
++}
++
+ impl CertSignInfo {
+     /// Parse a keybox.xml string and extract the RSA and EC signing keys/chains.
+     pub fn new(keybox_xml: &str) -> Result<Self, String> {
+diff --git a/rust/teesim-km/src/capi.rs b/rust/teesim-km/src/capi.rs
+index 2a31998..4f79db3 100644
+--- a/rust/teesim-km/src/capi.rs
++++ b/rust/teesim-km/src/capi.rs
+@@ -242,6 +242,33 @@ pub unsafe extern "C" fn teesim_km_import_key(
+     }
+ }
+ 
++/// Re-sign a real hardware attestation `leaf` (DER) under this profile's keybox with a patched
++/// (locked/Verified) root of trust; see `Ta::patch_attestation`. On success *out holds the new chain
++/// `[patched leaf, keybox chain]` with an empty key blob and characteristics.
++///
++/// # Safety
++/// See module docs; `leaf`/`leaf_len` must describe a valid buffer.
++#[no_mangle]
++pub unsafe extern "C" fn teesim_km_patch_attestation(
++    ta: *mut Ta,
++    leaf: *const u8,
++    leaf_len: usize,
++    out: *mut *mut TsCreationResult,
++) -> i32 {
++    match call(|| {
++        let ta = &*ta;
++        let leaf = if leaf.is_null() { &[][..] } else { slice::from_raw_parts(leaf, leaf_len) };
++        let certs = ta.patch_attestation(leaf)?;
++        Ok(TsCreationResult { key_blob: Vec::new(), certs, chars: Vec::new() })
++    }) {
++        Ok(r) => {
++            *out = Box::into_raw(Box::new(r));
++            0
++        }
++        Err(code) => code,
++    }
++}
++
+ // Accessors for TsCreationResult.
+ 
+ /// # Safety
+diff --git a/rust/teesim-km/src/ffi.rs b/rust/teesim-km/src/ffi.rs
+index 0d797ae..261c866 100644
+--- a/rust/teesim-km/src/ffi.rs
++++ b/rust/teesim-km/src/ffi.rs
+@@ -104,6 +104,8 @@ pub unsafe extern "C" fn teesim_km_init_ex(
+     vb_hash_len: usize,
+     device_locked: bool,
+     verified_boot_state: i32,
++    attest_version_tee: i32,
++    attest_version_strongbox: i32,
+     ids: *const TsDeviceIds,
+ ) -> *mut Ta {
+     init_logging();
+@@ -160,6 +162,8 @@ pub unsafe extern "C" fn teesim_km_init_ex(
+             verified_boot_hash: take_bytes(vb_hash, vb_hash_len),
+             device_boot_locked: device_locked,
+             verified_boot_state,
++            attest_version_tee,
++            attest_version_strongbox,
+             attestation_ids,
+         };
+         match Ta::new_ex(cfg) {
+diff --git a/rust/teesim-km/src/lib.rs b/rust/teesim-km/src/lib.rs
+index 012140f..64fc002 100644
+--- a/rust/teesim-km/src/lib.rs
++++ b/rust/teesim-km/src/lib.rs
+@@ -13,6 +13,7 @@ pub mod capi;
+ mod device;
+ pub mod ffi;
+ mod ops;
++mod resign;
+ 
+ use kmr_common::crypto;
+ use kmr_crypto_boring::{
+@@ -59,6 +60,17 @@ fn crypto_impls() -> crypto::Implementation {
+ /// The in-process TA plus the state the router needs around it.
+ pub struct Ta {
+     inner: KeyMintTa,
++    /// Retained copy of the keybox signing keys. kmr-ta owns its own copy for generation but does
++    /// not expose it, and patch mode needs it to re-sign a real attestation leaf under the keybox.
++    sign_info: attest::CertSignInfo,
++    /// The profile's root of trust (locked/Verified) as a DER `RootOfTrust` SEQUENCE, spliced into a
++    /// real leaf's attestation extension in patch mode. Identical to what generation emits.
++    patch_rot: Vec<u8>,
++    /// KeyMint HAL versions harvested at each level. The per-request override (see
++    /// `override_attestation_identity`) sets the record's attestation/keymint version to match the
++    /// HAL the request came through, so a generated key claims the real device's version.
++    attest_version_tee: i32,
++    attest_version_strongbox: i32,
+ }
+ 
+ /// Everything beyond the crypto backend that shapes a profile's attestation
+@@ -88,6 +100,12 @@ pub struct TaConfig<'a> {
+     pub device_boot_locked: bool,
+     /// 0 Verified, 1 SelfSigned, 2 Unverified, 3 Failed.
+     pub verified_boot_state: i32,
++    /// KeyMint HAL version harvested at TrustedEnvironment (attestationVersion; 100/200/300/400),
++    /// reported by keys attested at that level.
++    pub attest_version_tee: i32,
++    /// KeyMint HAL version harvested at StrongBox; falls back to the TEE value when StrongBox is
++    /// unavailable (a broken StrongBox is still offered, served by generation at the TEE version).
++    pub attest_version_strongbox: i32,
+     /// Device-ID values to vouch for, or `None` to decline ID attestation.
+     pub attestation_ids: Option<AttestationIdInfo>,
+ }
+@@ -108,6 +126,8 @@ impl<'a> TaConfig<'a> {
+             verified_boot_hash: vec![0u8; 32],
+             device_boot_locked: true,
+             verified_boot_state: VerifiedBootState::Verified as i32,
++            attest_version_tee: 400,
++            attest_version_strongbox: 400,
+             attestation_ids: None,
+         }
+     }
+@@ -149,7 +169,7 @@ impl Ta {
+ 
+         let dev = Implementation {
+             keys: Box::new(device::Keys),
+-            sign_info: Some(Box::new(sign_info)),
++            sign_info: Some(Box::new(sign_info.clone())),
+             attest_ids,
+             // Rollback-resistant keys are declined (no secure-deletion store).
+             sdd_mgr: None,
+@@ -168,6 +188,14 @@ impl Ta {
+             3 => VerifiedBootState::Failed,
+             _ => VerifiedBootState::Verified,
+         };
++        // Precompute the root of trust patch mode splices into a real leaf, from the same values the
++        // generation path feeds into kmr-ta's boot info (below), so both modes report it identically.
++        let patch_rot = resign::build_root_of_trust(
++            &cfg.verified_boot_key,
++            cfg.device_boot_locked,
++            cfg.verified_boot_state,
++            &cfg.verified_boot_hash,
++        );
+         // These fields double as the attestation record's root of trust and as
+         // inputs to the KEK derivation. The daemon supplies the device's real,
+         // frozen values, so the KEK stays stable across reboots and every profile
+@@ -188,7 +216,13 @@ impl Ta {
+             vendor_patchlevel: cfg.vendor_patchlevel,
+         });
+ 
+-        Ok(Ta { inner })
++        Ok(Ta {
++            inner,
++            sign_info,
++            patch_rot,
++            attest_version_tee: cfg.attest_version_tee,
++            attest_version_strongbox: cfg.attest_version_strongbox,
++        })
+     }
+ 
+     /// Feed a serialized kmr_wire request to the TA and return the serialized
+diff --git a/rust/teesim-km/src/ops.rs b/rust/teesim-km/src/ops.rs
+index 2ec39a7..110de1f 100644
+--- a/rust/teesim-km/src/ops.rs
++++ b/rust/teesim-km/src/ops.rs
+@@ -62,23 +62,28 @@ impl Ta {
+         Rsp::from_cbor_value(resp_value).map_err(|e| local(format!("{e:?}")))
+     }
+ 
+-    /// Apply a per-request attestation security level to the inner TA for the
+-    /// duration of one generateKey/importKey, returning the previous level to
+-    /// restore afterwards. The attestation record's `attestationSecurityLevel` /
+-    /// `keymasterSecurityLevel` and the KeyCharacteristics `securityLevel` all
+-    /// follow `hw_info.security_level`, so overriding it makes them reflect the
+-    /// HAL the request came through. A level outside the known set leaves the TA's
+-    /// configured default in place (encoding: 0 Software, 1 TrustedEnvironment,
+-    /// 2 StrongBox).
+-    fn override_security_level(&mut self, security_level: i32) -> Option<SecurityLevel> {
++    /// Apply a per-request attestation identity — security level and KeyMint HAL version — to the
++    /// inner TA for the duration of one generateKey/importKey, returning the previous pair to restore
++    /// afterwards. The record's `attestationSecurityLevel` / `keymasterSecurityLevel` and the
++    /// KeyCharacteristics `securityLevel` follow `hw_info.security_level`; its `attestationVersion` /
++    /// `keymintVersion` follow the TA's `aidl_version`. Overriding both makes the record reflect the
++    /// real HAL the request came through: `security_level` picks the level (0 Software, 1
++    /// TrustedEnvironment, 2 StrongBox) and the version harvested at that level (StrongBox falling
++    /// back to the TEE version). A level outside the known set leaves the TA's defaults in place.
++    fn override_attestation_identity(&mut self, security_level: i32) -> Option<(SecurityLevel, i32)> {
+         let level = match security_level {
+             0 => SecurityLevel::Software,
+             1 => SecurityLevel::TrustedEnvironment,
+             2 => SecurityLevel::Strongbox,
+             _ => return None,
+         };
+-        let prev = self.inner.security_level();
++        let prev = (self.inner.security_level(), self.inner.aidl_version());
+         self.inner.set_security_level(level);
++        let version = match level {
++            SecurityLevel::Strongbox => self.attest_version_strongbox,
++            _ => self.attest_version_tee,
++        };
++        self.inner.set_aidl_version(version);
+         Some(prev)
+     }
+ 
+@@ -91,11 +96,12 @@ impl Ta {
+         attestation_key: Option<AttestationKey>,
+         security_level: i32,
+     ) -> Result<KeyCreationResult, OpError> {
+-        let restore = self.override_security_level(security_level);
++        let restore = self.override_attestation_identity(security_level);
+         let resp: Result<GenerateKeyResponse, OpError> =
+             self.perform(GenerateKeyRequest { key_params, attestation_key });
+-        if let Some(prev) = restore {
+-            self.inner.set_security_level(prev);
++        if let Some((level, version)) = restore {
++            self.inner.set_security_level(level);
++            self.inner.set_aidl_version(version);
+         }
+         Ok(marked_result(resp?.ret))
+     }
+@@ -111,11 +117,12 @@ impl Ta {
+         attestation_key: Option<AttestationKey>,
+         security_level: i32,
+     ) -> Result<KeyCreationResult, OpError> {
+-        let restore = self.override_security_level(security_level);
++        let restore = self.override_attestation_identity(security_level);
+         let resp: Result<ImportKeyResponse, OpError> =
+             self.perform(ImportKeyRequest { key_params, key_format, key_data, attestation_key });
+-        if let Some(prev) = restore {
+-            self.inner.set_security_level(prev);
++        if let Some((level, version)) = restore {
++            self.inner.set_security_level(level);
++            self.inner.set_aidl_version(version);
+         }
+         Ok(marked_result(resp?.ret))
+     }
+diff --git a/rust/teesim-km/src/resign.rs b/rust/teesim-km/src/resign.rs
+new file mode 100644
+index 0000000..b4f32c9
+--- /dev/null
++++ b/rust/teesim-km/src/resign.rs
+@@ -0,0 +1,262 @@
++// Patch-mode attestation re-signing.
++//
++// In patch mode the real hardware generates and attests a key; we keep its (genuine, hardware-backed)
++// key blob and re-sign only the attestation leaf under the profile's keybox, replacing the root of
++// trust with the profile's locked/Verified one. Everything else in the real leaf — the attested
++// public key, the challenge, the KeyMint version fields and the tee-enforced authorization list — is
++// preserved, so the record carries authentic hardware attestation content behind a keybox-rooted,
++// locked chain.
++//
++// kmr-ta builds attestation leaves too, but its cert module is private and its signing key is not
++// exposed, so this path re-implements the small amount of X.509 assembly it needs with `x509-cert`
++// (for the certificate structure) and hand-written DER (for the one field, the root of trust, that
++// x509-cert cannot reach because it lives under a high-number `[704]` context tag). Signing reuses
++// the same BoringSSL backend and keybox key that generation uses.
++
++use crate::{Ta, OpError};
++use kmr_common::crypto::{rsa, AccumulatingOperation, Ec, KeyMaterial, Rsa, Sha256};
++use kmr_crypto_boring::{ec::BoringEc, rsa::BoringRsa, sha256::BoringSha256};
++use kmr_wire::keymint::Digest;
++use x509_cert::der::asn1::{BitString, ObjectIdentifier, OctetString};
++use x509_cert::der::{Decode, Encode};
++use x509_cert::spki::AlgorithmIdentifierOwned;
++use x509_cert::Certificate;
++
++/// Local (non-TA) failure code, matching `ops::ERR_UNKNOWN`.
++const ERR: i32 = -1000;
++
++const ID_EC_PUBLIC_KEY: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
++const EC_SHA256_SIG_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
++const RSA_SHA256_SIG_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11");
++const ATTESTATION_EXT_OID: ObjectIdentifier =
++    ObjectIdentifier::new_unwrap("1.3.6.1.4.1.11129.2.1.17");
++
++/// A short local error, formatting any Debug source.
++fn wrap<E: core::fmt::Debug>(ctx: &'static str) -> impl Fn(E) -> OpError {
++    move |e| OpError { code: ERR, msg: format!("patch: {ctx}: {e:?}") }
++}
++
++fn err(msg: &str) -> OpError {
++    OpError { code: ERR, msg: format!("patch: {msg}") }
++}
++
++impl Ta {
++    /// Re-sign a real hardware attestation `leaf` (DER) under the keybox with the profile's root of
++    /// trust. Returns the new chain `[patched leaf, keybox chain…]`.
++    pub fn patch_attestation(&self, leaf: &[u8]) -> Result<Vec<Vec<u8>>, OpError> {
++        let cert = Certificate::from_der(leaf).map_err(wrap("parse real leaf"))?;
++        let mut tbs = cert.tbs_certificate;
++
++        // Sign with the keybox key matching the attested key's algorithm, and append that key's chain.
++        let is_ec = tbs.subject_public_key_info.algorithm.oid == ID_EC_PUBLIC_KEY;
++        let (batch_key, batch_chain) = self.sign_info.batch(is_ec);
++        let batch_leaf = batch_chain.first().ok_or_else(|| err("keybox chain is empty"))?;
++        let batch_leaf =
++            Certificate::from_der(&batch_leaf.encoded_certificate).map_err(wrap("parse keybox leaf"))?;
++
++        let sig_alg = AlgorithmIdentifierOwned {
++            oid: if is_ec { EC_SHA256_SIG_OID } else { RSA_SHA256_SIG_OID },
++            // Match kmr-ta's generation path, which encodes no AlgorithmIdentifier parameters.
++            parameters: None,
++        };
++
++        // Splice the profile's root of trust into the attestation extension.
++        let exts = tbs.extensions.as_mut().ok_or_else(|| err("leaf has no extensions"))?;
++        let ext = exts
++            .iter_mut()
++            .find(|e| e.extn_id == ATTESTATION_EXT_OID)
++            .ok_or_else(|| err("leaf has no KeyMint attestation extension"))?;
++        let patched = splice_root_of_trust(ext.extn_value.as_bytes(), &self.patch_rot)?;
++        ext.extn_value = OctetString::new(patched).map_err(wrap("rewrap key description"))?;
++
++        // Re-root the leaf at the keybox and re-sign the modified tbsCertificate.
++        tbs.signature = sig_alg.clone();
++        tbs.issuer = batch_leaf.tbs_certificate.subject.clone();
++        let tbs_der = tbs.to_der().map_err(wrap("encode tbsCertificate"))?;
++        let sig = self.sign_tbs(is_ec, batch_key, &tbs_der)?;
++
++        let patched_leaf = Certificate {
++            tbs_certificate: tbs,
++            signature_algorithm: sig_alg,
++            signature: BitString::from_bytes(&sig).map_err(wrap("wrap signature"))?,
++        }
++        .to_der()
++        .map_err(wrap("encode leaf"))?;
++
++        let mut chain = Vec::with_capacity(1 + batch_chain.len());
++        chain.push(patched_leaf);
++        chain.extend(batch_chain.iter().map(|c| c.encoded_certificate.clone()));
++        Ok(chain)
++    }
++
++    /// Sign `tbs` with the keybox batch key using the same modes as kmr-ta's own cert signing
++    /// (ECDSA/SHA-256 or RSASSA-PKCS1-v1_5/SHA-256).
++    fn sign_tbs(&self, is_ec: bool, key: KeyMaterial, tbs: &[u8]) -> Result<Vec<u8>, OpError> {
++        let run = |mut op: Box<dyn AccumulatingOperation>| -> Result<Vec<u8>, OpError> {
++            op.update(tbs).map_err(wrap("sign update"))?;
++            op.finish().map_err(wrap("sign finish"))
++        };
++        match key {
++            KeyMaterial::Ec(_, _, k) if is_ec => {
++                run(BoringEc::default().begin_sign(k, Digest::Sha256).map_err(wrap("ec begin_sign"))?)
++            }
++            KeyMaterial::Rsa(k) if !is_ec => run(
++                BoringRsa::default()
++                    .begin_sign(k, rsa::SignMode::Pkcs1_1_5Padding(Digest::Sha256))
++                    .map_err(wrap("rsa begin_sign"))?,
++            ),
++            _ => Err(err("keybox key type does not match the attested key's algorithm")),
++        }
++    }
++}
++
++/// Build a DER `RootOfTrust ::= SEQUENCE { verifiedBootKey OCTET STRING, deviceLocked BOOLEAN,
++/// verifiedBootState ENUMERATED, verifiedBootHash OCTET STRING }` from the profile's boot info. This
++/// is the value generation emits (see kmr-ta's `RootOfTrust::from(&BootInfo)`), so patch and
++/// generation report an identical root of trust.
++pub(crate) fn build_root_of_trust(vb_key: &[u8], locked: bool, state: i32, vb_hash: &[u8]) -> Vec<u8> {
++    // kmr-ta hashes an over-long verified-boot key (boot_info_hashed_key); mirror it.
++    let key_bytes = if vb_key.len() > 32 {
++        BoringSha256.hash(vb_key).map(|h| h.to_vec()).unwrap_or_else(|_| vb_key.to_vec())
++    } else {
++        vb_key.to_vec()
++    };
++    let mut body = Vec::new();
++    body.extend_from_slice(&tlv(&[0x04], &key_bytes)); // verifiedBootKey OCTET STRING
++    body.extend_from_slice(&[0x01, 0x01, if locked { 0xff } else { 0x00 }]); // deviceLocked BOOLEAN
++    body.extend_from_slice(&[0x0a, 0x01, (state & 0xff) as u8]); // verifiedBootState ENUMERATED
++    body.extend_from_slice(&tlv(&[0x04], vb_hash)); // verifiedBootHash OCTET STRING
++    tlv(&[0x30], &body)
++}
++
++// `[704] EXPLICIT` — the context tag the RootOfTrust sits under in an AuthorizationList. Tag number
++// 704 needs the high-tag-number form: 0xBF (context, constructed, 0x1F) then 704 as base-128.
++const ROT_TAG: &[u8] = &[0xBF, 0x85, 0x40];
++
++/// Replace the RootOfTrust inside a DER `KeyDescription`'s hardware-enforced AuthorizationList with
++/// `rot_seq` (a bare `RootOfTrust` SEQUENCE). Every other field is copied verbatim.
++fn splice_root_of_trust(key_desc: &[u8], rot_seq: &[u8]) -> Result<Vec<u8>, OpError> {
++    let top = read_elem(key_desc)?;
++    if top.tag != [0x30] {
++        return Err(err("key description is not a SEQUENCE"));
++    }
++    let fields = split_elems(top.value)?;
++    if fields.len() != 8 {
++        return Err(err(&format!("key description has {} fields, expected 8", fields.len())));
++    }
++    // Field 7 (0-based) is the hardware-enforced AuthorizationList.
++    let hw = read_elem(fields[7])?;
++    if hw.tag != [0x30] {
++        return Err(err("hardware-enforced list is not a SEQUENCE"));
++    }
++    let new_rot = tlv(ROT_TAG, rot_seq);
++    let mut new_hw_body = Vec::with_capacity(hw.value.len());
++    let mut replaced = false;
++    let mut rest = hw.value;
++    while !rest.is_empty() {
++        let e = read_elem(rest)?;
++        if e.tag == ROT_TAG {
++            new_hw_body.extend_from_slice(&new_rot);
++            replaced = true;
++        } else {
++            new_hw_body.extend_from_slice(&rest[..e.total]);
++        }
++        rest = &rest[e.total..];
++    }
++    // Real hardware always carries a root of trust; if some HAL omits it, append ours (the tag list
++    // is ascending and [704] is high, so an append preserves ordering for the usual tag set).
++    if !replaced {
++        new_hw_body.extend_from_slice(&new_rot);
++    }
++
++    let mut body = Vec::with_capacity(key_desc.len());
++    for f in &fields[..7] {
++        body.extend_from_slice(f);
++    }
++    body.extend_from_slice(&tlv(&[0x30], &new_hw_body));
++    Ok(tlv(&[0x30], &body))
++}
++
++/// One parsed TLV: its tag bytes, its value bytes, and the total encoded length (tag+len+value).
++struct Elem<'a> {
++    tag: &'a [u8],
++    value: &'a [u8],
++    total: usize,
++}
++
++/// Parse the leading DER TLV of `input`, supporting multi-byte tags and long-form lengths.
++fn read_elem(input: &[u8]) -> Result<Elem<'_>, OpError> {
++    if input.is_empty() {
++        return Err(err("truncated DER (no tag)"));
++    }
++    let mut i = 1;
++    if input[0] & 0x1f == 0x1f {
++        loop {
++            let b = *input.get(i).ok_or_else(|| err("truncated multi-byte tag"))?;
++            i += 1;
++            if b & 0x80 == 0 {
++                break;
++            }
++        }
++    }
++    let tag = &input[..i];
++    let l0 = *input.get(i).ok_or_else(|| err("truncated length"))?;
++    i += 1;
++    let len = if l0 & 0x80 == 0 {
++        l0 as usize
++    } else {
++        let nbytes = (l0 & 0x7f) as usize;
++        if nbytes == 0 || nbytes > 4 {
++            return Err(err("unsupported DER length"));
++        }
++        let mut v = 0usize;
++        for _ in 0..nbytes {
++            v = (v << 8) | *input.get(i).ok_or_else(|| err("truncated length bytes"))? as usize;
++            i += 1;
++        }
++        v
++    };
++    let end = i.checked_add(len).ok_or_else(|| err("length overflow"))?;
++    if end > input.len() {
++        return Err(err("value runs past end of input"));
++    }
++    Ok(Elem { tag, value: &input[i..end], total: end })
++}
++
++/// Split a SEQUENCE's content into its element TLV slices.
++fn split_elems(mut content: &[u8]) -> Result<Vec<&[u8]>, OpError> {
++    let mut out = Vec::new();
++    while !content.is_empty() {
++        let e = read_elem(content)?;
++        out.push(&content[..e.total]);
++        content = &content[e.total..];
++    }
++    Ok(out)
++}
++
++/// Encode DER length octets for a value of length `n`.
++fn der_len(n: usize) -> Vec<u8> {
++    if n < 0x80 {
++        return vec![n as u8];
++    }
++    let mut be = Vec::new();
++    let mut v = n;
++    while v > 0 {
++        be.push((v & 0xff) as u8);
++        v >>= 8;
++    }
++    be.reverse();
++    let mut out = Vec::with_capacity(1 + be.len());
++    out.push(0x80 | be.len() as u8);
++    out.extend_from_slice(&be);
++    out
++}
++
++/// Build a TLV from tag bytes and a value.
++fn tlv(tag: &[u8], value: &[u8]) -> Vec<u8> {
++    let mut out = Vec::with_capacity(tag.len() + 5 + value.len());
++    out.extend_from_slice(tag);
++    out.extend_from_slice(&der_len(value.len()));
++    out.extend_from_slice(value);
++    out
++}
+-- 
+2.45.1.windows.1
+

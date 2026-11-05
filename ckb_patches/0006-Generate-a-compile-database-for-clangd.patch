@@ -1,0 +1,62 @@
+From 71c82d034de8613bb4051f7ff4b5f339f69c63c4 Mon Sep 17 00:00:00 2001
+From: JingMatrix <jingmatrix@gmail.com>
+Date: Sun, 9 Aug 2026 17:49:27 +0200
+Subject: [PATCH 06/47] Generate a compile database for clangd
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+CMake exports compile_commands.json, but the per-ABI build directories are not
+where clangd looks. Add scripts/gen-compile-commands.sh, which configures every C++
+target — the injector, the keymint interceptor, and the keystore interceptor — into
+build/compdb in one pass, and a .clangd that points there. It only configures, so
+nothing is compiled.
+---
+ .clangd                         |  4 ++++
+ scripts/gen-compile-commands.sh | 23 +++++++++++++++++++++++
+ 2 files changed, 27 insertions(+)
+ create mode 100644 .clangd
+ create mode 100755 scripts/gen-compile-commands.sh
+
+diff --git a/.clangd b/.clangd
+new file mode 100644
+index 0000000..38204f4
+--- /dev/null
++++ b/.clangd
+@@ -0,0 +1,4 @@
++# Point clangd at the compile database produced by scripts/gen-compile-commands.sh,
++# which configures every C++ target (injector, keymint, keystore) in one place.
++CompileFlags:
++  CompilationDatabase: build/compdb
+diff --git a/scripts/gen-compile-commands.sh b/scripts/gen-compile-commands.sh
+new file mode 100755
+index 0000000..c7c63d7
+--- /dev/null
++++ b/scripts/gen-compile-commands.sh
+@@ -0,0 +1,23 @@
++#!/usr/bin/env bash
++# Generate a compile database for clangd covering all of the project's C++ —
++# the injector, the keymint interceptor, and the legacy keystore interceptor.
++#
++# Only a CMake configure runs (compile_commands.json is written at configure time);
++# nothing is compiled. A placeholder CRYPTO_STATIC_LIB is enough to configure the
++# keystore targets so their sources are indexed too. .clangd points here.
++set -euo pipefail
++HERE=$(cd "$(dirname "$0")/.." && pwd)
++cd "$HERE"
++
++NDK=${ANDROID_NDK_HOME:-${ANDROID_NDK:-}}
++if [ -z "$NDK" ]; then
++  NDK=$(ls -d "${ANDROID_HOME:?set ANDROID_HOME or ANDROID_NDK_HOME}"/ndk/* 2>/dev/null | sort -V | tail -1)
++fi
++[ -d "$NDK" ] || { echo "NDK not found: $NDK" >&2; exit 1; }
++
++cmake -B build/compdb -G Ninja \
++  -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
++  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 \
++  -DCRYPTO_STATIC_LIB=for-indexing-only >/dev/null
++
++echo "compile database ready: build/compdb/compile_commands.json (used by .clangd)"
+-- 
+2.45.1.windows.1
+

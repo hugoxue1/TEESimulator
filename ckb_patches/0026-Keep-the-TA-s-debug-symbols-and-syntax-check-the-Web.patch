@@ -1,0 +1,103 @@
+From b627e77b49346200256aecc62df2ae84eda090e0 Mon Sep 17 00:00:00 2001
+From: JingMatrix <jingmatrix@gmail.com>
+Date: Mon, 10 Aug 2026 22:51:06 +0200
+Subject: [PATCH 26/47] Keep the TA's debug symbols and syntax-check the WebUI
+ in the build
+
+Two debug-build conveniences. Keep the interceptor's native symbols in the debug
+variant (jniLibs.keepDebugSymbols for libteesim_keymint.so) so a tombstone from a
+TA crash symbolicates, pairing with the Rust archive now built unstripped.
+
+And syntax-check the WebUI JavaScript before it ships: a new checkWebrootJs task
+runs `node --check` over every module/webroot JS file, wired ahead of packaging.
+A single JS syntax error otherwise blanks the whole UI at runtime with no build
+warning. The files are ES modules, which `node --check <file>` silently mis-parses,
+so each file is fed on stdin with --input-type=module to actually catch the error.
+node is optional: on a machine without it the task logs a notice and proceeds.
+---
+ app/build.gradle.kts | 55 +++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 54 insertions(+), 1 deletion(-)
+
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index e8ae4f1..4fcc3e4 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -85,7 +85,13 @@ android {
+     // (bcpkix/bcutil/bcprov, all 1.85) each ship an identical META-INF/LICENSE.md,
+     // which fails the merge. We extract only classes.dex, so the resource is never
+     // packaged anyway — drop it to let the merge pass.
+-    packaging { resources { excludes += "META-INF/LICENSE.md" } }
++    packaging {
++        resources { excludes += "META-INF/LICENSE.md" }
++        // Keep the interceptor's symbols so a native/TA crash symbolicates to file:line in the
++        // tombstone (paired with the Rust profile's debug=true). AGP otherwise strips them, and the
++        // module packaging reads the stripped output.
++        jniLibs { keepDebugSymbols += "**/libteesim_keymint.so" }
++    }
+ 
+     lint { abortOnError = false }
+ 
+@@ -133,6 +139,50 @@ tasks.register<Copy>("dex") {
+ // targets that device with no extra flags.
+ fun adb(vararg args: String): List<String> = listOf("adb", *args)
+ 
++// Syntax-check the WebUI JavaScript before packaging it. The WebUI is a set of ES modules; a single
++// syntax error makes one module fail to parse, its importers fail with it, and the whole UI never
++// renders (health stuck "checking", every page blank) — a failure the Kotlin/native build cannot catch.
++// This runs `node --check` on every module/webroot JS file, but only when node is installed: a build on
++// a machine without node logs a notice and proceeds, so node is a convenience, not a hard requirement.
++val checkWebrootJs =
++    tasks.register("checkWebrootJs") {
++        group = "TEESimulator Module Packaging"
++        description = "Syntax-checks the WebUI JavaScript with `node --check` when node is available."
++        val jsDir = rootProject.projectDir.resolve("module/webroot/js")
++        inputs.dir(jsDir)
++        doLast {
++            val nodeOk =
++                try {
++                    ProcessBuilder("node", "--version").redirectErrorStream(true).start().waitFor() == 0
++                } catch (e: Exception) {
++                    false
++                }
++            if (!nodeOk) {
++                logger.lifecycle("checkWebrootJs: node not found; skipping the WebUI JS syntax check")
++                return@doLast
++            }
++            // The WebUI files are ES modules. `node --check <file>` mis-detects them and silently
++            // passes real syntax errors, so feed each file on stdin with an explicit module type —
++            // that form exits non-zero (with a "[stdin]:LINE" location) on a genuine error.
++            val failures = mutableListOf<String>()
++            jsDir.walk().filter { it.isFile && it.extension == "js" }.forEach { f ->
++                val p = ProcessBuilder("node", "--input-type=module", "--check")
++                    .redirectInput(f)
++                    .redirectErrorStream(true)
++                    .start()
++                val msg = p.inputStream.bufferedReader().readText().trim()
++                if (p.waitFor() != 0) {
++                    val where = msg.lines().firstOrNull()?.replace("[stdin]", f.name) ?: "syntax error"
++                    failures.add("  ${f.relativeTo(rootProject.projectDir)}: $where")
++                }
++            }
++            if (failures.isNotEmpty()) {
++                throw GradleException("WebUI JavaScript syntax errors:\n" + failures.joinToString("\n"))
++            }
++            logger.lifecycle("checkWebrootJs: all WebUI JS files parse OK")
++        }
++    }
++
+ androidComponents {
+     onVariants(selector().all()) { variant ->
+         val capitalized = variant.name.replaceFirstChar { it.uppercase() }
+@@ -157,6 +207,9 @@ androidComponents {
+                 group = "TEESimulator Module Packaging"
+                 description = "Prepares all files for the ${variant.name} module zip."
+ 
++                // Reject a WebUI JS syntax error before it ships (no-op when node is absent).
++                dependsOn(checkWebrootJs)
++
+                 if (isDebug) {
+                     dependsOn("package${capitalized}")
+                 } else {
+-- 
+2.45.1.windows.1
+

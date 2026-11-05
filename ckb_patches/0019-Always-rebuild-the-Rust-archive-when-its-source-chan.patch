@@ -1,0 +1,45 @@
+From a58ffc9dcaeecc9c1b407e0db847dfd2f1ac3146 Mon Sep 17 00:00:00 2001
+From: JingMatrix <jingmatrix@gmail.com>
+Date: Mon, 10 Aug 2026 22:51:06 +0200
+Subject: [PATCH 19/47] Always rebuild the Rust archive when its source changes
+
+An add_custom_command with no source DEPENDS only ran when the .a was missing,
+so after the first build a Rust source change never refreshed it. That once
+linked a stale 14-argument teesim_km_init_ex against the 16-argument C++ caller:
+the device ids were read from the wrong stack slot and keystore2 crash-looped on
+a SIGSEGV. Replace it with a custom target that always invokes build.sh and lets
+cargo decide incrementally what to rebuild. cargo leaves the archive's mtime
+untouched when nothing changed, so the interceptor is not needlessly relinked.
+---
+ CMakeLists.txt | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8610b7d..b8ace88 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -77,14 +77,18 @@ elseif(ANDROID_ABI STREQUAL "x86")
+ endif()
+ 
+ set(RUST_A ${CMAKE_SOURCE_DIR}/rust/target/${RUST_TRIPLE}/release/libteesim_km.a)
+-add_custom_command(
+-    OUTPUT ${RUST_A}
++# ALWAYS invoke build.sh and let cargo decide incrementally what to rebuild. An OUTPUT custom command
++# with no source DEPENDS only runs when the .a is missing, so once built it was never refreshed on a
++# Rust source change — that once linked a stale 14-argument teesim_km_init_ex against a 16-argument C++
++# caller (ids read from the wrong stack slot → SIGSEGV, keystore2 crash loop). cargo leaves the .a's
++# mtime untouched when nothing changed, so this does not needlessly relink the interceptor.
++add_custom_target(rust_ta
++    BYPRODUCTS ${RUST_A}
+     COMMAND ${CMAKE_COMMAND} -E env
+             ABI=${ANDROID_ABI} API=${ANDROID_API_LEVEL} NDK_HOME=${ANDROID_NDK}
+             BORINGSSL=${BORINGSSL_DIR}
+             bash ${CMAKE_SOURCE_DIR}/rust/build.sh
+     VERBATIM USES_TERMINAL)
+-add_custom_target(rust_ta DEPENDS ${RUST_A})
+ 
+ # --- How the TAs reach BoringSSL --------------------------------------------
+ # The two interceptors resolve BoringSSL differently, and a single configure now
+-- 
+2.45.1.windows.1
+

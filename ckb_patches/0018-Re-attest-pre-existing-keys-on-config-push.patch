@@ -1,0 +1,601 @@
+From e2a7c1a1ad6ea9f9ebd9ebabd0e66c5f9bf2aefc Mon Sep 17 00:00:00 2001
+From: JingMatrix <jingmatrix@gmail.com>
+Date: Mon, 10 Aug 2026 14:33:20 +0200
+Subject: [PATCH 18/47] Re-attest pre-existing keys on config push
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A key an app generated before it was covered by a profile still carries the real
+hardware attestation — an unlocked root of trust rooted in the device's real
+attestation key. After each config push commits, re-root those keys to the keybox.
+
+The re-sign runs in the TA, reusing the patch-mode path: the daemon hands each
+existing leaf to the lib over a new "resign" request on the @teesim channel
+(teesim_cfg_resign), and the router calls teesim_km_patch_attestation on the owning
+profile's TA — keeping the leaf's public key and attestation content, re-rooting the
+issuer and root of trust under the keybox. The daemon writes the returned chain back
+with keystore2's updateSubcomponent (addressed by KEY_ID, like deleteKeyById); the
+key blob is never touched, so the real hardware key keeps signing.
+
+ReAttest, triggered on the lib's ack, enumerates each target uid's stored attestation
+leaves from the keystore2 database (KeystoreDb.attestedKeys) and skips our own keys and
+any leaf already rooted in the live keybox — so it is idempotent, and a leaf rooted in a
+keybox that is no longer configured is re-signed under the new one, self-healing a
+keybox rotation. The legacy keystore interceptor has no patch mode and declines to
+re-sign.
+---
+ app/src/main/java/org/matrix/teesim/App.kt    |  4 +-
+ .../main/java/org/matrix/teesim/Control.kt    | 80 ++++++++++++++++++-
+ .../org/matrix/teesim/Keystore2Service.kt     | 78 +++++++++++++-----
+ .../main/java/org/matrix/teesim/KeystoreDb.kt | 76 ++++++++++++++++++
+ .../main/java/org/matrix/teesim/ReAttest.kt   | 53 ++++++++++++
+ common/control.cpp                            | 56 +++++++++++++
+ common/control.h                              | 10 +++
+ keymint/keymint_router.cpp                    | 36 +++++++++
+ keystore/keystore_router.cpp                  |  6 ++
+ 9 files changed, 378 insertions(+), 21 deletions(-)
+ create mode 100644 app/src/main/java/org/matrix/teesim/ReAttest.kt
+
+diff --git a/app/src/main/java/org/matrix/teesim/App.kt b/app/src/main/java/org/matrix/teesim/App.kt
+index bfb29d0..04cdb6f 100644
+--- a/app/src/main/java/org/matrix/teesim/App.kt
++++ b/app/src/main/java/org/matrix/teesim/App.kt
+@@ -55,7 +55,9 @@ object App {
+             // Inject the interceptor and keep it injected across keystore restarts.
+             Injector(resolveModuleDir(args)).start()
+ 
+-            // Control channel + initial push, then watch config and packages.
++            // Control channel + initial push, then watch config and packages. After each committed
++            // push the lib acks; that is when pre-existing target keys are re-attested to the keybox.
++            Control.onCommitted = { lastGoodConfig?.let { ReAttest.run(it) } }
+             Control.start()
+             resolveAndPush()
+             ConfigStore.watch { resolveAndPush() }
+diff --git a/app/src/main/java/org/matrix/teesim/Control.kt b/app/src/main/java/org/matrix/teesim/Control.kt
+index c2f07d1..a2ebfce 100644
+--- a/app/src/main/java/org/matrix/teesim/Control.kt
++++ b/app/src/main/java/org/matrix/teesim/Control.kt
+@@ -4,6 +4,11 @@ import android.net.LocalSocket
+ import android.net.LocalSocketAddress
+ import java.io.InputStream
+ import java.io.OutputStream
++import java.util.Base64
++import java.util.concurrent.Executors
++import java.util.concurrent.LinkedBlockingQueue
++import java.util.concurrent.TimeUnit
++import java.util.concurrent.atomic.AtomicBoolean
+ import org.json.JSONObject
+ 
+ /**
+@@ -19,11 +24,26 @@ object Control {
+ 
+     private const val MAX_FRAME = 8 * 1024 * 1024
+ 
++    private const val RESIGN_TIMEOUT_MS = 10_000L
++
+     private val lock = Object()
+     @Volatile private var latest: String? = null
+     private var seq = 0L
+     @Volatile private var running = false
+ 
++    // The live connection's output stream, or null when disconnected — used to send resign requests
++    // outside the writer loop (writeFrame is stream-synchronized, so concurrent sends are safe).
++    @Volatile private var activeOut: OutputStream? = null
++    // Responses to the one in-flight resign request. Buffered (size 1) so a reply that arrives before
++    // the sender polls is not lost; the sender drains it before each request.
++    private val resignReplies = LinkedBlockingQueue<JSONObject>(1)
++
++    // Invoked (on [commitExecutor]) after the lib acks a config commit, so the daemon can re-attest
++    // pre-existing keys against the just-committed profile set. Coalesced by [commitPending].
++    @Volatile var onCommitted: (() -> Unit)? = null
++    private val commitExecutor = Executors.newSingleThreadExecutor { r -> Thread(r, "teesim-reattest").apply { isDaemon = true } }
++    private val commitPending = AtomicBoolean(false)
++
+     @Volatile
+     var libHook: String? = null
+         private set
+@@ -87,6 +107,7 @@ object Control {
+                 val out = socket.outputStream
+                 val inp = socket.inputStream
+                 writeFrame(out, "{\"type\":\"hello\",\"role\":\"daemon\",\"protocol\":1}")
++                activeOut = out
+ 
+                 val conn = Conn(socket, out)
+                 val writer =
+@@ -101,6 +122,7 @@ object Control {
+                     }
+                 } finally {
+                     conn.alive = false
++                    activeOut = null
+                     synchronized(lock) { lock.notifyAll() }
+                     writer.interrupt()
+                 }
+@@ -170,15 +192,71 @@ object Control {
+                     "control: lib hello hook=$libHook api=$libApi pid=${msg.optInt("keystorePid", 0)}"
+                 )
+             }
+-            "ack" ->
++            "ack" -> {
+                 SystemLogger.info(
+                     "control: ack epoch=${msg.optLong("epoch")} ok=${msg.optBoolean("ok")} " +
+                         "applied=${msg.optInt("profilesApplied")} failed=${msg.optInt("profilesFailed")}"
+                 )
++                // The ack means the lib has committed the new profile set — the point at which
++                // pre-existing keys can be re-attested against it. Coalesce bursts of pushes into one
++                // run and never run it on this reader thread (resign responses arrive here).
++                val cb = onCommitted
++                if (cb != null && commitPending.compareAndSet(false, true)) {
++                    commitExecutor.execute {
++                        commitPending.set(false)
++                        try {
++                            cb()
++                        } catch (e: Throwable) {
++                            SystemLogger.warning("control: re-attest run failed: ${e.message}")
++                        }
++                    }
++                }
++            }
++            "resigned" -> {
++                resignReplies.clear()
++                resignReplies.offer(msg)
++            }
+             "pong" -> SystemLogger.verbose("control: pong ${msg.optLong("epoch")}")
+         }
+     }
+ 
++    /**
++     * Ask the lib to re-sign an existing key's attestation [leaf] under profile [profileId]'s keybox,
++     * returning the patched chain (leaf first) or null if there is no live connection, the request
++     * times out, or the lib reports failure. Called from [onCommitted] on [commitExecutor]; the reader
++     * thread delivers the reply, so this must not run on that thread.
++     */
++    fun resign(profileId: String, leaf: ByteArray): List<ByteArray>? {
++        val out = activeOut ?: return null
++        resignReplies.clear()
++        val req =
++            JSONObject()
++                .put("type", "resign")
++                .put("profile", profileId)
++                .put("leafB64", Base64.getEncoder().encodeToString(leaf))
++        try {
++            writeFrame(out, req.toString())
++        } catch (e: Exception) {
++            SystemLogger.warning("control: resign send failed: ${e.message}")
++            return null
++        }
++        val reply =
++            resignReplies.poll(RESIGN_TIMEOUT_MS, TimeUnit.MILLISECONDS)
++                ?: run {
++                    SystemLogger.warning("control: resign timed out (profile $profileId)")
++                    return null
++                }
++        if (!reply.optBoolean("ok")) return null
++        val arr = reply.optJSONArray("chainB64") ?: return null
++        val dec = Base64.getDecoder()
++        return try {
++            (0 until arr.length()).map { dec.decode(arr.getString(it)) }
++        } catch (e: Exception) {
++            SystemLogger.warning("control: resign reply undecodable: ${e.message}")
++            null
++        }
++    }
++
+     // --- framing: [u32 BE length][UTF-8 JSON] -----------------------------------
+ 
+     private fun writeFrame(out: OutputStream, payload: String) {
+diff --git a/app/src/main/java/org/matrix/teesim/Keystore2Service.kt b/app/src/main/java/org/matrix/teesim/Keystore2Service.kt
+index c4c58b9..ac83949 100644
+--- a/app/src/main/java/org/matrix/teesim/Keystore2Service.kt
++++ b/app/src/main/java/org/matrix/teesim/Keystore2Service.kt
+@@ -19,31 +19,42 @@ object Keystore2Service {
+     private const val SERVICE = "android.system.keystore2.IKeystoreService/default"
+     private const val DOMAIN_KEY_ID = 4 // android.system.keystore2.Domain.KEY_ID
+ 
++    /** The resolved IKeystoreService: its interface class, the service instance, and KeyDescriptor class. */
++    private class Svc(val iface: Class<*>, val service: Any?, val descriptorClass: Class<*>)
++
++    /** Resolve keystore2's binder and reflect the classes we call, or null (logged) if unavailable. */
++    private fun connect(): Svc? {
++        val serviceManager = Class.forName("android.os.ServiceManager")
++        val binder =
++            serviceManager.getMethod("getService", String::class.java).invoke(null, SERVICE) as? IBinder
++        if (binder == null) {
++            SystemLogger.warning("Keystore2Service: service $SERVICE not found")
++            return null
++        }
++        val stub = Class.forName("android.system.keystore2.IKeystoreService\$Stub")
++        val service = stub.getMethod("asInterface", IBinder::class.java).invoke(null, binder)
++        val iface = Class.forName("android.system.keystore2.IKeystoreService")
++        val descriptorClass = Class.forName("android.system.keystore2.KeyDescriptor")
++        return Svc(iface, service, descriptorClass)
++    }
++
++    /** A KeyDescriptor addressing keyentry [keyId] by Domain.KEY_ID; alias and blob stay null. */
++    private fun Svc.keyIdDescriptor(keyId: Long): Any {
++        val d = descriptorClass.getConstructor().newInstance()
++        descriptorClass.getField("domain").setInt(d, DOMAIN_KEY_ID)
++        descriptorClass.getField("nspace").setLong(d, keyId)
++        return d
++    }
++
+     /**
+      * Ask keystore2 to delete the key with keyentry id [keyId]. Returns true on success; false if the
+      * service is absent or the call is rejected (e.g. SELinux denies our context) — logged either way.
+      */
+     fun deleteKeyById(keyId: Long): Boolean {
+         return try {
+-            val serviceManager = Class.forName("android.os.ServiceManager")
+-            val binder =
+-                serviceManager.getMethod("getService", String::class.java).invoke(null, SERVICE) as? IBinder
+-            if (binder == null) {
+-                SystemLogger.warning("Keystore2Service: service $SERVICE not found")
+-                return false
+-            }
+-
+-            val stub = Class.forName("android.system.keystore2.IKeystoreService\$Stub")
+-            val service = stub.getMethod("asInterface", IBinder::class.java).invoke(null, binder)
+-            val iface = Class.forName("android.system.keystore2.IKeystoreService")
+-
+-            val descriptorClass = Class.forName("android.system.keystore2.KeyDescriptor")
+-            val descriptor = descriptorClass.getConstructor().newInstance()
+-            descriptorClass.getField("domain").setInt(descriptor, DOMAIN_KEY_ID)
+-            descriptorClass.getField("nspace").setLong(descriptor, keyId)
+-            // alias and blob stay null: KEY_ID addresses the key directly.
+-
+-            iface.getMethod("deleteKey", descriptorClass).invoke(service, descriptor)
++            val svc = connect() ?: return false
++            svc.iface.getMethod("deleteKey", svc.descriptorClass)
++                .invoke(svc.service, svc.keyIdDescriptor(keyId))
+             SystemLogger.info("Keystore2Service: deleted key id=$keyId via keystore2 API")
+             true
+         } catch (e: Throwable) {
+@@ -54,4 +65,33 @@ object Keystore2Service {
+             false
+         }
+     }
++
++    /**
++     * Ask keystore2 to replace the stored public/attestation certificate ([publicCert], the leaf DER)
++     * and its chain ([certificateChain], the DER concatenation of the rest) for the key with keyentry id
++     * [keyId], leaving the key blob itself untouched. This is how a pre-existing key's attestation is
++     * re-rooted to the keybox. Returns true on success; false if the service is absent or the call is
++     * rejected — logged either way.
++     */
++    fun updateSubcomponent(keyId: Long, publicCert: ByteArray?, certificateChain: ByteArray?): Boolean {
++        return try {
++            val svc = connect() ?: return false
++            svc.iface
++                .getMethod(
++                    "updateSubcomponent",
++                    svc.descriptorClass,
++                    ByteArray::class.java,
++                    ByteArray::class.java,
++                )
++                .invoke(svc.service, svc.keyIdDescriptor(keyId), publicCert, certificateChain)
++            SystemLogger.info("Keystore2Service: updated attestation certs for key id=$keyId")
++            true
++        } catch (e: Throwable) {
++            val cause = (e as? InvocationTargetException)?.targetException ?: e
++            SystemLogger.warning(
++                "Keystore2Service.updateSubcomponent($keyId) failed: ${cause.javaClass.simpleName}: ${cause.message}"
++            )
++            false
++        }
++    }
+ }
+diff --git a/app/src/main/java/org/matrix/teesim/KeystoreDb.kt b/app/src/main/java/org/matrix/teesim/KeystoreDb.kt
+index b754c24..d37234d 100644
+--- a/app/src/main/java/org/matrix/teesim/KeystoreDb.kt
++++ b/app/src/main/java/org/matrix/teesim/KeystoreDb.kt
+@@ -56,6 +56,9 @@ object KeystoreDb {
+     // literal so `substr(blob,1,9) = X'…'` selects the keys we minted.
+     private const val MARKER_HEX = "54454553494D6B6D00"
+ 
++    // The KeyMint attestation extension OID; a leaf carrying it has attestation content to re-root.
++    private const val ATTEST_EXT_OID = "1.3.6.1.4.1.11129.2.1.17"
++
+     // Plausible epoch-millis window (~2014-05 .. ~2128), used to spot a creation-date metadata cell
+     // without depending on the release-specific tag number.
+     private const val TS_MIN = 1_400_000_000_000L
+@@ -103,6 +106,79 @@ object KeystoreDb {
+         }
+     }
+ 
++    /** One pre-existing key to re-attest: its owning app uid, keyentry id, and leaf certificate DER. */
++    data class AttestedKey(val uid: Int, val id: Long, val leaf: ByteArray)
++
++    /**
++     * Every stored key of the given app [uids] that carries a hardware attestation leaf and is NOT one
++     * of ours (no marker blob) — the pre-existing keys whose attestation the daemon re-roots to the
++     * keybox on a config push. One snapshot read for all uids; best effort, never throws. Our own
++     * generation keys (marker blobs) are skipped, and keys with no attestation extension (a plain key
++     * generated without a challenge) have nothing to re-root and are skipped too.
++     */
++    fun attestedKeys(uids: Set<Int>): List<AttestedKey> {
++        if (!available() || uids.isEmpty()) return emptyList()
++        val src = File(KEYSTORE2_DB)
++        if (!src.isFile) return emptyList()
++
++        var db: SQLiteDatabase? = null
++        return try {
++            val copy = snapshot(src)
++            db = SQLiteDatabase.openDatabase(copy.absolutePath, null, SQLiteDatabase.OPEN_READONLY)
++            if (!tableExists(db, "blobentry")) return emptyList()
++
++            val uidList = uids.joinToString(",") // validated ints -> safe to inline
++            val idToUid = LinkedHashMap<Long, Int>()
++            db.rawQuery(
++                    "SELECT k.id, k.namespace FROM keyentry k WHERE k.domain=0 AND k.namespace IN ($uidList) " +
++                        "AND k.alias IS NOT NULL AND k.state=1 " +
++                        "AND NOT EXISTS (SELECT 1 FROM blobentry b WHERE b.keyentryid=k.id " +
++                        "AND substr(b.blob,1,9)=X'$MARKER_HEX')",
++                    null,
++                )
++                .use { c -> while (c.moveToNext()) idToUid[c.getLong(0)] = c.getInt(1) }
++            if (idToUid.isEmpty()) return emptyList()
++
++            val blobsById = HashMap<Long, MutableList<ByteArray>>()
++            db.rawQuery(
++                    "SELECT keyentryid, blob FROM blobentry WHERE keyentryid IN (${idToUid.keys.joinToString(",")})",
++                    null,
++                )
++                .use { c ->
++                    while (c.moveToNext()) {
++                        val kid = c.getLong(0)
++                        val blob = c.getBlob(1) ?: continue
++                        blobsById.getOrPut(kid) { ArrayList() }.add(blob)
++                    }
++                }
++            val cf = CertificateFactory.getInstance("X.509")
++            val signers = KeyboxInspector.signerIndex()
++            val out = ArrayList<AttestedKey>()
++            for ((id, uid) in idToUid) {
++                val certs = parseCerts(blobsById[id], cf)
++                val leaf = leafOf(certs) ?: continue
++                if (leaf.getExtensionValue(ATTEST_EXT_OID) == null) continue // no attestation to re-root
++                // Skip keys already rooted in a currently-configured keybox (ones we've patched, or a
++                // generation key's chain): re-signing them would be redundant. A key rooted in a keybox
++                // that is no longer configured (e.g. after a keybox swap) is NOT matched, so it is
++                // re-signed under the new keybox — the re-attest self-heals a rotation.
++                if (matchKeybox(certs, leaf, signers) != null) continue
++                out.add(AttestedKey(uid, id, leaf.encoded))
++            }
++            out
++        } catch (e: Throwable) {
++            SystemLogger.warning("KeystoreDb.attestedKeys failed", e)
++            emptyList()
++        } finally {
++            try {
++                db?.close()
++            } catch (_: Throwable) {}
++            try {
++                snapshotDir.deleteRecursively()
++            } catch (_: Throwable) {}
++        }
++    }
++
+     /**
+      * Remove the given keys. [ids] are keyentry.id values from [listKeys]; each is first re-verified
+      * (read-only, against a snapshot) to be one of our marked blobs belonging to a [targets] app, so a
+diff --git a/app/src/main/java/org/matrix/teesim/ReAttest.kt b/app/src/main/java/org/matrix/teesim/ReAttest.kt
+new file mode 100644
+index 0000000..b7b5635
+--- /dev/null
++++ b/app/src/main/java/org/matrix/teesim/ReAttest.kt
+@@ -0,0 +1,53 @@
++package org.matrix.teesim
++
++import java.io.ByteArrayOutputStream
++
++/**
++ * Re-roots pre-existing keys' attestation on a config push. A key generated before its app was
++ * covered (or under a previous keybox) still carries the real hardware attestation — an unlocked
++ * root of trust rooted in the device's real attestation key. For each target app, every stored key
++ * that carries such a leaf is re-signed under its profile's keybox — the same patch the router
++ * applies to a freshly generated key — and written back with [Keystore2Service.updateSubcomponent].
++ * The key blob is never touched, so the real hardware key keeps working; only the certificate the app
++ * reads changes.
++ *
++ * Idempotent and record-less: it re-scans the live keystore each run and re-signs whatever it finds,
++ * so a re-run, a keybox swap, or a newly installed app all converge on the next push.
++ */
++object ReAttest {
++
++    /** Re-attest every eligible pre-existing key of [config]'s target apps against the live profiles. */
++    fun run(config: ConfigStore.Config) {
++        // uid -> the profile whose keybox should sign that app's keys (one profile per package).
++        val uidToProfile = HashMap<Int, String>()
++        for (profile in config.profiles) {
++            for (pkg in profile.apps) {
++                val uid = Packages.uidForPackage(pkg)
++                if (uid >= 0) uidToProfile[uid] = profile.id
++            }
++        }
++        if (uidToProfile.isEmpty()) return
++
++        val keys = KeystoreDb.attestedKeys(uidToProfile.keys)
++        if (keys.isEmpty()) return
++
++        var done = 0
++        for (key in keys) {
++            val profileId = uidToProfile[key.uid] ?: continue
++            val chain = Control.resign(profileId, key.leaf) ?: continue
++            if (chain.isEmpty()) continue
++            // keystore2 stores the leaf (CERT) and the rest of the chain (CERT_CHAIN) separately.
++            val leaf = chain[0]
++            val rest = concatFrom(chain, 1)
++            if (Keystore2Service.updateSubcomponent(key.id, leaf, rest)) done++
++        }
++        SystemLogger.info("re-attest: re-rooted $done of ${keys.size} pre-existing target key(s) to the keybox")
++    }
++
++    /** DER concatenation of [certs] from index [from] onward (empty when there are no further certs). */
++    private fun concatFrom(certs: List<ByteArray>, from: Int): ByteArray {
++        val bos = ByteArrayOutputStream()
++        for (i in from until certs.size) bos.write(certs[i])
++        return bos.toByteArray()
++    }
++}
+diff --git a/common/control.cpp b/common/control.cpp
+index 6a2d532..411be39 100644
+--- a/common/control.cpp
++++ b/common/control.cpp
+@@ -63,6 +63,31 @@ bool Base64Decode(const std::string &in, std::vector<uint8_t> &out) {
+   return true;
+ }
+ 
++// Standard base64 encode, for handing re-signed certificates back to the daemon.
++std::string Base64Encode(const uint8_t *data, size_t len) {
++  static const char kTable[] =
++      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++  std::string out;
++  out.reserve((len + 2) / 3 * 4);
++  size_t i = 0;
++  for (; i + 3 <= len; i += 3) {
++    uint32_t n = (uint32_t(data[i]) << 16) | (uint32_t(data[i + 1]) << 8) | data[i + 2];
++    out.push_back(kTable[(n >> 18) & 63]);
++    out.push_back(kTable[(n >> 12) & 63]);
++    out.push_back(kTable[(n >> 6) & 63]);
++    out.push_back(kTable[n & 63]);
++  }
++  if (i < len) {
++    bool two = (i + 1 < len);
++    uint32_t n = (uint32_t(data[i]) << 16) | (two ? uint32_t(data[i + 1]) << 8 : 0);
++    out.push_back(kTable[(n >> 18) & 63]);
++    out.push_back(kTable[(n >> 12) & 63]);
++    out.push_back(two ? kTable[(n >> 6) & 63] : '=');
++    out.push_back('=');
++  }
++  return out;
++}
++
+ int AndroidApi() {
+   char buf[PROP_VALUE_MAX] = {0};
+   if (__system_property_get("ro.build.version.sdk", buf) > 0) return atoi(buf);
+@@ -281,6 +306,37 @@ void HandleConnection(int fd) {
+       WriteFrame(fd, BuildAck(epoch, applied, total));
+       LOGI("control: applied config epoch=%llu profiles=%d/%d",
+            static_cast<unsigned long long>(epoch), applied, total);
++    } else if (t == "resign") {
++      // Re-sign one existing key's attestation leaf under its profile's keybox. The daemon sends the
++      // leaf and the owning profile id; we return the patched chain (base64 DER per cert) for it to
++      // write back with updateSubcomponent.
++      const tjson::Value *pid = msg.get("profile");
++      const tjson::Value *lb = msg.get("leafB64");
++      std::string profile = pid ? pid->as_string() : std::string();
++      std::vector<uint8_t> leaf;
++      // Accumulate the chain as a JSON array body via the cert sink (captureless -> C callback).
++      struct SinkCtx {
++        std::string certs;
++        bool first = true;
++      } sc;
++      auto sink = [](void *ctx, const uint8_t *der, size_t len) {
++        auto *s = static_cast<SinkCtx *>(ctx);
++        if (!s->first) s->certs += ",";
++        s->first = false;
++        s->certs += '"';
++        s->certs += Base64Encode(der, len);
++        s->certs += '"';
++      };
++      bool ok = false;
++      if (lb && !profile.empty() && Base64Decode(lb->as_string(), leaf) && !leaf.empty()) {
++        ok = teesim_cfg_resign(profile.c_str(), leaf.data(), leaf.size(), sink, &sc);
++      }
++      std::string resp = "{\"type\":\"resigned\",\"ok\":";
++      resp += ok ? "true" : "false";
++      resp += ",\"chainB64\":[";
++      resp += sc.certs;
++      resp += "]}";
++      WriteFrame(fd, resp);
+     } else if (t == "ping") {
+       const tjson::Value *e = msg.get("epoch");
+       std::string pong = "{\"type\":\"pong\",\"epoch\":";
+diff --git a/common/control.h b/common/control.h
+index 793ad99..6b87d45 100644
+--- a/common/control.h
++++ b/common/control.h
+@@ -65,6 +65,16 @@ bool teesim_cfg_add_profile(const TsProfile *p);
+ // Atomically swap the staged profile set live. Returns the number of profiles
+ // applied, or -1 on a hard failure. `err` receives a short message on failure.
+ int teesim_cfg_commit(uint64_t epoch, char *err, size_t err_len);
++
++// Re-sign an existing key's real attestation leaf under profile `profile_id`'s keybox with its
++// patched (locked/Verified) root of trust — patch mode applied to a key already stored in the
++// keystore. `leaf`/`leaf_len` is the DER leaf. `sink` is invoked once per certificate of the
++// resulting chain [patched leaf, keybox chain] with its DER bytes. Returns false if the profile is
++// unknown or the re-sign fails (the keystore1 interceptor, which has no patch mode, always returns
++// false). Runs on the control thread, against the live profile set.
++typedef void (*TsCertSink)(void *ctx, const uint8_t *der, size_t der_len);
++bool teesim_cfg_resign(const char *profile_id, const uint8_t *leaf, size_t leaf_len,
++                       TsCertSink sink, void *ctx);
+ // Which hook this lib is, for the hello message: "keymint" or "keystore1".
+ const char *teesim_hook_name(void);
+ 
+diff --git a/keymint/keymint_router.cpp b/keymint/keymint_router.cpp
+index 313ecd0..4509abe 100644
+--- a/keymint/keymint_router.cpp
++++ b/keymint/keymint_router.cpp
+@@ -716,6 +716,42 @@ extern "C" int teesim_cfg_commit(uint64_t /*epoch*/, char* /*err*/, size_t /*err
+   return static_cast<int>(g_profiles.size());
+ }
+ 
++extern "C" bool teesim_cfg_resign(const char* profile_id, const uint8_t* leaf, size_t leaf_len,
++                                  TsCertSink sink, void* ctx) {
++  if (!profile_id || !leaf || leaf_len == 0 || !sink) return false;
++  TaPtr ta;
++  {
++    std::lock_guard<std::mutex> lk(g_cfg_mu);
++    for (const auto& prof : g_profiles) {
++      if (prof.id == profile_id) {
++        ta = prof.ta;
++        break;
++      }
++    }
++  }
++  if (!ta) {
++    LOGW("resign: unknown profile '%s'", profile_id);
++    return false;
++  }
++  // Re-sign the existing leaf exactly as patch mode does for a fresh key: keep its public key and
++  // attestation content, re-root under the keybox with a patched root of trust.
++  TsCreationResult* res = nullptr;
++  int32_t rc = teesim_km_patch_attestation(ta.get(), leaf, leaf_len, &res);
++  if (rc != 0) {
++    LOGW("resign: patch_attestation failed (%d) for profile '%s'", rc, profile_id);
++    return false;
++  }
++  size_t n = teesim_km_result_num_certs(res);
++  for (size_t i = 0; i < n; ++i) {
++    const uint8_t* c = nullptr;
++    size_t clen = 0;
++    teesim_km_result_cert(res, i, &c, &clen);
++    sink(ctx, c, clen);
++  }
++  teesim_km_free_result(res);
++  return true;
++}
++
+ // Create a local device wrapping the real HAL binder (may be null). Returns an
+ // AIBinder* whose ownership passes to the caller (release with AIBinder_decStrong).
+ //
+diff --git a/keystore/keystore_router.cpp b/keystore/keystore_router.cpp
+index 6da6c3e..d08a30e 100644
+--- a/keystore/keystore_router.cpp
++++ b/keystore/keystore_router.cpp
+@@ -798,6 +798,12 @@ extern "C" int teesim_cfg_commit(uint64_t /*epoch*/, char* /*err*/, size_t /*err
+   return static_cast<int>(g_profiles.size());
+ }
+ 
++// The legacy keystore interceptor has no patch mode, so it re-signs nothing.
++extern "C" bool teesim_cfg_resign(const char* /*profile_id*/, const uint8_t* /*leaf*/,
++                                  size_t /*leaf_len*/, TsCertSink /*sink*/, void* /*ctx*/) {
++  return false;
++}
++
+ // The interception handler installed for the keystore service binder.
+ extern "C" bool teesim_ks_handle(uint32_t code, const Parcel& data, Parcel* reply,
+                                   status_t& result) {
+-- 
+2.45.1.windows.1
+

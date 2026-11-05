@@ -1,0 +1,1068 @@
+From 861f84c7757d7bd3d94c9ad797701c987fd94179 Mon Sep 17 00:00:00 2001
+From: JingMatrix <jingmatrix@gmail.com>
+Date: Mon, 10 Aug 2026 22:51:06 +0200
+Subject: [PATCH 25/47] Rework the WebUI key and log views
+
+Stored keys: present each key with its class, algorithm and purposes, show the
+keybox only when one is attributed (dropping the empty line otherwise), and
+replace the funnel with a plain Spoofed / All toggle that reads more clearly.
+
+Logs: a proper log viewer with a save sheet - the daemon writes the file itself
+(a path-traversal-safe POST /logs/write) and a browser can download the tail over
+GET /logs/download, which authenticates by a ?token= query parameter because a
+navigation cannot set the header token every other route uses.
+
+KeyAdmin serves each connection on its own thread with a read timeout and logs
+every request. A client-supplied Content-Length is capped before it is used as an
+allocation size, so a bogus value cannot force a huge allocation and take the
+per-connection thread down with an OutOfMemoryError. Deleting a profile now
+persists to disk immediately, bypassing the whole-config validation gate: a
+removal cannot introduce invalidity, and the gate would otherwise reject it when a
+different profile happened to be invalid and leave the stale one on disk.
+---
+ .../main/java/org/matrix/teesim/KeyAdmin.kt   | 189 +++++++++++++++++-
+ .../main/java/org/matrix/teesim/LogTail.kt    |  22 +-
+ module/webroot/css/app.css                    |  44 +++-
+ .../js/controllers/config-controller.js       |  11 +
+ .../js/controllers/keyadmin-controller.js     |  34 +++-
+ .../webroot/js/controllers/logs-controller.js |  96 ++++-----
+ module/webroot/js/data/keyadmin.js            |  43 +++-
+ module/webroot/js/ui/key-view.js              | 100 +++++++--
+ module/webroot/js/ui/logs-view.js             |  68 +++++--
+ 9 files changed, 483 insertions(+), 124 deletions(-)
+
+diff --git a/app/src/main/java/org/matrix/teesim/KeyAdmin.kt b/app/src/main/java/org/matrix/teesim/KeyAdmin.kt
+index ad5d8d3..4ca85c0 100644
+--- a/app/src/main/java/org/matrix/teesim/KeyAdmin.kt
++++ b/app/src/main/java/org/matrix/teesim/KeyAdmin.kt
+@@ -3,6 +3,7 @@ package org.matrix.teesim
+ import android.os.Build
+ import android.security.keystore.KeyInfo
+ import java.io.BufferedReader
++import java.io.File
+ import java.io.InputStreamReader
+ import java.io.OutputStream
+ import java.net.InetAddress
+@@ -36,9 +37,9 @@ import org.json.JSONObject
+  *
+  * Contract (all responses application/json; send header `X-Teesim-Token: <token>`): GET /status ->
+  * { ok, version, harvest{...}, lib{hook,api} } GET /keys -> { ok, keys:[ {alias, securityLevel, ours,
+- * cert{...}} ] } GET /keys/db -> { ok, available, apiLevel, keys:[ {id, alias, uid, package, state,
+- * created?, keybox?, keyAlgorithm?} ] } (the keys THIS MODULE minted for target apps, from keystore2's DB
+- * on API >= 31; empty + available=false on 10/11 where there is no such database) POST
++ * cert{...}} ] } GET /keys/db -> { ok, available, apiLevel, keys:[ {id, alias, uid, package, state, class,
++ * created?, keybox?, keyAlgorithm?, purposes?} ] } (target-app keys with a stored attestation cert, from
++ * keystore2's DB on API >= 31; empty + available=false on 10/11 where there is no such database) POST
+  * /keys/db/delete?ids=1,2,3 -> { ok, deleted, requested } (removes those keyentry ids from keystore2,
+  * marker- and target-verified) GET /keys/inspect?alias=A -> { ok, alias, attestation{...} | null }
+  * POST /keys/delete?alias=A -> { ok, deleted } GET /logs?after=N&max=M
+@@ -50,6 +51,9 @@ import org.json.JSONObject
+ object KeyAdmin {
+ 
+     private const val ATTEST_OID = "1.3.6.1.4.1.11129.2.1.17"
++    // Upper bound on a request body (bytes). The admin socket is localhost + token-authed, but a bogus
++    // Content-Length should still never be trusted as an allocation size.
++    private const val MAX_BODY_BYTES = 8 * 1024 * 1024
+     private val b64 = Base64.getEncoder()
+ 
+     @Volatile private var token: String = ""
+@@ -91,9 +95,19 @@ object KeyAdmin {
+         while (true) {
+             try {
+                 val client = server.accept()
+-                handle(client)
++                // Handle each connection on its own thread with a read timeout, so one slow, half-open,
++                // or mis-framed client (e.g. a Content-Length that never fully arrives) can never wedge
++                // the accept loop and take the whole admin endpoint down with it.
++                client.soTimeout = 15000
++                Thread({
++                    try {
++                        handle(client)
++                    } catch (e: Exception) {
++                        SystemLogger.warning("KeyAdmin: handle error", e)
++                    }
++                }, "teesim-keyadmin-conn").apply { isDaemon = true }.start()
+             } catch (e: Exception) {
+-                SystemLogger.warning("KeyAdmin: accept/handle error", e)
++                SystemLogger.warning("KeyAdmin: accept error", e)
+             }
+         }
+     }
+@@ -104,6 +118,8 @@ object KeyAdmin {
+             val out = client.getOutputStream()
+ 
+             val requestLine = reader.readLine() ?: return
++            val t0 = System.currentTimeMillis()
++            SystemLogger.info("KeyAdmin: → ${requestLine.take(140)}")
+             val parts = requestLine.split(" ")
+             if (parts.size < 2) {
+                 respond(out, 400, JSONObject().put("ok", false).put("error", "bad request"))
+@@ -113,24 +129,69 @@ object KeyAdmin {
+             val rawPath = parts[1]
+ 
+             var headerToken: String? = null
++            var contentLength = 0
+             while (true) {
+                 val line = reader.readLine() ?: break
+                 if (line.isEmpty()) break
+                 val idx = line.indexOf(':')
+-                if (idx > 0 && line.substring(0, idx).trim().equals("X-Teesim-Token", true)) {
+-                    headerToken = line.substring(idx + 1).trim()
+-                }
++                if (idx <= 0) continue
++                val hName = line.substring(0, idx).trim()
++                val hVal = line.substring(idx + 1).trim()
++                if (hName.equals("X-Teesim-Token", true)) headerToken = hVal
++                else if (hName.equals("Content-Length", true)) contentLength = hVal.toIntOrNull() ?: 0
+             }
+ 
+             if (method == "OPTIONS") { // CORS preflight
+                 respond(out, 204, null)
+                 return
+             }
++            // The log download is opened by a browser navigation, which cannot set the
++            // X-Teesim-Token header, so this one route authenticates with a ?token= query
++            // parameter (validated against the same in-memory token) and streams plain text
++            // named by a Content-Disposition header instead of the JSON envelope. Handled here,
++            // ahead of the header-token check that every other route still requires.
++            if (method == "GET" && rawPath.substringBefore('?') == "/logs/download") {
++                val dlQuery = parseQuery(rawPath.substringAfter('?', ""))
++                if (dlQuery["token"] != token) {
++                    respond(out, 403, JSONObject().put("ok", false).put("error", "invalid token"))
++                    return
++                }
++                downloadLogs(out, dlQuery)
++                return
++            }
+             if (headerToken == null || headerToken != token) {
+                 respond(out, 403, JSONObject().put("ok", false).put("error", "invalid token"))
+                 return
+             }
+ 
++            // Read the request body when one was announced. The request line and headers were
++            // consumed through `reader`, whose buffer may already hold body bytes, so the body must
++            // be read from the SAME reader — not the raw socket stream. Content-Length is a byte
++            // count, so read decoded chars until that many UTF-8 bytes have been consumed.
++            // A client-supplied Content-Length is untrusted: cap it so a bogus huge value cannot force a
++            // multi-gigabyte allocation (an OutOfMemoryError would escape the per-connection catch, which
++            // only handles Exception, and kill the thread). Our largest real body is a keybox, well under
++            // this. The initial StringBuilder capacity is also bounded rather than trusting the header.
++            if (contentLength > MAX_BODY_BYTES) {
++                respond(out, 413, JSONObject().put("ok", false).put("error", "request body too large"))
++                return
++            }
++            val requestBody =
++                if (contentLength > 0) {
++                    val sb = StringBuilder(minOf(contentLength, 64 * 1024))
++                    val buf = CharArray(4096)
++                    var bytes = 0
++                    while (bytes < contentLength) {
++                        val n = reader.read(buf, 0, buf.size)
++                        if (n < 0) break
++                        sb.append(buf, 0, n)
++                        bytes += String(buf, 0, n).toByteArray(Charsets.UTF_8).size
++                    }
++                    sb.toString()
++                } else {
++                    ""
++                }
++
+             val path = rawPath.substringBefore('?')
+             val query = parseQuery(rawPath.substringAfter('?', ""))
+             try {
+@@ -153,11 +214,15 @@ object KeyAdmin {
+                                 query["tag"] ?: error("tag required"),
+                                 query["variant"] ?: "release",
+                             )
++                        method == "POST" && path == "/logs/write" -> writeLogs(query, requestBody)
+                         else -> JSONObject().put("ok", false).put("error", "not found")
+                     }
+-                respond(out, if (body.optBoolean("ok", true)) 200 else 400, body)
++                val ok = body.optBoolean("ok", true)
++                respond(out, if (ok) 200 else 400, body)
++                SystemLogger.info("KeyAdmin: ← ${method} ${path} ${if (ok) 200 else 400} in ${System.currentTimeMillis() - t0}ms")
+             } catch (e: Exception) {
+                 respond(out, 500, JSONObject().put("ok", false).put("error", e.message ?: "error"))
++                SystemLogger.warning("KeyAdmin: ← ${method} ${path} 500 in ${System.currentTimeMillis() - t0}ms: ${e.message}")
+             }
+         }
+     }
+@@ -295,6 +360,76 @@ object KeyAdmin {
+         return JSONObject().put("ok", true).put("lines", arr).put("nextAfter", next)
+     }
+ 
++    /**
++     * Streams the same recent log buffer as [logs] but as a plain-text attachment, so a browser
++     * navigation names and saves the file from the Content-Disposition header (the WebView's
++     * download handler ignores an <a download> attribute). Honors the same optional `after`/`max`
++     * params as [logs]; with neither present it dumps the full recent buffer.
++     */
++    private fun downloadLogs(out: OutputStream, query: Map<String, String>) {
++        val after = query["after"]?.toLongOrNull() ?: 0L
++        val max = (query["max"]?.toIntOrNull() ?: 2000).coerceIn(1, 2000)
++        val (lines, _) = LogTail.snapshot(after, max)
++        // Each Line.text is already the full logcat line the Logs tab renders, so one line per
++        // entry joined by newlines reproduces exactly what the on-screen Save produced.
++        val body = lines.joinToString("\n") { it.text }
++        val payload = (if (body.isEmpty()) body else body + "\n").toByteArray(Charsets.UTF_8)
++        val name = safeDownloadName(query["name"])
++        respondRaw(
++            out,
++            200,
++            "text/plain; charset=utf-8",
++            listOf("Content-Disposition: attachment; filename=\"$name\""),
++            payload,
++        )
++    }
++
++    /**
++     * Reduces a client-supplied filename to a safe basename for a Content-Disposition header:
++     * strips path separators, quotes, and control characters (CR/LF included, which would allow
++     * header injection), caps the length, and falls back to a default when nothing survives.
++     */
++    private fun safeDownloadName(raw: String?): String {
++        val cleaned =
++            (raw ?: "")
++                .replace(Regex("[\\x00-\\x1f/\\\\\"]"), "")
++                .trim()
++                .take(128)
++        return if (cleaned.isEmpty()) "teesim-logs.log" else cleaned
++    }
++
++    /**
++     * Writes the log text the WebUI shows to a caller-chosen file, so the saved file is named and
++     * placed by the daemon (root) rather than the WebView, which ignores both the download filename
++     * and Content-Disposition. The directory is an absolute path the user chose and is used verbatim;
++     * the name is reduced to a safe basename. The resolved file must still sit inside that directory
++     * (a canonical-path check rejects any traversal), then the directory is created and the bytes
++     * written. Responds { ok, path } or { ok:false, error }.
++     */
++    private fun writeLogs(query: Map<String, String>, body: String): JSONObject {
++        val dir = query["dir"] ?: return JSONObject().put("ok", false).put("error", "dir required")
++        if (!dir.startsWith("/"))
++            return JSONObject().put("ok", false).put("error", "dir must be an absolute path")
++        val safeName = safeDownloadName(query["name"])
++        val dirFile = File(dir)
++        val canonicalDir = dirFile.canonicalPath
++        val target = File(dirFile, safeName)
++        val canonicalTarget = target.canonicalPath
++        if (canonicalTarget != canonicalDir + File.separator + safeName &&
++            !canonicalTarget.startsWith(canonicalDir + File.separator)) {
++            return JSONObject().put("ok", false).put("error", "invalid path")
++        }
++        return try {
++            dirFile.mkdirs()
++            File(canonicalTarget).writeBytes(body.toByteArray(Charsets.UTF_8))
++            SystemLogger.info("KeyAdmin: wrote ${body.length} chars of logs to $canonicalTarget")
++            JSONObject().put("ok", true).put("path", canonicalTarget)
++        } catch (e: Exception) {
++            SystemLogger.warning("KeyAdmin: /logs/write failed for $canonicalTarget", e)
++            JSONObject().put("ok", false).put("error", e.message ?: "write failed")
++        }
++    }
++
+     // --- helpers ----------------------------------------------------------------
+ 
+     // isInsideSecureHardware is the only pre-31 signal, and the fallback for an unknown level on 31+.
+@@ -490,4 +625,40 @@ object KeyAdmin {
+         if (payload.isNotEmpty()) out.write(payload)
+         out.flush()
+     }
++
++    /**
++     * Writes a raw HTTP/1.1 response with a caller-chosen Content-Type and extra header lines,
++     * for downloads that can't use the JSON [respond]. Sends the same CORS and Connection headers.
++     */
++    private fun respondRaw(
++        out: OutputStream,
++        code: Int,
++        contentType: String,
++        extraHeaders: List<String>,
++        payload: ByteArray,
++    ) {
++        val reason =
++            when (code) {
++                200 -> "OK"
++                204 -> "No Content"
++                400 -> "Bad Request"
++                403 -> "Forbidden"
++                404 -> "Not Found"
++                500 -> "Internal Server Error"
++                else -> "OK"
++            }
++        val sb = StringBuilder()
++        sb.append("HTTP/1.1 $code $reason\r\n")
++        sb.append("Content-Type: $contentType\r\n")
++        sb.append("Content-Length: ${payload.size}\r\n")
++        extraHeaders.forEach { sb.append(it).append("\r\n") }
++        sb.append("Access-Control-Allow-Origin: *\r\n")
++        sb.append("Access-Control-Allow-Headers: X-Teesim-Token, Content-Type\r\n")
++        sb.append("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n")
++        sb.append("Connection: close\r\n")
++        sb.append("\r\n")
++        out.write(sb.toString().toByteArray(Charsets.UTF_8))
++        if (payload.isNotEmpty()) out.write(payload)
++        out.flush()
++    }
+ }
+diff --git a/app/src/main/java/org/matrix/teesim/LogTail.kt b/app/src/main/java/org/matrix/teesim/LogTail.kt
+index ab96260..bc53dbd 100644
+--- a/app/src/main/java/org/matrix/teesim/LogTail.kt
++++ b/app/src/main/java/org/matrix/teesim/LogTail.kt
+@@ -5,11 +5,13 @@ import java.io.InputStreamReader
+ 
+ /**
+  * Tails logcat into a bounded ring buffer so the WebUI can poll recent lines cheaply (no logcat
+- * spawn per request). It keeps three things: every `TEESimulator` line (the daemon, the TA, and both
+- * native interceptors all log under that tag), every `avc` line (SELinux denials — the usual
+- * injection blocker), and, once the interceptor is injected, every line from the target keystore
+- * process, so the Logs panel shows what happens inside the process we hook rather than only our own
+- * output. The WebUI filters this stream by tag, level, and substring.
++ * spawn per request). It keeps: every `TEESimulator` line (the daemon, the TA, and both native
++ * interceptors all log under that tag), every `avc` line (SELinux denials — the usual injection
++ * blocker), every `AndroidRuntime` line and every fatal-level line (Java/native crash reports, so a
++ * crash that takes down the daemon or the hooked process is visible), and, once the interceptor is
++ * injected, every line from the target keystore process, so the Logs panel shows what happens inside
++ * the process we hook rather than only our own output. The WebUI filters this stream by tag, level,
++ * and substring.
+  *
+  * logcat cannot select by pid in its filterspec, so we capture broadly (`TEESimulator:V *:I`) and
+  * keep only the matching lines here; [targetPid] is supplied by the [Injector].
+@@ -83,7 +85,15 @@ object LogTail {
+             level = m.groupValues[2].firstOrNull() ?: 'I'
+             tag = m.groupValues[3].trim()
+             val pidNow = targetPid
+-            keep = tag == "TEESimulator" || tag == "avc" || (pidNow > 0 && pid == pidNow)
++            // Also keep AndroidRuntime (Java crash reports) and every fatal-level line (native
++            // aborts / "FATAL EXCEPTION"), so a crash that takes down the daemon or keystore2 lands
++            // in the WebUI log without a separate logcat pull.
++            keep =
++                tag == "TEESimulator" ||
++                    tag == "avc" ||
++                    tag == "AndroidRuntime" ||
++                    level == 'F' ||
++                    (pidNow > 0 && pid == pidNow)
+             lastKept = keep
+             lastLevel = level
+             lastTag = tag
+diff --git a/module/webroot/css/app.css b/module/webroot/css/app.css
+index eebe3a5..ec2565d 100644
+--- a/module/webroot/css/app.css
++++ b/module/webroot/css/app.css
+@@ -182,6 +182,10 @@ input[type="file"].input { padding: 8px 10px; }
+ .filter-menu-btn:hover, .filter-menu-btn[aria-expanded="true"] { color: var(--accent); background: var(--accent-weak, rgba(120, 150, 255, 0.12)); }
+ .sel-icon { position: relative; width: 16px; height: 16px; border: 1.5px solid currentColor; border-radius: 3px; }
+ .sel-icon::after { content: ""; position: absolute; left: 4px; top: 1px; width: 4px; height: 8px; border: solid currentColor; border-width: 0 1.5px 1.5px 0; transform: rotate(45deg); }
++/* Key-scope control: a segmented "Spoofed | All" toggle on its own row under the filter field, with a
++ * muted hint counting the real device keys the default "Spoofed" scope is hiding. */
++.keyscope-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 10px; }
++.keyscope-hint { font-size: 12px; }
+ .selmenu-backdrop { position: fixed; inset: 0; z-index: 40; }
+ .selmenu { position: absolute; top: calc(100% + 6px); right: 0; z-index: 41; min-width: 190px; background: var(--card); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18); padding: 6px; }
+ .selmenu button { display: block; width: 100%; text-align: left; padding: 10px 12px; border: 0; background: transparent; color: var(--fg); cursor: pointer; border-radius: 6px; font: inherit; }
+@@ -195,6 +199,20 @@ input[type="file"].input { padding: 8px 10px; }
+ .keycheck { flex: none; display: flex; align-items: center; }
+ .keymeta { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+ .keyalias { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
++/* Purpose chips sit just under the alias line, above the subdued meta lines: small pills naming what
++ * the key may be used for. AttestKey is accented because an attestation-capable app key is notable. */
++.keypurposes { display: flex; flex-wrap: wrap; gap: 6px; }
++.chip.purpose { color: var(--fg); font-weight: 600; }
++.chip.purpose.attest { color: var(--accent); background: var(--accent-weak, rgba(120, 150, 255, 0.14)); }
++/* Per-key class badge: shares the .chip pill shape, tinted by class. Generated keys we minted
++ * outright read green; patched real keys we re-rooted read amber; delegated keys blue; the app's
++ * own untouched keys stay muted grey. A read-only row's disabled checkbox is dimmed by the UA. */
++.chip.kclass { font-weight: 600; }
++.chip.kclass-generated { color: var(--ok); }
++.chip.kclass-patched { color: var(--warn); }
++.chip.kclass-delegated { color: var(--accent); }
++.chip.kclass-untouched { color: var(--muted); }
++.keyrow.readonly .keymeta { opacity: .85; }
+ .keybtns { display: flex; gap: 6px; flex: none; }
+ .code { background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 12px; overflow-x: auto; font-family: ui-monospace, monospace; font-size: 12px; margin: 0; white-space: pre; }
+ 
+@@ -338,6 +356,11 @@ html, body { overscroll-behavior-y: contain; }
+ }
+ 
+ /* --- logs --------------------------------------------------------------- */
++/* Unlike the other panels (where the whole page scrolls), the logs screen is pinned to
++ * the viewport height so the PANE scrolls internally. That is what makes the jump-to-top
++ * / jump-to-bottom buttons work — they move the pane, not the page — and keeps them
++ * pinned in view instead of stranded at the far end of a long page. */
++#tab-logs.screen { height: calc(100dvh - var(--topbar-h)); min-height: 0; overflow: hidden; }
+ .logs { position: relative; display: flex; flex-direction: column; gap: 10px; flex: 1; min-height: 0; }
+ .logs-head { gap: 10px; }
+ .logs-tools { display: flex; gap: 6px; }
+@@ -353,17 +376,23 @@ html, body { overscroll-behavior-y: contain; }
+ .logline.lv-w { color: var(--warn); }
+ .logline.lv-e, .logline.lv-f { color: var(--danger); }
+ .logs-tools { flex-wrap: wrap; }
+-/* Floating jump-to-top/bottom button over the log pane. Its chevron flips with .up/.down. */
++/* Two floating buttons over the log pane: jump to top (↑) and jump to bottom (↓), stacked. */
++.logs-fabs {
++  position: absolute; right: 18px; bottom: 18px; z-index: 5;
++  display: flex; flex-direction: column; gap: 8px;
++}
+ .logs-fab {
+-  position: absolute; right: 18px; bottom: 18px; width: 44px; height: 44px; z-index: 5;
+-  border: 0; border-radius: 50%; background: var(--accent); color: #fff; cursor: pointer;
++  width: 40px; height: 40px;
++  border: 1px solid var(--line); border-radius: 50%;
++  background: var(--card); color: var(--accent); cursor: pointer;
+   display: flex; align-items: center; justify-content: center;
+-  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
++  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.16);
+ }
++.logs-fab:hover { border-color: var(--accent); }
+ .logs-fab:active { transform: scale(0.94); }
+ .fab-chevron { width: 9px; height: 9px; border-right: 2px solid currentColor; border-bottom: 2px solid currentColor; }
+-.logs-fab.down .fab-chevron { transform: translateY(-2px) rotate(45deg); }
+-.logs-fab.up .fab-chevron { transform: translateY(2px) rotate(-135deg); }
++.fab-chevron.down { transform: translateY(-2px) rotate(45deg); }
++.fab-chevron.up { transform: translateY(2px) rotate(-135deg); }
+ 
+ /* --- sheets: extra breathing room above the primary/reset action -------- */
+ .sheet-submit { margin-top: 8px; }
+@@ -380,6 +409,9 @@ html, body { overscroll-behavior-y: contain; }
+  * what gets attested (the real value shows in the Fabricated group below). */
+ .kv-replaced .kv-val, .kv-replaced .kv-hex { color: var(--muted); text-decoration: line-through; }
+ .harvest-body { display: flex; flex-direction: column; gap: 12px; }
++/* Level selector: the two chips split the line evenly, flat rather than pill-shaped. */
++.harvest-modes { display: flex; gap: 6px; }
++.harvest-modes .chip.clickable { flex: 1; justify-content: center; border-radius: var(--radius); }
+ .kv-replaced .kv-label { color: var(--warn); }
+ 
+ /* --- keybox inspector --------------------------------------------------- */
+diff --git a/module/webroot/js/controllers/config-controller.js b/module/webroot/js/controllers/config-controller.js
+index 773efa1..e31bf79 100644
+--- a/module/webroot/js/controllers/config-controller.js
++++ b/module/webroot/js/controllers/config-controller.js
+@@ -104,6 +104,13 @@ export function create(mount) {
+       editing ? renderEditor() : renderList();
+       return;
+     }
++    await persist();
++  }
++
++  // Write the config to disk without the validation gate. A profile removal must persist even when a
++  // DIFFERENT profile is currently invalid — deleting one profile cannot introduce invalidity, and the
++  // whole-config gate in save() would otherwise reject the removal and leave the stale profile on disk.
++  async function persist() {
+     const r = await ioSave(config);
+     if (r.ok) {
+       dirty = false;
+@@ -183,6 +190,10 @@ export function create(mount) {
+       dirty = true;
+       revalidate();
+       closeEditor(); // the edited profile is gone; drop back to the list
++      // Persist the removal to disk right away — a confirmed delete that only lived in memory left the
++      // on-disk config (and its stale profile) untouched until the next unrelated Save. Bypass the
++      // validation gate: a removal must persist even if another profile is currently invalid.
++      await persist();
+     },
+ 
+     onToggleGroup(id) {
+diff --git a/module/webroot/js/controllers/keyadmin-controller.js b/module/webroot/js/controllers/keyadmin-controller.js
+index ffc9d07..2cbf754 100644
+--- a/module/webroot/js/controllers/keyadmin-controller.js
++++ b/module/webroot/js/controllers/keyadmin-controller.js
+@@ -4,22 +4,30 @@
+ // which the daemon's own AndroidKeyStore never sees. On Android 10/11 there is no
+ // keystore2 database, so the view shows a hint instead of a list.
+ //
+-// It owns the transient UI state the view is stateless about: the filter text and the
+-// set of selected key ids. Deletion goes back through /keys/db/delete, which the daemon
+-// re-verifies (our marker + a target app) before removing anything. Degrades gracefully:
+-// if the daemon isn't reachable yet it shows an "unavailable" panel instead of crashing.
++// It owns the transient UI state the view is stateless about: the filter text, the scope toggle
++// (spoofedOnly), and the set of selected key ids. Deletion goes back through /keys/db/delete, which
++// the daemon re-verifies (a target app) before removing anything. Degrades gracefully: if the daemon
++// isn't reachable yet it shows an "unavailable" panel instead of crashing.
+ 
+ import { keyAdmin } from "../data/keyadmin.js";
+ import { renderKeys } from "../ui/key-view.js";
+ import { confirmDialog, toast } from "../ui/dom.js";
+ import { attachPullToRefresh } from "../ui/pull-refresh.js";
+ 
++// A key we spoofed vs the app's own untouched real key. Both are deletable; the "Spoofed" scope just
++// hides the real ones by default, and bulk-select only ever touches what the scope currently shows.
++const isSpoofed = (k) => (k.class || "untouched") !== "untouched";
++
+ export function create(mount) {
+   let state = {
+     keys: [], available: false, apiLevel: 0, unavailable: false,
+     loading: false, deleting: false, filter: "", selected: new Set(), menuOpen: false,
++    spoofedOnly: true,
+   };
+ 
++  // The keys currently shown given the scope (bulk-select operates on these, never on hidden keys).
++  const visibleKeys = () => (state.spoofedOnly ? state.keys.filter(isSpoofed) : state.keys);
++
+   function render() {
+     renderKeys(mount, state, handler);
+   }
+@@ -79,11 +87,20 @@ export function create(mount) {
+         state.filter = arg;
+         render();
+         return;
+-      case "toggle":
++      case "toggle": {
+         if (state.selected.has(arg)) state.selected.delete(arg);
+         else state.selected.add(arg);
+         render();
+         return;
++      }
++      case "toggleSpoofed": {
++        state.spoofedOnly = !state.spoofedOnly;
++        // Drop any selection that just became hidden, so the delete count only counts visible keys.
++        const vis = new Set(visibleKeys().map((k) => k.id));
++        state.selected = new Set([...state.selected].filter((id) => vis.has(id)));
++        render();
++        return;
++      }
+       case "toggleMenu":
+         state.menuOpen = !state.menuOpen;
+         render();
+@@ -92,13 +109,14 @@ export function create(mount) {
+         state.menuOpen = false;
+         render();
+         return;
+-      case "selectFiltered":
++      case "selectFiltered": {
+         (arg || []).forEach((id) => state.selected.add(id));
+         state.menuOpen = false;
+         render();
+         return;
++      }
+       case "selectAll":
+-        state.keys.forEach((k) => state.selected.add(k.id));
++        visibleKeys().forEach((k) => state.selected.add(k.id));
+         state.menuOpen = false;
+         render();
+         return;
+@@ -109,7 +127,7 @@ export function create(mount) {
+         return;
+       case "inverse": {
+         const next = new Set();
+-        state.keys.forEach((k) => { if (!state.selected.has(k.id)) next.add(k.id); });
++        visibleKeys().forEach((k) => { if (!state.selected.has(k.id)) next.add(k.id); });
+         state.selected = next;
+         state.menuOpen = false;
+         render();
+diff --git a/module/webroot/js/controllers/logs-controller.js b/module/webroot/js/controllers/logs-controller.js
+index ce64244..00f48fd 100644
+--- a/module/webroot/js/controllers/logs-controller.js
++++ b/module/webroot/js/controllers/logs-controller.js
+@@ -6,12 +6,14 @@
+ 
+ import { keyAdmin } from "../data/keyadmin.js";
+ import { moduleVersion } from "../data/logs-io.js";
+-import { renderLogs, renderLogFilters } from "../ui/logs-view.js";
++import { renderLogs, renderLogFilters, renderSaveSheet } from "../ui/logs-view.js";
+ import { toast, clear, openSheet } from "../ui/dom.js";
+ 
+ const POLL_MS = 1500;
+ const MAX_FETCH = 500;
+ const MAX_KEPT = 4000;
++const SAVE_DIR_KEY = "teesim.logs.dir";
++const DEFAULT_SAVE_DIR = "/sdcard/Download";
+ 
+ // The default export filename: TEESimulator-<version>-<variant>-<timestamp>.log. The module
+ // version already embeds the variant, e.g. "v4.0 (17-0375393-debug)"; sanitize it into a
+@@ -43,11 +45,13 @@ export function create(mount) {
+   let error = null;
+   let timer = null;
+   let inFlight = false;
+-  let moduleVer = ""; // cached at load so Save stays synchronous (an await would kill the gesture)
++  let moduleVer = ""; // cached at load so the default save filename is ready without an await
+ 
+   let filter = { minLevel: "V", tags: new Set(), text: "" };
+   let filterHost = null;    // content element inside the filter sheet
+   let filterOverlay = null; // { close } while the sheet is open
++  let saveHost = null;      // content element inside the save sheet
++  let saveOverlay = null;   // { close } while the save sheet is open
+ 
+   const filterActive = () => filter.minLevel !== "V" || filter.tags.size > 0 || filter.text !== "";
+   const seenTags = () => {
+@@ -98,6 +102,41 @@ export function create(mount) {
+     if (filterOverlay) filterOverlay.close();
+   }
+ 
++  // ---- save sheet -------------------------------------------------------
++  // The Save button opens this sheet; the sheet's own Save click is the gesture that POSTs
++  // the log text to the daemon, which (as root) writes it to the chosen folder/name and
++  // returns the final path. The folder is remembered in localStorage for next time.
++  function openSaveSheet() {
++    if (!lines.length) { toast("No logs to save"); return; }
++    const dir = localStorage.getItem(SAVE_DIR_KEY) || DEFAULT_SAVE_DIR;
++    const name = defaultLogName(moduleVer);
++    saveHost = document.createElement("div");
++    saveHost.appendChild(renderSaveSheet({ dir, name }, saveActions));
++    saveOverlay = openSheet(saveHost, { label: "Save logs", onClose: () => { saveHost = null; saveOverlay = null; } });
++  }
++
++  const saveActions = {
++    async save(dir, name) {
++      const text = lines.map((l) => l.text).join("\n");
++      if (!text) { toast("No logs to save"); return; }
++      const folder = (dir || "").trim() || DEFAULT_SAVE_DIR;
++      try {
++        const res = await keyAdmin("logsWrite", { dir: folder, name, text });
++        if (res && res.ok) {
++          localStorage.setItem(SAVE_DIR_KEY, folder);
++          toast("Saved to " + res.path);
++          if (saveOverlay) saveOverlay.close();
++        } else {
++          toast("Save failed: " + ((res && res.error) || "unknown error"));
++        }
++      } catch (e) {
++        console.error("[logs.save] write failed:", e);
++        toast("Save failed: " + (e && e.message ? e.message : String(e)));
++      }
++    },
++    close() { if (saveOverlay) saveOverlay.close(); },
++  };
++
+   // Level, tag chips, and Reset rebuild the sheet (to repaint the segmented control and
+   // the selected chips); focus is on a button then, so no caret is lost. The message
+   // input only updates the filter and the pane — rebuilding the sheet would yank the
+@@ -122,56 +161,7 @@ export function create(mount) {
+       render();
+       if (!paused) poll();
+     },
+-    // Synchronous by design: the download must fire inside the click's user-gesture, or the WebView
+-    // silently blocks it and never raises the system Save-As dialog. So no await here — the module
+-    // version is prefetched at load(). A Blob URL works over plain http:// (unlike the clipboard API),
+-    // and `download` supplies the default filename the dialog opens with (rename + choose location).
+-    async save() {
+-      const text = lines.map((l) => l.text).join("\n");
+-      if (!text) {
+-        toast("No logs to save");
+-        return;
+-      }
+-      const name = defaultLogName(moduleVer);
+-
+-      // Prefer the system "Save As" picker (choose location + rename) via the File System Access
+-      // API. It needs a secure context and a user gesture — this WebUI is https and we're inside the
+-      // click, and moduleVer is prefetched so nothing awaits before the picker call. Falls back to a
+-      // plain download when the API is absent (older WebView). "AbortError" = the user cancelled.
+-      if (typeof window.showSaveFilePicker === "function") {
+-        try {
+-          const handle = await window.showSaveFilePicker({
+-            suggestedName: name,
+-            types: [{ description: "Log file", accept: { "text/plain": [".log"] } }],
+-          });
+-          const w = await handle.createWritable();
+-          await w.write(text);
+-          await w.close();
+-          toast("Saved " + name);
+-          return;
+-        } catch (e) {
+-          if (e && e.name === "AbortError") return;
+-          console.warn("[logs.save] showSaveFilePicker failed; falling back to download:", e);
+-        }
+-      }
+-
+-      // Fallback: hand the file to the browser as a download.
+-      console.log("[logs.save] downloading %o (%d bytes)", name, text.length);
+-      try {
+-        const url = URL.createObjectURL(new Blob([text], { type: "text/plain;charset=utf-8" }));
+-        const a = document.createElement("a");
+-        a.href = url;
+-        a.download = name;
+-        document.body.appendChild(a);
+-        a.click();
+-        a.remove();
+-        setTimeout(() => URL.revokeObjectURL(url), 2000);
+-        toast("Saved " + name);
+-      } catch (e) {
+-        console.error("[logs.save] failed:", e);
+-        toast("Save failed: " + (e && e.message ? e.message : String(e)));
+-      }
+-    },
++    openSaveSheet() { openSaveSheet(); },
+   };
+ 
+   function visible() {
+@@ -187,7 +177,7 @@ export function create(mount) {
+ 
+   return {
+     load() {
+-      // Prefetch the module version for the Save filename so save() needn't await (see save()).
++      // Prefetch the module version so the default save filename is ready without awaiting.
+       moduleVersion()
+         .then((v) => { moduleVer = v; console.log("[logs] module version prefetched: %o", v); })
+         .catch((e) => console.error("[logs] moduleVersion prefetch failed:", e));
+diff --git a/module/webroot/js/data/keyadmin.js b/module/webroot/js/data/keyadmin.js
+index 93e6ad2..bf810a6 100644
+--- a/module/webroot/js/data/keyadmin.js
++++ b/module/webroot/js/data/keyadmin.js
+@@ -14,7 +14,7 @@
+ //   keyAdmin("status")               -> { ok, version, harvest{…}, lib:{ hook, api } }
+ //   keyAdmin("list")                 -> { ok, keys:[{ alias, securityLevel, ours, cert{…} }] }
+ //   keyAdmin("keysDb")               -> { ok, available, apiLevel,
+-//                                          keys:[{ id, alias, uid, package, state,
++//                                          keys:[{ id, alias, uid, package, state, class,
+ //                                                  created?, keybox?, keyAlgorithm? }] }
+ //       the keys THIS MODULE minted for target apps, read from keystore2's database on
+ //       API >= 31; on Android 10/11 there is no such database, so available:false and
+@@ -26,6 +26,9 @@
+ //   keyAdmin("inspect", { alias })   -> { ok, alias, cert{…}, attestation:{…}|null }
+ //   keyAdmin("delete",  { alias })   -> { ok, deleted }
+ //   keyAdmin("logs", { after, max }) -> { ok, lines:[{ seq, level, tag, text }], nextAfter }
++//   keyAdmin("logsWrite", { dir, name, text }) -> { ok, path } | { ok:false, error }
++//       the daemon (root) writes `text` to <dir>/<safe(name)>, creating dir; it names and
++//       places the file since the WebView ignores download filenames and Content-Disposition.
+ //   keyAdmin("keyboxInspect", { name }) -> { ok, name, deviceId,
+ //                                          keys:[{ algorithm, privateKeyPresent, chainLength,
+ //                                                  linkage, certs:[{ index, subject, issuer,
+@@ -63,31 +66,47 @@ function getToken() {
+   return tokenPromise;
+ }
+ 
++// A daemon download is reached by a browser navigation, which cannot carry the
++// X-Teesim-Token header, so the log-download route authenticates with a ?token= query
++// param. These two exports keep the base URL and token owned by this seam; callers build
++// only the path+query. Prefetch adminToken() so the token is in hand before the click.
++export const API_BASE = BASE;
++export function adminToken() {
++  return getToken();
++}
++
+ // One request helper: attach the token header, parse JSON, and convert any non-200
+ // or network/parse failure into a thrown Error carrying the daemon's message when
+ // there is one.
+-async function request(method, path) {
++async function request(method, path, body) {
+   const token = await getToken();
+   const t0 = Date.now();
+   console.log("[keyAdmin] → %s %s%s", method, path, token ? "" : " (NO TOKEN)");
++  const init = { method, headers: { "X-Teesim-Token": token } };
++  if (body != null) {
++    init.body = body;
++    init.headers["Content-Type"] = "text/plain; charset=utf-8";
++  }
+   let res;
+   try {
+-    res = await fetch(BASE + path, { method, headers: { "X-Teesim-Token": token } });
++    res = await fetch(BASE + path, init);
+   } catch (e) {
+     console.error("[keyAdmin] ✗ %s %s network error in %dms:", method, path, Date.now() - t0, e);
+     throw new Error("daemon unreachable: " + (e && e.message ? e.message : String(e)));
+   }
+-  let body = null;
+-  try { body = await res.json(); } catch { /* leave body null on empty/invalid JSON */ }
++  // Response body — a distinct name from the `body` REQUEST parameter above (re-declaring a parameter
++  // with `let` is a SyntaxError that would break this whole module and, with it, the entire WebUI).
++  let data = null;
++  try { data = await res.json(); } catch { /* leave null on empty/invalid JSON */ }
+   console.log("[keyAdmin] ← %s %s %d ok=%o in %dms", method, path, res.status, res.ok, Date.now() - t0);
+   if (!res.ok) {
+-    console.warn("[keyAdmin] ✗ %s %s body:", method, path, body);
++    console.warn("[keyAdmin] ✗ %s %s body:", method, path, data);
+     // The daemon reports failures two ways: key ops use { ok:false, error },
+     // while the canary endpoints use { ok:false, message }. Surface either so a
+     // failed canaryInstall keeps the daemon's human-readable reason.
+-    throw new Error((body && (body.error || body.message)) || ("HTTP " + res.status));
++    throw new Error((data && (data.error || data.message)) || ("HTTP " + res.status));
+   }
+-  return body;
++  return data;
+ }
+ 
+ // The alias travels in the query string; encode it so any character is inert.
+@@ -110,6 +129,12 @@ const canaryInstallQuery = (args) =>
+   "?tag=" + encodeURIComponent((args && args.tag) || "") +
+   "&variant=" + encodeURIComponent((args && args.variant) || "release");
+ 
++// The save target: the chosen folder and filename, both encoded so any character is inert.
++// The log text itself rides in the request body (too large for a query), not here.
++const logsWriteQuery = (args) =>
++  "?dir=" + encodeURIComponent((args && args.dir) || "") +
++  "&name=" + encodeURIComponent((args && args.name) || "");
++
+ export async function keyAdmin(action, args = {}) {
+   switch (action) {
+     case "status":
+@@ -126,6 +151,8 @@ export async function keyAdmin(action, args = {}) {
+       return request("POST", "/keys/delete" + aliasQuery(args));
+     case "logs":
+       return request("GET", "/logs" + logsQuery(args));
++    case "logsWrite":
++      return request("POST", "/logs/write" + logsWriteQuery(args), args.text);
+     case "keyboxInspect":
+       return request("GET", "/keybox/inspect" + nameQuery(args));
+     case "canary":
+diff --git a/module/webroot/js/ui/key-view.js b/module/webroot/js/ui/key-view.js
+index 5fd155e..46de848 100644
+--- a/module/webroot/js/ui/key-view.js
++++ b/module/webroot/js/ui/key-view.js
+@@ -7,8 +7,8 @@
+ // rendered inline because its label carries the live selection count.
+ //
+ // renderKeys(mount, state, handler)
+-//   state = { keys, available, apiLevel, unavailable, loading, deleting, filter, selected, menuOpen }
+-//     keys        [{ id, alias, uid, package, state, created?, keybox?, keyAlgorithm? }] from keystore2's DB
++//   state = { keys, available, apiLevel, unavailable, loading, deleting, filter, selected, menuOpen, spoofedOnly }
++//     keys        [{ id, alias, uid, package, state, class, created?, keybox?, keyAlgorithm?, purposes? }] from keystore2's DB
+ //     available   true when the daemon could read keystore2's database (API >= 31)
+ //     apiLevel    the device SDK_INT the daemon reported (0 before the first fetch)
+ //     unavailable true when the daemon key endpoint isn't reachable yet
+@@ -48,6 +48,7 @@ export function renderKeys(mount, state, handler) {
+   const {
+     keys = [], available = false, apiLevel = 0, unavailable = false,
+     loading = false, deleting = false, filter = "", selected = new Set(), menuOpen = false,
++    spoofedOnly = true,
+   } = state;
+ 
+   // Panel head: Delete-selected (only when something is checked; its label counts the selection),
+@@ -103,18 +104,27 @@ export function renderKeys(mount, state, handler) {
+     return;
+   }
+ 
+-  // Matching is a case-insensitive substring over alias / app / keybox.
++  // Matching is a case-insensitive substring over alias / app / keybox. Spoofed keys
++  // (generated / delegated / patched) sort ahead of untouched ones; the sort is stable,
++  // so within a class the daemon's namespace+alias order is preserved.
+   const q = filter.trim().toLowerCase();
+-  const shown = q ? keys.filter((k) => matchesFilter(k, q)) : keys;
++  let matched = q ? keys.filter((k) => matchesFilter(k, q)) : keys;
++  // The apps' own untouched (real hardware) keys are hidden by default so the list shows only what we
++  // spoofed; the "All" scope segment reveals them for inspection or deletion.
++  const hiddenReal = spoofedOnly ? matched.filter((k) => !isSpoofed(k)).length : 0;
++  if (spoofedOnly) matched = matched.filter(isSpoofed);
++  const shown = matched.slice().sort((a, b) => classRank(a) - classRank(b));
+ 
+-  // Search card: the filter box with a trailing icon that opens the selection menu.
+-  mount.appendChild(searchCard(filter, shown, menuOpen, handler));
++  // Search card: the filter box, the selection menu, and the spoofed/all scope control.
++  mount.appendChild(searchCard(filter, shown, menuOpen, spoofedOnly, hiddenReal, handler));
+ 
+   // List card: one row per shown key, each with its own checkbox.
+   const listCard = el("div", { class: "card keypanel" });
+   if (!shown.length) {
+-    listCard.appendChild(el("p", { class: "muted keyempty", text:
+-      keys.length ? "No keys match “" + filter + "”." : "No keys." }));
++    const msg = hiddenReal
++      ? hiddenReal + " real device key(s) hidden — switch to All to show them."
++      : keys.length ? "No keys match “" + filter + "”." : "No keys.";
++    listCard.appendChild(el("p", { class: "muted keyempty", text: msg }));
+     mount.appendChild(listCard);
+     restoreFocus();
+     return;
+@@ -122,16 +132,17 @@ export function renderKeys(mount, state, handler) {
+   const list = el("ul", { class: "keylist" });
+   for (const k of shown) {
+     const checked = selected.has(k.id);
++    const check = el("input", { type: "checkbox", checked, onchange: () => handler("toggle", k.id) });
+     list.appendChild(el("li", { class: "keyrow" + (checked ? " selected" : "") }, [
+-      el("label", { class: "keycheck" }, [
+-        el("input", { type: "checkbox", checked, onchange: () => handler("toggle", k.id) }),
+-      ]),
++      el("label", { class: "keycheck" }, [check]),
+       el("div", { class: "keymeta" }, [
+         el("div", { class: "keyalias" }, [
+           el("span", { class: "mono", text: k.alias || "(no alias)" }),
++          classChip(k),
+           el("span", { class: "chip", text: appLabel(k) }),
+           ...abnormalChips(k),
+         ]),
++        ...purposeChips(k),
+         ...metaLines(k),
+       ]),
+     ]));
+@@ -144,7 +155,7 @@ export function renderKeys(mount, state, handler) {
+ // The search card: a field that looks like an input, holding the borderless filter box and a
+ // trailing icon button. The button opens an in-field menu of bulk-selection actions; a full-screen
+ // backdrop below the menu dismisses it on an outside tap.
+-function searchCard(filter, shown, menuOpen, handler) {
++function searchCard(filter, shown, menuOpen, spoofedOnly, hiddenReal, handler) {
+   const filterInput = el("input", {
+     id: "keyfilter", class: "filter-input", type: "text", value: filter,
+     placeholder: "Filter by alias, app, or keybox",
+@@ -169,7 +180,30 @@ function searchCard(filter, shown, menuOpen, handler) {
+       item("Inverse selection", "inverse"),
+     ]));
+   }
+-  return el("div", { class: "card keysearch" }, [field]);
++
++  // Scope control: "Spoofed" (default) lists only keys this module spoofed; "All" also shows the apps'
++  // own real device keys. Both segments drive the same toggleSpoofed action — clicking the active one
++  // is a no-op. The hint reports how many real keys "Spoofed" is currently hiding.
++  const scope = el("div", { class: "segmented keyscope", role: "group", "aria-label": "Which keys to list" }, [
++    el("button", {
++      class: "seg" + (spoofedOnly ? " on" : ""), type: "button", text: "Spoofed",
++      "aria-pressed": spoofedOnly ? "true" : "false", title: "Only keys this module spoofed",
++      onclick: () => { if (!spoofedOnly) handler("toggleSpoofed"); },
++    }),
++    el("button", {
++      class: "seg" + (!spoofedOnly ? " on" : ""), type: "button", text: "All",
++      "aria-pressed": !spoofedOnly ? "true" : "false", title: "Include the apps' own real device keys",
++      onclick: () => { if (spoofedOnly) handler("toggleSpoofed"); },
++    }),
++  ]);
++  const scopeRow = el("div", { class: "keyscope-row" }, [scope]);
++  if (spoofedOnly && hiddenReal) {
++    scopeRow.appendChild(el("span", {
++      class: "keyscope-hint muted",
++      text: hiddenReal + " real device key(s) hidden",
++    }));
++  }
++  return el("div", { class: "card keysearch" }, [field, scopeRow]);
+ }
+ 
+ function matchesFilter(k, q) {
+@@ -195,10 +229,48 @@ function stateLabel(s) {
+   return ({ 0: "creating", 1: "live", 2: "orphaned" })[Number(s)] || ("state " + s);
+ }
+ 
++// The four key classes the daemon reports, in the order spoofed-before-untouched, each with its
++// display label and badge modifier class. An unknown/absent class is treated as "untouched".
++const KEY_CLASSES = {
++  generated: { label: "Generated", cls: "kclass-generated", rank: 0 },
++  delegated: { label: "Delegated", cls: "kclass-delegated", rank: 1 },
++  patched: { label: "Patched", cls: "kclass-patched", rank: 2 },
++  untouched: { label: "Untouched", cls: "kclass-untouched", rank: 3 },
++};
++
++function keyClass(k) {
++  return KEY_CLASSES[k.class] || KEY_CLASSES.untouched;
++}
++
++function classRank(k) {
++  return keyClass(k).rank;
++}
++
++// A colored badge naming how the key was spoofed (or that it is the app's own untouched key).
++function classChip(k) {
++  const c = keyClass(k);
++  return el("span", { class: "chip kclass " + c.cls, text: c.label });
++}
++
++// A key we spoofed (generated / delegated / patched), as opposed to the app's own untouched real key.
++// Every listed key belongs to a target app and may be deleted; real ones are just hidden by default.
++function isSpoofed(k) {
++  return (k.class || "untouched") !== "untouched";
++}
++
++// The key's KeyPurpose labels (from the daemon's Tag::PURPOSE read) as small chips, with ATTEST_KEY
++// accented since an attestation-capable app key is notable. No chips when the key reports no purposes.
++function purposeChips(k) {
++  if (!Array.isArray(k.purposes) || !k.purposes.length) return [];
++  return [el("div", { class: "keypurposes" }, k.purposes.map((p) =>
++    el("span", { class: "chip small purpose" + (p === "AttestKey" ? " attest" : ""), text: p })))];
++}
++
+ function metaLines(k) {
+   const lines = [];
+   if (k.keyAlgorithm) lines.push(metaLine("Algorithm", k.keyAlgorithm));
+-  lines.push(metaLine("Keybox", k.keybox || el("span", { class: "muted", text: "unattributed" })));
++  // Only attributed keys carry a keybox; omit the line entirely for untouched real keys.
++  if (k.keybox) lines.push(metaLine("Keybox", k.keybox));
+   if (k.created) lines.push(metaLine("Created", fmtDate(k.created)));
+   return lines;
+ }
+diff --git a/module/webroot/js/ui/logs-view.js b/module/webroot/js/ui/logs-view.js
+index b14637e..b29a73e 100644
+--- a/module/webroot/js/ui/logs-view.js
++++ b/module/webroot/js/ui/logs-view.js
+@@ -1,6 +1,6 @@
+ // The Logs panel: a scrollback pane of recent logcat lines under a sticky header with
+-// the title and a Filter / Pause / Save toolbar, plus a floating button that jumps the
+-// pane to the top or bottom (whichever way it isn't). Filters (min level, a set of
++// the title and a Filter / Pause / Save toolbar, plus two floating buttons pinned to the
++// pane that jump it to the top or the bottom. Filters (min level, a set of
+ // selected tags, and a message substring) live in the controller and are applied here;
+ // the filter controls themselves open in a bottom sheet built by renderLogFilters. Pure
+ // DOM — it renders from controller state and calls back through `actions`. Lines are
+@@ -57,29 +57,25 @@ export function renderLogs(mount, state, actions) {
+       ]),
+       el("span", { class: "logs-msg", "data-role": "msg" }, ""),
+       el("pre", { class: "logs-pane", tabindex: "0" }),
+-      el("button", { class: "logs-fab down", type: "button", "aria-label": "Scroll to top or bottom" }, [
+-        el("span", { class: "fab-chevron", "aria-hidden": "true" }),
++      el("div", { class: "logs-fabs" }, [
++        el("button", { class: "logs-fab", type: "button", "data-scroll": "top", "aria-label": "Scroll to top" }, [
++          el("span", { class: "fab-chevron up", "aria-hidden": "true" }),
++        ]),
++        el("button", { class: "logs-fab", type: "button", "data-scroll": "bottom", "aria-label": "Scroll to bottom" }, [
++          el("span", { class: "fab-chevron down", "aria-hidden": "true" }),
++        ]),
+       ]),
+     ]);
+     shell.querySelector('[data-act="filter"]').addEventListener("click", () => actions.openFilters());
+     shell.querySelector('[data-act="pause"]').addEventListener("click", () => actions.togglePause());
+-    shell.querySelector('[data-act="save"]').addEventListener("click", () => actions.save());
++    shell.querySelector('[data-act="save"]').addEventListener("click", () => actions.openSaveSheet());
+ 
+-    // Floating scroll button: when the pane is near the bottom it offers "jump to top" (chevron up),
+-    // otherwise "jump to bottom" (chevron down). Its direction tracks the scroll position; a tap
+-    // scrolls the pane to whichever end it currently points at.
++    // Two floating buttons that jump the log pane to the top or the bottom.
+     const paneEl = shell.querySelector(".logs-pane");
+-    const fab = shell.querySelector(".logs-fab");
+-    const syncFab = () => {
+-      const nearBottom = paneEl.scrollHeight - paneEl.scrollTop - paneEl.clientHeight < 40;
+-      fab.classList.toggle("up", nearBottom);
+-      fab.classList.toggle("down", !nearBottom);
+-    };
+-    paneEl.addEventListener("scroll", syncFab);
+-    fab.addEventListener("click", () => {
+-      paneEl.scrollTop = fab.classList.contains("up") ? 0 : paneEl.scrollHeight;
+-    });
+-    shell._syncFab = syncFab;
++    shell.querySelector('[data-scroll="top"]').addEventListener("click", () =>
++      paneEl.scrollTo({ top: 0, behavior: "smooth" }));
++    shell.querySelector('[data-scroll="bottom"]').addEventListener("click", () =>
++      paneEl.scrollTo({ top: paneEl.scrollHeight, behavior: "smooth" }));
+     mount.append(shell);
+   }
+ 
+@@ -136,7 +132,6 @@ export function renderLogs(mount, state, actions) {
+   while (pane.childElementCount > MAX_SHOWN) pane.removeChild(pane.firstElementChild);
+ 
+   if (!state.paused && atBottom) pane.scrollTop = pane.scrollHeight;
+-  if (shell._syncFab) shell._syncFab();
+ }
+ 
+ // ---- filter sheet -------------------------------------------------------
+@@ -189,3 +184,36 @@ export function renderLogFilters(state, actions) {
+     el("button", { class: "btn ghost block sheet-submit", type: "button", text: "Reset filters", onclick: () => actions.reset() }),
+   ]);
+ }
++
++// ---- save sheet ---------------------------------------------------------
++// renderSaveSheet(state, actions) -> HTMLElement   (content for the save sheet)
++//   state   = { dir, name }
++//   actions = { save(dir, name), close() }
++// The daemon (root) writes the file, so the folder can be anywhere it can reach. The two
++// inputs are uncontrolled: their live values are read only when Save is clicked, so typing
++// never rebuilds the sheet. The Save click is the gesture that fires the POST.
++export function renderSaveSheet(state, actions) {
++  const { dir = "", name = "" } = state;
++  const dirInput = el("input", {
++    class: "input", type: "text", value: dir, placeholder: "/sdcard/Download",
++    autocapitalize: "off", autocorrect: "off", spellcheck: "false",
++  });
++  const nameInput = el("input", {
++    class: "input", type: "text", value: name, placeholder: "teesim-logs.log",
++    autocapitalize: "off", autocorrect: "off", spellcheck: "false",
++  });
++  return el("div", {}, [
++    el("div", { class: "sheet-head" }, [
++      el("h2", { text: "Save logs" }),
++      el("button", { class: "iconbtn", type: "button", "aria-label": "Close", onclick: () => actions.close() }, [
++        el("span", { class: "x-mark", "aria-hidden": "true" }),
++      ]),
++    ]),
++    el("div", { class: "field" }, [el("span", { class: "field-label", text: "Folder" }), dirInput]),
++    el("div", { class: "field" }, [el("span", { class: "field-label", text: "Filename" }), nameInput]),
++    el("button", {
++      class: "btn primary block sheet-submit", type: "button", text: "Save",
++      onclick: () => actions.save(dirInput.value, nameInput.value),
++    }),
++  ]);
++}
+-- 
+2.45.1.windows.1
+

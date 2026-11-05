@@ -1,0 +1,229 @@
+From 75d2d558a797dabcc00de0798e9e2b5cc5fb3a8f Mon Sep 17 00:00:00 2001
+From: JingMatrix <jingmatrix@gmail.com>
+Date: Mon, 10 Aug 2026 22:51:06 +0200
+Subject: [PATCH 20/47] Log the TA's certificate chains and keep its debug
+ symbols
+
+Instrument the reference TA so a capture shows exactly what it produced.
+generate_key and import_key log their parameters and the resulting chain,
+patch_attestation logs the input leaf and the patched output, and the keybox is
+dumped (both the RSA and EC chains) when it is parsed. A shared
+resign::log_chain / describe_cert renders each certificate as "subject <= issuer".
+
+Keep line tables and symbols in the release archive (strip = false, debug = true)
+so a panic in the TA symbolicates to a Rust file:line in the tombstone. The
+shipped release .so is still stripped by AGP; the debug variant keeps the symbols
+(app/build.gradle.kts keepDebugSymbols). Also drop the unused kmr-tests dependency.
+---
+ rust/Cargo.toml              |  7 ++++--
+ rust/teesim-km/src/attest.rs |  8 +++++--
+ rust/teesim-km/src/ops.rs    | 41 ++++++++++++++++++++++++++++++++++--
+ rust/teesim-km/src/resign.rs | 28 ++++++++++++++++++++++++
+ 4 files changed, 78 insertions(+), 6 deletions(-)
+
+diff --git a/rust/Cargo.toml b/rust/Cargo.toml
+index 2fd9bbf..11d743e 100644
+--- a/rust/Cargo.toml
++++ b/rust/Cargo.toml
+@@ -12,11 +12,14 @@ kmr-common = { path = "../third_party/keymint/common" }
+ kmr-derive = { path = "../third_party/keymint/derive" }
+ kmr-wire = { path = "../third_party/keymint/wire" }
+ kmr-ta = { path = "../third_party/keymint/ta" }
+-kmr-tests = { path = "../third_party/keymint/tests" }
+ kmr-crypto-boring = { path = "../third_party/keymint/boringssl" }
+ 
+ [profile.release]
+ panic = "unwind"
+ opt-level = "z"
+ lto = true
+-strip = true
++# Keep debug info (line tables) and symbols so a crash in the TA symbolicates to a Rust file:line in
++# the tombstone. build.sh always builds --release; the shipped release .so is still stripped by AGP,
++# while the debug variant keeps these symbols (see app/build.gradle.kts keepDebugSymbols).
++strip = false
++debug = true
+diff --git a/rust/teesim-km/src/attest.rs b/rust/teesim-km/src/attest.rs
+index 35b5e95..b3f98a6 100644
+--- a/rust/teesim-km/src/attest.rs
++++ b/rust/teesim-km/src/attest.rs
+@@ -50,10 +50,14 @@ impl CertSignInfo {
+             .find(|n| n.has_tag_name("Key") && n.attribute("algorithm") == Some("ecdsa"))
+             .ok_or("keybox: no <Key algorithm=\"ecdsa\">")?;
+ 
+-        Ok(CertSignInfo {
++        let info = CertSignInfo {
+             rsa: parse_algo(rsa_node, SigningAlgorithm::Rsa)?,
+             ec: parse_algo(ec_node, SigningAlgorithm::Ec)?,
+-        })
++        };
++        log::info!("teesim_km: keybox parsed");
++        crate::resign::log_chain("teesim_km: keybox RSA chain", &info.rsa.chain);
++        crate::resign::log_chain("teesim_km: keybox EC chain", &info.ec.chain);
++        Ok(info)
+     }
+ }
+ 
+diff --git a/rust/teesim-km/src/ops.rs b/rust/teesim-km/src/ops.rs
+index 110de1f..6ce53e5 100644
+--- a/rust/teesim-km/src/ops.rs
++++ b/rust/teesim-km/src/ops.rs
+@@ -96,6 +96,12 @@ impl Ta {
+         attestation_key: Option<AttestationKey>,
+         security_level: i32,
+     ) -> Result<KeyCreationResult, OpError> {
++        log::info!(
++            "teesim_km: generate_key: {} param(s), security_level={}, attest_key={}",
++            key_params.len(),
++            security_level,
++            attestation_key.is_some()
++        );
+         let restore = self.override_attestation_identity(security_level);
+         let resp: Result<GenerateKeyResponse, OpError> =
+             self.perform(GenerateKeyRequest { key_params, attestation_key });
+@@ -103,7 +109,9 @@ impl Ta {
+             self.inner.set_security_level(level);
+             self.inner.set_aidl_version(version);
+         }
+-        Ok(marked_result(resp?.ret))
++        let ret = resp?.ret;
++        crate::resign::log_chain("teesim_km: generate_key result", &ret.certificate_chain);
++        Ok(marked_result(ret))
+     }
+ 
+     /// importKey. The returned key blob carries our marker. `security_level` is
+@@ -117,6 +125,14 @@ impl Ta {
+         attestation_key: Option<AttestationKey>,
+         security_level: i32,
+     ) -> Result<KeyCreationResult, OpError> {
++        log::info!(
++            "teesim_km: import_key: {} param(s), format={:?}, {} key bytes, security_level={}, attest_key={}",
++            key_params.len(),
++            key_format,
++            key_data.len(),
++            security_level,
++            attestation_key.is_some()
++        );
+         let restore = self.override_attestation_identity(security_level);
+         let resp: Result<ImportKeyResponse, OpError> =
+             self.perform(ImportKeyRequest { key_params, key_format, key_data, attestation_key });
+@@ -124,7 +140,9 @@ impl Ta {
+             self.inner.set_security_level(level);
+             self.inner.set_aidl_version(version);
+         }
+-        Ok(marked_result(resp?.ret))
++        let ret = resp?.ret;
++        crate::resign::log_chain("teesim_km: import_key result", &ret.certificate_chain);
++        Ok(marked_result(ret))
+     }
+ 
+     /// begin. `key_blob` is a marked blob; the marker is stripped before use.
+@@ -135,6 +153,12 @@ impl Ta {
+         params: Vec<KeyParam>,
+         auth_token: Option<HardwareAuthToken>,
+     ) -> Result<InternalBeginResult, OpError> {
++        log::info!(
++            "teesim_km: begin: purpose={:?}, blob_len={}, {} param(s)",
++            purpose,
++            key_blob.len(),
++            params.len()
++        );
+         let resp: BeginResponse = self.perform(BeginRequest {
+             purpose,
+             key_blob: strip_marker(key_blob).to_vec(),
+@@ -180,6 +204,12 @@ impl Ta {
+         timestamp_token: Option<TimeStampToken>,
+         confirmation_token: Option<Vec<u8>>,
+     ) -> Result<Vec<u8>, OpError> {
++        log::info!(
++            "teesim_km: finish: op={}, input={} bytes, signature={} bytes",
++            op_handle,
++            input.as_ref().map_or(0, |v| v.len()),
++            signature.as_ref().map_or(0, |v| v.len())
++        );
+         let resp: FinishResponse = self.perform(FinishRequest {
+             op_handle,
+             input,
+@@ -199,6 +229,7 @@ impl Ta {
+ 
+     /// deleteKey. `key_blob` is a marked blob.
+     pub fn delete_key(&mut self, key_blob: &[u8]) -> Result<(), OpError> {
++        log::info!("teesim_km: delete_key: blob_len={}", key_blob.len());
+         let _: DeleteKeyResponse =
+             self.perform(DeleteKeyRequest { key_blob: strip_marker(key_blob).to_vec() })?;
+         Ok(())
+@@ -210,6 +241,11 @@ impl Ta {
+         key_blob: &[u8],
+         upgrade_params: Vec<KeyParam>,
+     ) -> Result<Vec<u8>, OpError> {
++        log::info!(
++            "teesim_km: upgrade_key: blob_len={}, {} param(s)",
++            key_blob.len(),
++            upgrade_params.len()
++        );
+         let resp: UpgradeKeyResponse = self.perform(UpgradeKeyRequest {
+             key_blob_to_upgrade: strip_marker(key_blob).to_vec(),
+             upgrade_params,
+@@ -224,6 +260,7 @@ impl Ta {
+         app_id: Vec<u8>,
+         app_data: Vec<u8>,
+     ) -> Result<Vec<KeyCharacteristics>, OpError> {
++        log::info!("teesim_km: get_key_characteristics: blob_len={}", key_blob.len());
+         let resp: GetKeyCharacteristicsResponse = self.perform(GetKeyCharacteristicsRequest {
+             key_blob: strip_marker(key_blob).to_vec(),
+             app_id,
+diff --git a/rust/teesim-km/src/resign.rs b/rust/teesim-km/src/resign.rs
+index b4f32c9..704923a 100644
+--- a/rust/teesim-km/src/resign.rs
++++ b/rust/teesim-km/src/resign.rs
+@@ -25,6 +25,25 @@ use x509_cert::Certificate;
+ /// Local (non-TA) failure code, matching `ops::ERR_UNKNOWN`.
+ const ERR: i32 = -1000;
+ 
++/// One-line "subject <= issuer" description of a DER certificate, for logs. Best effort.
++pub(crate) fn describe_cert(der: &[u8]) -> String {
++    match Certificate::from_der(der) {
++        Ok(c) => format!(
++            "subject=[{}] issuer=[{}]",
++            c.tbs_certificate.subject, c.tbs_certificate.issuer
++        ),
++        Err(e) => format!("<unparseable {}-byte cert: {e}>", der.len()),
++    }
++}
++
++/// Log a certificate chain at info level under `tag`, one line per cert.
++pub(crate) fn log_chain(tag: &str, certs: &[kmr_wire::keymint::Certificate]) {
++    log::info!("{tag}: {} cert(s) in chain", certs.len());
++    for (i, c) in certs.iter().enumerate() {
++        log::info!("{tag}:   [{i}] {}", describe_cert(&c.encoded_certificate));
++    }
++}
++
+ const ID_EC_PUBLIC_KEY: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
+ const EC_SHA256_SIG_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
+ const RSA_SHA256_SIG_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11");
+@@ -44,6 +63,7 @@ impl Ta {
+     /// Re-sign a real hardware attestation `leaf` (DER) under the keybox with the profile's root of
+     /// trust. Returns the new chain `[patched leaf, keybox chain…]`.
+     pub fn patch_attestation(&self, leaf: &[u8]) -> Result<Vec<Vec<u8>>, OpError> {
++        log::info!("teesim_km: patch_attestation input leaf: {}", describe_cert(leaf));
+         let cert = Certificate::from_der(leaf).map_err(wrap("parse real leaf"))?;
+         let mut tbs = cert.tbs_certificate;
+ 
+@@ -86,6 +106,14 @@ impl Ta {
+         let mut chain = Vec::with_capacity(1 + batch_chain.len());
+         chain.push(patched_leaf);
+         chain.extend(batch_chain.iter().map(|c| c.encoded_certificate.clone()));
++        log::info!(
++            "teesim_km: patch_attestation -> {} cert(s) [patched leaf + keybox {} chain]",
++            chain.len(),
++            if is_ec { "EC" } else { "RSA" }
++        );
++        for (i, c) in chain.iter().enumerate() {
++            log::info!("teesim_km:   [{i}] {}", describe_cert(c));
++        }
+         Ok(chain)
+     }
+ 
+-- 
+2.45.1.windows.1
+

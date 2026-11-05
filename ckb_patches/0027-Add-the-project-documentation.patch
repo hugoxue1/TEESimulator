@@ -1,0 +1,930 @@
+From cecf994af92db645dfd34f6cbf7765d778d6e1ca Mon Sep 17 00:00:00 2001
+From: JingMatrix <jingmatrix@gmail.com>
+Date: Mon, 10 Aug 2026 23:23:10 +0200
+Subject: [PATCH 27/47] Add the project documentation
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A root README covering the control daemon, the profile-based configuration, the
+keybox, and the Gradle build, plus a README for each subproject — the injector,
+the two interceptors, and the Rust TA — explaining how each works. The KeyMint
+interceptor README documents the current attest-key handling: keys with ATTEST_KEY
+purpose minted in the TA, the remote-provisioning denial for target apps, the
+foreign-key forward and startup purge, and caller-uid routing.
+---
+ README.md                | 125 ++++++++++++++++++++++
+ app/README.md            | 118 ++++++++++++++++++++
+ injector/README.md       |  69 ++++++++++++
+ keymint/README.md        | 225 +++++++++++++++++++++++++++++++++++++++
+ keystore/README.md       |  62 +++++++++++
+ rust/teesim-km/README.md | 208 ++++++++++++++++++++++++++++++++++++
+ third_party/README.md    |  47 ++++++++
+ 7 files changed, 854 insertions(+)
+ create mode 100644 README.md
+ create mode 100644 app/README.md
+ create mode 100644 injector/README.md
+ create mode 100644 keymint/README.md
+ create mode 100644 keystore/README.md
+ create mode 100644 rust/teesim-km/README.md
+ create mode 100644 third_party/README.md
+
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..2096177
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,125 @@
++# TEESimulator
++
++*TEESimulator* defeats hardware-backed [Key Attestation](https://developer.android.com/privacy-and-security/security-key-attestation) by serving selected apps from a software KeyMint that runs *inside* the real keystore daemon, while every other key stays on the device's real hardware.
++
++Rather than patch certificates after the fact, it embeds AOSP's own reference KeyMint trusted application ([`kmr-ta`](https://cs.android.com/android/platform/superproject/main/+/main:system/keymint/)) and signs attestations with a user-provided keybox. The certificates are generated the same way a real TEE generates them, so they are internally consistent by construction.
++
++## How it works
++
++A privileged control daemon owns the configuration and the real device identity; the injected native library is a pure crypto-and-routing engine. The daemon launches at boot, harvests the device's real attestation parameters (verified-boot state, patch levels, OS version) from a throwaway hardware key, resolves the configured profiles against the live device, injects the interceptor into the keystore daemon, and pushes the resolved configuration over a local socket. Editing the configuration re-pushes without a reboot.
++
++The daemon that guards keys — and the way apps reach it — changed across Android versions, so the module hooks each generation at the point that suits it, and both paths lead to the same reference TA and keybox:
++
++* *Android 12 and newer* use `keystore2`, which reaches the KeyMint HAL over Binder. The module injects a native library into `keystore2` and PLT-hooks `AIBinder_transact`; a KeyMint transaction for a *targeted app* (or a key the module created) is redirected to a *local, in-process `IKeyMintDevice`* that wraps the TA, and everything else is forwarded to the real hardware.
++* *Android 10 and 11* use the legacy `keystore` daemon, which apps reach over `IKeystoreService`. The module injects into `keystore`, hooks `ioctl` on libbinder, and redirects that service to a local stub handled in-process. For a targeted app it generates the key itself, hands back its public key, and at attestation time imports that key into the TA with the app's challenge, so the TA issues a keybox-signed chain over it. Other callers pass through.
++
++Keys the simulator creates are tagged (Android 12+) or tracked by caller (Android 10/11) so only they are served; real hardware keys are never intercepted. If no keybox is loaded the interceptor stays a no-op, so a misconfigured module is inert rather than a hazard.
++
++### Profiles and device identity
++
++Configuration is organised into **profiles**: a named bundle of a keybox, an operation mode, patch and OS levels, and optional device-identity values (brand, model, IMEI, …), assigned to a set of apps. Each targeted app belongs to exactly one profile, and its attestations are signed and shaped by that profile.
++
++The root of trust — verified-boot key, verified-boot state, device-locked flag — is deliberately *not* configurable. The daemon harvests the device's real values once and freezes them: they make the attested root of trust authentic, and because those fields also seed KeyMint's key-encryption-key derivation, freezing them gives a stable per-device key that keeps stored keys decryptable across reboots.
++
++## Requirements
++
++* *Android 10 or newer*
++* A *64-bit* device — *arm64-v8a* or *x86_64* (the keystore daemon is 64-bit)
++* Root (Magisk, KernelSU, or APatch)
++
++## Installation
++
++1. Flash the module with the root manager and reboot.
++2. Place a hardware-backed `keybox.xml` at `/data/adb/teesim/keybox.xml`.
++3. List the apps to simulate under a profile in `/data/adb/teesim/config.json`, or edit the profile in the WebUI.
++4. Save. The daemon watches the configuration and applies changes live; no reboot is needed.
++
++The module ships a default `config.json` that targets Google Play services and the Play Store. The keybox is private and is never shipped with the module, so until one is placed the interceptor does nothing.
++
++Killing the keystore daemon (`su -c 'kill $(pidof keystore2)'` on Android 12+, `keystore` on 10/11) is the recovery path: a fresh daemon starts clean, with no interception, until the module re-injects it.
++
++## Configuration
++
++Everything lives in `/data/adb/teesim/`, owned and validated by the daemon. The keybox files carry private keys and are never shipped with the module.
++
++### `config.json`
++
++A schema version and a map of named profiles. Each targeted package must appear in exactly one profile:
++
++```jsonc
++{
++  "version": 1,
++  "profiles": {
++    "default": {
++      "keybox": "keybox.xml",                // relative to /data/adb/teesim; must parse (rsa + ecdsa, chains >= 2)
++      "patchLevel": { "system": "today", "vendor": "YYYY-MM-05", "boot": "YYYY-MM-05" },
++      "osVersion": "",                       // empty = harvested | system_property | "16" | "16.0.0" | 160000
++      "brand": "", "device": "", "product": "",
++      "manufacturer": "", "model": "",
++      "serial": "", "imei": "", "meid": "", "imei2": "",
++      "apps": ["com.google.android.gms", "com.android.vending"]
++    }
++  }
++}
++```
++
++Patch and OS levels accept a small mini-language the daemon resolves against the device. `harvested` reuses the value captured from the real TEE at harvest time; `system_property` reads the matching build property from `getprop` and nothing else. Both report *nothing* when their source has no value — the tag is omitted rather than sent as a made-up default. `today` is the current month; `YYYY-MM-DD` / `YYYY-MM` an explicit date; `no` suppresses the level. A date may also use the tokens `YYYY` / `MM` / `DD`, resolved to today, so `YYYY-MM-05` means the 5th of the current month (the shipped default for the vendor and boot patch levels, which tracks the calendar). Device-identity fields fall back to the values captured from the real TEE at harvest, so an app that asks the keystore to attest the device's real ids gets a matching answer; a non-empty field overrides that, and both are omitted only when neither is set. The root of trust is never listed here — it comes from the harvest.
++
++### `keybox.xml`
++
++A keybox carries the private keys and certificate chains the simulator signs with. It must contain *both* an RSA and an ECDSA key (the EC key on NIST P-256), each with a PEM `PrivateKey` and its `CertificateChain`:
++
++```xml
++<?xml version="1.0"?>
++<AndroidAttestation>
++  <Keybox DeviceID="...">
++    <Key algorithm="rsa">
++      <PrivateKey format="pem">-----BEGIN PRIVATE KEY-----...</PrivateKey>
++      <CertificateChain>
++        <Certificate format="pem">-----BEGIN CERTIFICATE-----...</Certificate>
++        <!-- ...intermediate and root... -->
++      </CertificateChain>
++    </Key>
++    <Key algorithm="ecdsa">
++      <PrivateKey format="pem">-----BEGIN EC PRIVATE KEY-----...</PrivateKey>
++      <CertificateChain>
++        <Certificate format="pem">-----BEGIN CERTIFICATE-----...</Certificate>
++      </CertificateChain>
++    </Key>
++  </Keybox>
++</AndroidAttestation>
++```
++
++A profile names its keybox by relative path, so several profiles can sign with different keyboxes. An app that is in no profile is transparent to the module — its keys go straight to the real hardware.
++
++### WebUI
++
++Where the root manager supports it (KernelSU, APatch), the module ships a WebUI that edits profiles without a text editor: create and assign profiles, import and rename keyboxes, choose the operation mode, and set the patch/OS levels and device identity. It also manages the keys the simulator has stored — list, inspect the attestation record, and delete — surfaces the harvest and injection status and live daemon logs, and can download and flash a newer canary build in place.
++
++## Building from source
++
++The build depends on no device: `libbinder_ndk` and `liblog` come from the NDK, and BoringSSL is either resolved at runtime (Android 12+) or built as a static library from the submodule (Android 10/11). It needs only the SDK (for `aidl`) and the NDK.
++
++```sh
++git clone --recurse-submodules <repo> TEESimulator
++cd TEESimulator
++
++export ANDROID_HOME=/path/to/android/sdk        # SDK: aidl, cmake, the daemon's AGP build
++export ANDROID_NDK_HOME=/path/to/android/ndk    # or the newest NDK under $ANDROID_HOME/ndk
++
++./gradlew zipRelease                            # -> out/TEESimulator-<version>-<count>-<hash>-Release.zip
++```
++
++The whole build is one Gradle graph. `zipRelease` (or `zipDebug`, which bundles extra logging) builds the Rust TA, both native interceptors for `arm64-v8a` and `x86_64` (via CMake `externalNativeBuild`), and the control daemon's dex, then assembles the flashable module. With a device attached, `./gradlew installMagisk` (or `installKsu` / `installApatch`) pushes and installs it; append `AndReboot` to reboot after, and set `ANDROID_SERIAL=<serial>` to pick a device when several are connected.
++
++## Project layout
++
++| Path | What it is |
++| --- | --- |
++| `app/` | The Kotlin control daemon: harvests the real device parameters, resolves profiles, injects the interceptor, serves the WebUI, and pushes configuration over the control socket. |
++| `injector/` | A `ptrace`-based tool that loads an interceptor into a running process. |
++| `keymint/` | The Android 12+ interceptor: the `AIBinder_transact` hook and the router that decides, per request, whether to simulate or forward. |
++| `keystore/` | The Android 10/11 interceptor: the libbinder `ioctl` hook and the `IKeystoreService` handler that serves a target's key lifecycle from the TA. |
++| `rust/teesim-km/` | The in-process TA — the reference KeyMint TA wired to BoringSSL and keybox-based attestation, behind a small C ABI. |
++| `module/` | The flashable module: boot service, installer, `sepolicy.rule`, the default configuration, and the WebUI. |
++| `third_party/` | Submodules: the reference KeyMint, the AIDL interfaces, `frameworks/native`, BoringSSL, and LSPlt. |
+diff --git a/app/README.md b/app/README.md
+new file mode 100644
+index 0000000..e418843
+--- /dev/null
++++ b/app/README.md
+@@ -0,0 +1,118 @@
++# app
++
++The privileged **control daemon** — the brain of the module. Everything that needs a real
++Android framework (an attested key to harvest from, `PackageManager` to resolve uids, a
++`Context` to reach keystore) lives here, in a Kotlin process launched by the module's
++`service.sh` via `app_process`. The injected native interceptors stay pure crypto-and-routing
++engines; this daemon owns the configuration, resolves it against the live device, injects the
++interceptor, and pushes the resolved profiles over the `@teesim` control socket. It never sits
++in the keystore hot path.
++
++It builds to a single `classes.dex` (AGP), shipped in the module and run as:
++
++```
++app_process -Djava.class.path=$MODDIR/classes.dex $MODDIR --nice-name=teesim org.matrix.teesim.App $MODDIR
++```
++
++## Bootstrap
++
++A bare `app_process` has no `Application`, no bound `Context`, no `AndroidKeyStore` provider —
++so `App` builds just enough of the framework by hand, in the order the platform requires. It
++waits for a core system service (`ServiceManager
++.waitForService("package")`) so it doesn't race `system_server` at boot, then
++`Looper.prepareMainLooper()`, `ActivityThread.systemMain()`, `getSystemContext()`, wraps that in
++an `Application`, and sets `ActivityThread.mInitialApplication` so `KeyStore
++.getApplicationContext()` works. It installs the R/S+ `AndroidKeyStore` provider and swaps
++Android's stripped `BC` for the bundled full BouncyCastle (ASN.1 parsing). Only then does the
++real work start.
++
++The framework classes it calls are hidden or `@SystemApi`, so they can't be compiled against
++the SDK directly. The sibling **`stub/`** module supplies compile-only stand-ins
++(`ActivityThread`, `ContextImpl`, `ServiceManager`, `SystemProperties`, `IPackageManager`, the
++two `AndroidKeyStoreProvider`s) with the right signatures; at runtime the device's real classes
++resolve instead. `stub/` is `compileOnly` and never shipped.
++
++## The pipeline
++
++Once the framework is up, `App.main` wires the daemon and enters `Looper.loop()`:
++
++1. **`Harvester`** generates a throwaway attested key and reads the leaf's KeyDescription
++   extension (OID `1.3.6.1.4.1.11129.2.1.17`) to capture the device's real attestation
++   parameters — verified-boot key/hash, patch levels, OS version, security levels, and (via
++   `setDevicePropertiesAttestationIncluded`) the device-identity ids. It tries a
++   device-properties attestation first, falls back to a plain one, and only reports a broken TEE
++   if both fail. `verifiedBoot*` are frozen on first success (they seed KeyMint's
++   key-encryption-key derivation, so a changed value would orphan stored keys). IMEI/MEID/serial,
++   which device-properties attestation omits, are read straight from the platform — IMEI/MEID from the
++   `IPhoneSubInfo` binder's legacy `getDeviceIdForPhone`/`getMeidForSubscriber` calls, and the serial
++   from the `ro.serialno` property. The public `TelephonyManager.getImei()`/`Build.getSerial()` paths
++   are deliberately avoided: they enforce a "calling package belongs to caller uid" check the root
++   daemon (uid 0, no package) can never satisfy, whereas the legacy binder calls return the real values
++   regardless of package. The record is cached to `harvested.json`, and each parsed field is logged.
++2. **`ConfigStore`** parses, validates, and `FileObserver`-watches `config.json`; **`Resolver`**
++   turns a validated config plus the frozen harvest, system properties, and the clock into the
++   full-replace `config` message the native lib applies — resolving package names to uids
++   (**`Packages`**), the patch mini-language, and the harvested device ids and security level.
++   **`PackageWatch`** re-resolves and re-pushes on `PACKAGE_ADDED/REMOVED/REPLACED`.
++3. **`Injector`** finds the keystore daemon's pid (`keystore2` on API ≥ 31, `keystore` on 10/11),
++   runs the packaged `inject` binary to load the right interceptor, and re-injects whenever the
++   pid changes; it confirms the library actually checked in over `@teesim` and warns otherwise
++   (usually an SELinux denial on the abstract socket).
++4. **`Control`** connects the `@teesim` abstract unix socket, checks peer credentials, and pushes
++   the resolved config on start and on every change.
++5. **`ReAttest`** runs after each push commits (on the lib's `ack`) to re-root keys that already
++   existed before their app was covered — a key made earlier carries the real hardware attestation
++   (an unlocked root of trust). For each target app it reads that uid's stored attestation leaves
++   from the keystore2 database (**`KeystoreDb.attestedKeys`**, skipping our own keys and any leaf
++   already rooted in the live keybox), asks the lib to re-sign each under the profile's keybox over
++   a `resign` request on the same socket (the same patch the router applies to a fresh key), and
++   writes the patched chain back with **`Keystore2Service.updateSubcomponent`** — the key blob is
++   never touched, so the real hardware key keeps signing; only the certificate the app reads changes.
++   Record-less and idempotent: it re-scans each run, so a keybox swap or a newly installed app
++   self-heals on the next push.
++
++   On the **first** commit only (daemon start), `ReAttest.purgeTargetAttestKeys` additionally
++   **deletes** each target app's *foreign* attestation key — one with `ATTEST_KEY` purpose that is not
++   ours (**`KeystoreDb.deleteTargetAttestKeys`**, scoped hard to the target uid, `PURPOSE=ATTEST_KEY`,
++   and *not* carrying our marker). This exists because of how attest-key delegation works: an
++   attestation key signs the leaves of the keys it attests, and keystore2 appends *that key's own*
++   stored certificate chain (snapshotted at generation, before the HAL call). So a delegated key is
++   only fully spoofable — keybox-rooted chain **and** a patched, locked root of trust *inside the
++   leaf* — when we hold the attest key's private key and sign that leaf ourselves. A real hardware
++   attest key we don't control can only ever sign a leaf carrying the device's genuine, unlocked root
++   of trust, which we cannot re-sign. Deleting the foreign key forces the app to regenerate it, and
++   the router always mints an `ATTEST_KEY`-purpose key in the TA (generation mode, never patched), so
++   the replacement is ours. Our own marked attest keys are left untouched, and the purge runs exactly
++   once at start (an `AtomicBoolean` one-shot), so it never disturbs a key mid-session.
++
++## The WebUI back end
++
++The root-manager WebUI talks to the daemon over a tiny loopback HTTP endpoint, since the daemon
++has a real `Context` and root that the webview alone does not:
++
++- **`KeyAdmin`** — HTTP/1.1 on `127.0.0.1:8790`, gated by a random token in a root-only file
++  (`admin.token`). It serves the WebUI's status, key, keybox, logs, and canary routes.
++- **`KeystoreDb`** — on API ≥ 31, snapshots keystore2's SQLite database and reads the `keyentry`
++  table so the WebUI can list the keys targeted apps actually created (they live in each app's
++  own namespace, which the daemon's `AndroidKeyStore` can't enumerate).
++- **`KeyboxInspector`** — parses a `keybox.xml` and its certificate chains for the WebUI's keybox
++  inspector (subject/issuer/validity/key type/chain linkage).
++- **`Updater`** — canary self-update: checks the rolling `canary-<code>` GitHub prereleases,
++  reports the installed version, and downloads-and-flashes a chosen build through the root
++  manager on request.
++- **`LogTail`** — tails logcat (our `TEESimulator` tag, SELinux `avc` denials, and the injected
++  keystore pid) into a bounded ring buffer the WebUI polls and filters.
++
++## Support
++
++- **`DeviceProps`** — read-only system properties and the integer encodings KeyMint expects
++  (osVersion, patch levels), plus the config patch mini-language resolution.
++- **`Const`** — paths, the control port, and the security-level encodings shared with the native
++  side.
++- **`SystemLogger`** — logcat under the single `TEESimulator` tag the whole module logs to.
++
++## Building
++
++The daemon is one node in the top-level Gradle graph; `./gradlew zipRelease` (or `zipDebug`)
++compiles it to `classes.dex` and assembles it into the flashable module alongside the native
++interceptors and the WebUI. It needs only the Android SDK.
+diff --git a/injector/README.md b/injector/README.md
+new file mode 100644
+index 0000000..d1e6400
+--- /dev/null
++++ b/injector/README.md
+@@ -0,0 +1,69 @@
++# injector
++
++`inject` is a standalone native executable that runs our code inside a process we don't own. The keystore daemon (`keystore2` on API ≥ 31, legacy `keystore` on API 29–30) is a system service we can't recompile or restart with our flags, but our KeyMint/keystore interceptors have to live *in its address space* to hook its Binder handling. `inject` puts them there: it attaches with `ptrace`, loads a shared object into the running daemon, calls the library's `entry()`, and detaches — leaving the daemon running as if nothing happened, now with our hooks installed.
++
++The control daemon drives it in a loop: `inject <pid> <library.so> entry`, re-running each time the keystore daemon's pid changes (it restarts often, and each restart drops our library). The library it loads is `libteesim_keymint.so` or `libteesim_keystore.so`; both export `entry(void*)`.
++
++## Remote calls
++
++Everything here is built on one primitive: calling an arbitrary function *in another process*. `remote_call` in [`utils.cpp`](utils.cpp) does it.
++
++After `PTRACE_ATTACH` the target stops with `SIGSTOP`; we `wait_for_trace` for that, then `get_regs` to snapshot every register (`backup_regs`). To call `f(a, b, …)` we take a working copy of those registers and rewrite them: arguments go into the ABI's argument registers (`rdi/rsi/…` on x86_64, `x0–x7` on arm64, `r0–r3` on arm — see `setup_*_args`), overflow arguments and any pushed structs/strings go on the target's own stack, `REG_IP` (the program counter) is pointed at `f`, and — the key part — we set a **return address we control**. `set_regs` writes this back, `PTRACE_CONT` resumes the target, and it runs `f` for us.
++
++The return address is not real code. `find_module_return_addr` walks the target's maps and returns the start of a **readable, non-executable** page of `libc.so`. On x86_64 we push it on the stack (what a `call` would do); on arm64/arm we load it into the link register (`x30`/`r14`). When `f` finishes and returns *there*, the CPU tries to fetch an instruction from a non-executable page and faults with `SIGSEGV`, faulting address == our return address. That fault is exactly the event that hands control back to us: `waitpid` returns, and `remote_post_call` confirms a clean return by checking `REG_IP == expected_return_addr` (any *other* stop address means `f` crashed somewhere real — it logs `PTRACE_GETSIGINFO` and bails). The function's result is read straight out of `REG_RET` (`rax`/`x0`/`r0`). This is why the "return address" must be a page that exists but can't run: the fault is the signal, not an error.
++
++`remote_pre_call` / `remote_post_call` are the same thing split in two, used once — for `recvmsg`, where we need to leave the target *parked inside* the call while we act from the outside.
++
++Supporting pieces in [`utils.cpp`](utils.cpp):
++
++- `read_proc` / `write_proc` — move bytes across the process boundary with [`process_vm_readv`](https://cs.android.com/android/platform/superproject/main/+/main:bionic/libc/include/sys/uio.h) / `process_vm_writev` (write can fall back to `/proc/<pid>/mem`). No word-at-a-time `PTRACE_PEEK`.
++- `push_memory` / `push_string` — reserve space on the target's stack (decrement `REG_SP`, 16-byte align, write). Return the remote address so it can be passed as a pointer argument.
++- `find_func_addr` — resolves a remote function without symbols in the target. It `dlopen`s the *same* module locally, `dlsym`s the symbol, computes its offset from the local module base, and adds that offset to the module's base **in the target** (found via LSPlt maps). ASLR randomizes the load base but not the internal layout, so the offset is identical across processes — as long as both map the same `libc.so`, which they do (it's the system one).
++
++`REG_SP`, `REG_IP`, `REG_RET` and friends are macros in [`utils.hpp`](include/utils.hpp) that paper over the per-arch register names in `user_regs_struct`.
++
++## Loading the .so
++
++A system process runs under a **restricted linker namespace**. Its dynamic linker will refuse to `dlopen` a path under `/data` no matter what the file permissions say — the namespace's allowed search paths simply don't include it, and the linker rejects the path before it ever opens the file (its `is_accessible` gate matches the path against the namespace's `permitted_paths_` / `default_library_paths_` — see [`linker_namespaces.cpp`](https://cs.android.com/android/platform/superproject/main/+/main:bionic/linker/linker_namespaces.cpp)). So we can't hand `keystore2` a path to our library.
++
++The way around it is `android_dlopen_ext` with [`ANDROID_DLEXT_USE_LIBRARY_FD`](https://cs.android.com/android/platform/superproject/main/+/main:bionic/libc/include/android/dlext.h): give the linker an already-open file descriptor and it loads the ELF from that fd, skipping the path/namespace check entirely. The catch is that the fd has to be valid *in the target's* file table. `transfer_fd_to_remote` gets it there over a Unix socket using `SCM_RIGHTS` (the kernel's fd-passing mechanism — it duplicates the sender's open file into the receiver's table). The dance:
++
++1. Resolve `socket`, `bind`, `recvmsg`, `close`, `__errno` in the target's libc.
++2. Remote-call `socket(AF_UNIX, SOCK_DGRAM)` so the target creates the receiving socket **itself** — meaning it lives in keystore's own SELinux domain and credentials, which is what makes the transfer legal.
++3. Bind it to an **abstract** address (`sun_path[0] == '\0'`, random 16-char magic after). Abstract sockets have no filesystem entry, so there's no directory to be denied traversal on; they're scoped to the network namespace, which injector and target share.
++4. Push a `cmsghdr` buffer and `msghdr` onto the target's stack and start `recvmsg(fd, …, MSG_WAITALL)` with `remote_pre_call` — this leaves the target **blocked inside `recvmsg`**, waiting for a datagram.
++5. From the injector, `sendmsg` to that abstract address with the local library fd attached as `SCM_RIGHTS`. The kernel installs a copy in the target.
++6. `remote_post_call` finishes the parked `recvmsg`; we `read_proc` the control buffer back out of the target's memory and parse the `SCM_RIGHTS` cmsg to learn the fd *number the target received*. That number is what we pass to `android_dlopen_ext`.
++
++`get_remote_errno` is worth knowing: bionic's `errno` is thread-local, so to read it we remote-call `__errno` (which returns `&errno`) and then `read_proc` the int at that address. That's how the error logs here carry real errno values from calls that happened in another process.
++
++Once `dlopen` succeeds the transferred fd has done its job; `RemoteLibraryHandle`'s destructor remote-calls `close` on it so it doesn't leak in the daemon.
++
++### Staging fallback
++
++If the fd transfer fails — a seccomp filter blocks `recvmsg`/`SCM_RIGHTS`, or the functions won't resolve — `inject_via_staging` copies the library to `/data/local/tmp/lib<magic>.so`, `chmod`s it `0644`, and remote-calls plain `dlopen(path, RTLD_NOW)`. `ScopedFileDeleter` `unlink`s the file immediately after; the inode stays alive because the target has it mapped. This only works where the daemon's namespace is loose enough to `dlopen` a `/data/local/tmp` path — true on Android 10/11's `keystore`, **not** on `keystore2`, whose namespace rejects it. On keystore2, fd passing is the only path that works.
++
++## Loading order and the entry contract
++
++`inject_library` in [`main.cpp`](main.cpp) is the orchestrator. Read the RAII objects as the real control flow — they encode the ordering the injection depends on:
++
++- `PtraceAttachment` — attach on construct, detach on destruct.
++- On x86_64, `current_regs.rsp -= 128` up front to step over the **red zone** (128 bytes below `rsp` that the interrupted function may still be using) before we start pushing.
++- `RegisterRestorer` holds `backup_regs` and restores them on scope exit, so the target resumes at the exact instruction it was interrupted on.
++- An explicit inner `{ }` block wraps the work so that `RemoteLibraryHandle` (which remote-calls `close`) destructs **before** `RegisterRestorer` runs — the fd cleanup needs the target still attached and its registers still in our working state.
++
++The loaded library must export `extern "C" bool entry(void*)`. `remote_find_entry` `dlsym`s it in the target, `remote_call_entry` calls it with the `dlopen` handle as its single argument and logs the return value. We never `dlclose` — the library stays resident. `get_remote_dlerror` reads the target's `dlerror()` string (via remote `dlerror` + `strlen` + `read_proc`) so failed loads report a real reason.
++
++One sharp edge: `inject` reports success once `entry` has been *called*, regardless of what `entry` returns. `remote_call_entry` always returns `true`. So if `entry()` itself fails, `inject` still exits 0, and the control daemon treats that pid as covered. "Injection succeeded" means "the library loaded and `entry` ran," not "the hooks are live" — so the daemon confirms separately by waiting for the library to check in over the `@teesim` control channel, and logs a warning if it never does.
++
++## LSPlt usage
++
++LSPlt is linked in, but only `lsplt::MapInfo::Scan()` is used — it parses `/proc/<pid>/maps` into `{start, end, perms, offset, path}` records. That feeds `find_module_base`, `find_func_addr`, and `find_module_return_addr`. The PLT/GOT rewriting LSPlt is actually built for happens later, **inside** the injected interceptors — not in this tool.
++
++## Files
++
++- [`main.cpp`](main.cpp) — the injection orchestration: `transfer_fd_to_remote`, `remote_dlopen`, `remote_find_entry`, `remote_call_entry`, `inject_via_staging`, and the RAII guards, plus `main`'s argument validation (`realpath` the library, check readability, parse pid).
++- [`utils.cpp`](utils.cpp) / [`include/utils.hpp`](include/utils.hpp) — the ptrace primitives: register get/set, remote memory read/write, stack pushing, `remote_call`, symbol/base/return-address resolution, `UniqueFd`, magic-string generation, and status/signal parsing. The header also declares helpers (`remote_mmap`, `switch_mnt_ns`, `do_syscall`, …) that aren't on the injection path — don't assume everything declared is exercised by `inject`.
++- [`include/logging.hpp`](include/logging.hpp) — pulls in the shared [`logging.hpp`](include/logging.hpp) and sets `LOG_TAG`.
++
++Builds as the `inject` target in the top-level `CMakeLists.txt` (`-static-libstdc++`, linked against `lsplt` and `log`). Cross-builds per ABI; nothing device-specific at build time.
+diff --git a/keymint/README.md b/keymint/README.md
+new file mode 100644
+index 0000000..d3c5974
+--- /dev/null
++++ b/keymint/README.md
+@@ -0,0 +1,225 @@
++# keymint
++
++The Android 12+ interceptor. It runs as a shared library injected into `keystore2`
++and steers KeyMint transactions to an in-process software KeyMint backed by the
++keybox, while leaving every other key on the real hardware.
++
++On Android 12 and newer, `keystore2` doesn't hold KeyMint in-process — it talks to a
++KeyMint HAL over Binder. That's the seam we splice into.
++
++## Interception point
++
++The obvious move would be to hand `keystore2` a different binder when it resolves
++KeyMint. Too late: `keystore2` resolves the KeyMint HAL once at boot and caches the
++binder for the life of the process (see [`get_keymint_device` in keystore2's `globals.rs`](https://cs.android.com/android/platform/superproject/main/+/main:system/security/keystore2/src/globals.rs),
++which memoizes each connection in a `LazyLock` device map), and it does that *before* we're injected. There
++is no resolution call left to intercept.
++
++So we intercept the traffic instead. [`keymint_hook.cpp`](keymint_hook.cpp) PLT-hooks
++`AIBinder_transact` — the one NDK function every outbound Binder call funnels
++through. `HookedTransact` inspects each call and, when it's a KeyMint request we care
++about, re-dispatches it to a local binder we own. Everything else calls
++`real_transact` (the saved original) and is none the wiser.
++
++Two tests gate a call. `IsHandled(code)` matches the transaction codes we simulate —
++`3` generateKey, `4` importKey, `5` importWrappedKey, `6` upgradeKey, `7` deleteKey,
++`10` begin, `13` convertStorageKeyToEphemeral, `14` getKeyCharacteristics. (These are
++the [AIDL method ordinals](https://cs.android.com/android/platform/superproject/main/+/main:hardware/interfaces/security/keymint/aidl/android/hardware/security/keymint/IKeyMintDevice.aidl),
++matching the method declaration order in `IKeyMintDevice.aidl`; the AIDL compiler numbers methods from `1` after the
++reserved metadata slots.) `IsKeyMintProxy(binder)` confirms the target is actually
++the KeyMint proxy and not some other service sharing the `AIBinder_transact` call
++site: it checks `AIBinder_isRemote` and compares the binder's class descriptor
++against `IKeyMintDevice::descriptor`. The descriptor is the interface's fully-qualified
++name string, stamped on every binder of that type, so it's a reliable identity check.
++
++## Re-dispatching the transaction
++
++We cannot take `keystore2`'s parcel and feed it to our own local binder.
++`AIBinder_transact` rejects a parcel that wasn't created by `AIBinder_prepareTransaction`
++for *that specific* target binder — the parcel carries a header bound to its intended
++recipient.
++
++That header is the interface token. Every AIDL transaction parcel begins with a fixed
++preamble (a strict-mode policy word, then the interface descriptor string) that the
++receiving stub reads back and validates before touching the payload (written by
++[`Parcel::writeInterfaceToken`, checked by `Parcel::enforceInterface`](https://cs.android.com/android/platform/superproject/main/+/main:frameworks/native/libs/binder/Parcel.cpp)). `prepareTransaction`
++writes this preamble; the arguments are marshalled after it. Two parcels prepared for
++two binders of the *same* interface get byte-identical headers, only the payload
++differs.
++
++`Redirect` exploits that. It calls `AIBinder_prepareTransaction(local, &my_in)` to get
++a fresh parcel already carrying the correct header for our local device, then measures
++that header's length with `AParcel_getDataSize(my_in)` before writing anything else —
++call it `hdr`. It reads the incoming parcel's full length as `total`, and copies the
++payload across with [`AParcel_appendFrom`](https://cs.android.com/android/platform/superproject/main/+/main:frameworks/native/libs/binder/ndk/parcel.cpp):
++
++```
++AParcel_appendFrom(*in, my_in, hdr, total - hdr)
++```
++
++That copies `keystore2`'s request bytes starting at offset `hdr` (skipping its header,
++which is identical to ours) for the remaining `total - hdr` bytes, appending them right
++after our header. The result is a valid parcel for `local` holding the original
++arguments. We dispatch it with `real_transact(local, code, &my_in, out, flags)`.
++
++One ownership detail: `AIBinder_transact` takes ownership of the input parcel and frees
++it (see [ibinder.cpp](https://cs.android.com/android/platform/superproject/main/+/main:frameworks/native/libs/binder/ndk/ibinder.cpp),
++where the input parcel is wrapped in an `AutoParcelDestroyer`). Our hook stands in for that call, so callers still expect their `*in` to be consumed.
++`real_transact` frees `my_in`; we then `AParcel_delete(*in)` and null it ourselves to
++honor the same contract. Skip that and a parcel leaks per KeyMint call.
++
++If anything in the setup fails — `prepareTransaction`, a short parcel, `appendFrom` — we
++fall back to `real_transact(proxy, …)` on the original binder, so a redirect that can't
++be built degrades to normal behavior rather than breaking the call.
++
++## Simulate or forward
++
++[`keymint_router.cpp`](keymint_router.cpp) defines the local binder, `TeesimKeyMintDevice`, a
++`BnKeyMintDevice` that also holds a `shared_ptr<IKeyMintDevice>` to the *real* HAL
++(reconstructed from the cached proxy binder via `IKeyMintDevice::fromBinder`). It's
++created lazily per proxy and cached in `g_local_for_proxy`.
++
++Being a `Bn…` server means the generated AIDL stub unmarshals the parcel we handed it
++into typed C++ arguments and calls the matching method — `generateKey`, `begin`, and so
++on. We never parse raw parcels here; we work with `KeyParameter`, `KeyCreationResult`,
++`BeginResult`. That's the whole reason we build the AIDL: the `Bn` base classes do the
++marshalling, so the router is ordinary typed C++.
++
++Each method decides for itself whether to simulate or forward:
++
++- **Creation** (`generateKey`, `importKey`) acts only for an app assigned to a profile.
++  `ProfileForRequest` scans the key parameters for `ATTESTATION_APPLICATION_ID` and matches
++  its value against each profile's package names; a request with no attestation app id is
++  never a target — an app not asking for attestation has no reason to be handled — and
++  non-targets forward to the real HAL untouched. For a target, the profile's mode decides
++  *how* (see [Patch and generation modes](#patch-and-generation-modes)).
++- **Operations on an existing key** (`begin`, `deleteKey`, `upgradeKey`,
++  `getKeyCharacteristics`) route by the blob. `IsOurs(keyBlob)` calls
++  `teesim_km_is_marked`: keys the TA mints carry a blob prefix, so later operations on
++  them come back to us, while real TEE blobs fail the check and forward. This is what
++  keeps a simulated key working end-to-end (generate → begin → update → finish) without
++  us having to track handles across calls.
++- **Everything else** (`addRngEntropy`, `deviceLocked`, root-of-trust calls,
++  `importWrappedKey`, `convertStorageKeyToEphemeral`, …) forwards. Note that a few of
++  these are in `IsHandled` and so pass through the local device, but the local device
++  just relays them to the real HAL; they're intercepted for uniformity, not simulated.
++
++The method bodies translate between the AIDL types and the TA's flat C ABI
++([`teesim_km.h`](../rust/teesim-km/include/teesim_km.h)): `ToKm`/`FromKm` convert a `KeyParameter` to/from a `KmParam`, using the
++tag's top nibble (`kTagBool`, `kTagBytes`, `kTagUlong`, …) to pick the active union
++member. `TeesimKeyMintOperation` wraps a TA operation handle and aborts it in the
++destructor if `finish` never ran, so a dropped operation doesn't leak state in the TA.
++
++### Patch and generation modes
++
++A target key is created one of two ways, chosen per profile:
++
++- **Generation** mints the whole key in the TA and keybox-signs a fresh attestation. The
++  key never touches the real hardware; `IsOurs` later routes its operations back to us. This
++  is the fallback whenever the real hardware can't be used.
++- **Patch** (the default, fewer detection points) forwards `generateKey` to the real HAL, so
++  the key is genuinely hardware-backed and its attestation carries authentic KeyMint content
++  (real version, real tee-enforced authorizations). We keep that **real key blob** unchanged
++  — later operations forward to the real HAL — and only **re-sign the attestation leaf** under
++  the keybox with the root of trust patched to locked/Verified (`teesim_km_patch_attestation`,
++  implemented in [`resign.rs`](../rust/teesim-km/src/resign.rs)). Patch needs working hardware
++  at the request's level; a level whose hardware can't attest falls back to generation.
++
++`PatchAttest` is the forward-plus-re-sign path; if the real HAL declines or returns no
++attestation, it falls back to `Simulate` (generation) so a target key is always produced.
++
++The same re-sign is exposed to the daemon as `teesim_cfg_resign` (see [control.h](../common/control.h)):
++after a config push commits, the daemon re-attests keys that already existed before their app was
++covered by handing each one's real leaf back over the `@teesim` channel and writing the returned,
++keybox-rooted chain into the keystore. The re-sign is identical to a fresh patch — it keeps the real
++key blob and only re-roots the certificate.
++
++Attestation keys need special handling — a spoofed leaf is only convincing if the key that signed
++it is also ours — as does StrongBox:
++
++- **Creating an attestation key** (`ATTEST_KEY` purpose) is always minted in the TA
++  (`IsAttestKeyRequest` → `Simulate`, ignoring any attest key keystore2 injected), so we hold its
++  private key and can patch the root of trust of every leaf it later signs. An app usually creates
++  its attest key *unattested* (no challenge, no app id), so it is routed to its profile by caller
++  uid (`ProfileForRequest`'s uid fallback) rather than by name.
++- **Denying remote provisioning.** On TrustedEnvironment, keystore2 resolves a real,
++  remote-provisioned (RKP) key to attest a target app's new attest key and appends that key's
++  Google-rooted chain — which the app can read straight off the `generateKey` reply, too late for
++  any later fix. The hook fails keystore2's own outbound `IRemoteProvisioning.getRegistration`
++  transact for a target uid, so on a hybrid device keystore2 falls back to *no* attest key and
++  appends nothing, leaving the TA's keybox-rooted chain intact. It is scoped to target uids
++  (`teesim_is_target_uid`, and the resolution runs on the app's binder thread so `getCallingUid`
++  is the app's) and gated on `remote_provisioning.tee.rkp_only`, which is only *read*, never
++  written — a global property change would be an obvious detection point.
++- **A foreign attest key on a leaf** — one an app made before we covered it — is forwarded to the
++  real HAL (its leaf keeps the real root of trust). The durable fix is that attest keys are now
++  ours, so once regenerated the app takes the "ours" path; the startup purge deletes any
++  pre-existing foreign attest key to force that regeneration.
++- **StrongBox.** keystore2 resolves separate TEE (`/default`) and StrongBox (`/strongbox`)
++  KeyMint proxies; both are hooked, each wrapped by a local device reporting its real level.
++  A device with a real TrustedEnvironment always *offers* StrongBox, but an unlocked dev unit
++  may have a broken StrongBox that can't attest — `g_strongbox_ok` (harvested) gates patch at
++  the StrongBox level, forcing generation there when it's broken.
++
++### Per-level attestation identity
++
++The record's security level and KeyMint version must match the HAL the request came through:
++a StrongBox key claims StrongBox and that HAL's version, a TEE key the TEE's. One TA serves
++both proxies, so before each creation the router passes the proxy's level to the TA, which
++overrides both `hw_info.security_level` and `aidl_version` for that one request
++(`override_attestation_identity`) and restores them after. The two versions are harvested from
++throwaway attested keys at each level and carried in the config; a broken StrongBox reuses the
++TEE version. Patch mode gets this for free — it re-signs the real leaf, whose version fields are
++already the hardware's.
++
++### Recursion guard
++
++Forwarding to the real HAL calls `real_->generateKey(…)` etc., which issues an outbound
++Binder call — back through `AIBinder_transact`, back into our hook. Left alone that's
++infinite recursion. A `thread_local bool tls_forwarding` breaks it: `ForwardGuard` sets
++it (via `teesim_hook_set_forwarding`) around every call into the real HAL, and
++`HookedTransact` bails to `real_transact` immediately when it's set. Thread-local, not
++global, because unrelated KeyMint traffic on other threads must still be intercepted
++while one thread is mid-forward.
++
++## Files
++
++- [`keymint_hook.cpp`](keymint_hook.cpp) — the `AIBinder_transact` hook, the KeyMint redirect, the
++  remote-provisioning denial for target apps (`IsRkpProvisioning` / `RkpOnlyTee`), and
++  `teesim_hook_install`,
++  which uses LSPlt to patch the caller's PLT slot for the symbol. It scans `/proc/self/maps`
++  and probes only the main executable first — the binder client that issues the KeyMint call
++  is linked into it, so that is where `AIBinder_transact` is imported — which avoids LSPlt
++  logging a "symbol not found" for every unrelated library. Only if the executable turns out
++  not to import it does it widen to a full ELF scan, so coverage is never lost. Either way it
++  registers on ELF mappings only (the main executable and `.so` files); feed LSPlt a non-ELF
++  mapping (dex, oat, font, apk) and its ELF parser faults.
++- [`keymint_router.cpp`](keymint_router.cpp) — `TeesimKeyMintDevice` / `TeesimKeyMintOperation`, the
++  patch/generation/forward logic (`PatchAttest`, `Simulate`, `IsAttestKeyRequest`), the
++  parcel↔TA translation, per-profile routing (`ProfileForRequest`, by app id then caller uid,
++  carrying each profile's mode), `teesim_is_target_uid` for the RKP denial, and the
++  config-staging C entry points (`teesim_cfg_begin`, `teesim_cfg_add_profile`,
++  `teesim_cfg_commit`) that build a new profile set and swap it in atomically, plus
++  `teesim_router_new_device`.
++- [`keymint_entry.cpp`](keymint_entry.cpp) — `entry()`, what the injector calls. It reads no
++  files: it starts the `@teesim` control server and installs the hook in a no-op state, and
++  the daemon then connects and pushes the resolved profiles (keyboxes included). Until a
++  profile is pushed nothing is simulated — a keystore without configuration is a no-op,
++  not a hazard.
++- [`exports.map`](exports.map) — exposes only `entry`; everything else is hidden so our symbols can't
++  collide with `keystore2`'s.
++- [`libcrypto.syms`](libcrypto.syms) — the BoringSSL symbols the TA needs. In the default build there's no
++  bundled crypto: CMake generates a stub `libcrypto.so` (empty functions with the right
++  SONAME) from this list purely to satisfy the linker, and at runtime `keystore2`'s own
++  `libcrypto` provides the real implementations. The list must stay in sync with what the
++  Rust TA actually calls.
++
++## Integration
++
++The injector (`../injector`) loads this library into `keystore2` and calls `entry()`.
++The device methods call the Rust TA in `../rust/teesim-km` over the [`teesim_km.h`](../rust/teesim-km/include/teesim_km.h) C ABI;
++the TA does the crypto and signs attestations with the keybox. The KeyMint AIDL and the
++`frameworks/native` binder headers are built from the `third_party` submodules at build
++time (see the top-level `CMakeLists.txt`). The Android 10/11 sibling, `../keystore`,
++does the same job for the legacy `keystore` daemon, which apps reach over a different
++Binder path.
+diff --git a/keystore/README.md b/keystore/README.md
+new file mode 100644
+index 0000000..c4050f3
+--- /dev/null
++++ b/keystore/README.md
+@@ -0,0 +1,62 @@
++# keystore
++
++The Android 10/11 interceptor. It runs as a shared library injected into the legacy
++`keystore` daemon and answers a target app's key operations from an in-process software
++Keymaster backed by the keybox, while forwarding every other caller to the real service.
++
++Android 10 and 11 predate `keystore2`/KeyMint. Apps talk to the `keystore` daemon over its
++`android.security.keystore` (`IKeystoreService`) Binder, and the daemon reaches a Keymaster
++HAL beneath it. That app-facing service is the seam we splice into — not the HAL below it.
++
++## Interception point
++
++On this platform we intercept on the **server side**, inside the `keystore` daemon itself,
++rather than swapping a binder the way the keymint interceptor does. Injected into `keystore`,
++we PLT-hook `ioctl` on `libbinder.so` and watch the incoming `BR_TRANSACTION`s the driver
++delivers. For a transaction whose target is the registered `keystore` binder we rewrite the
++target handle to a local stub (transaction code `0xdeadbeef`); the stub hands the parcel to an
++in-process handler that either answers it or reports "not mine", in which case the call is
++replayed to the real service untouched. Hooking `ioctl` (not a service method) means we see
++every transaction the daemon receives regardless of which `IKeystoreService` method it is.
++
++Only ELF mappings are hooked, and only the one whose path ends in `/libbinder.so` — the driver
++calls funnel through that single library, so there is nothing to gain from scanning the rest.
++
++## Simulation
++
++For a target app the key never touches the real Keymaster. The handler
++([`keystore_router.cpp`](keystore_router.cpp)) generates the key pair itself and hands back its
++public key; at `attestKey` it imports that key into the reference TA with the app's challenge, so
++the TA issues a **keybox-signed** attestation over it. The same imported key backs the crypto
++lifecycle — `begin`/`update`/`finish`/`abort` run against the TA operation — so the key is usable
++for signing, not merely for attestation. Non-target callers are forwarded, so unrelated apps keep
++using the real hardware.
++
++Because the legacy `IKeystoreService` methods deliver their results by transacting **back** on a
++callback binder passed in the request (the transaction's own reply is just a status), the handler
++produces each result by calling that callback binder, mirroring what the real daemon would do.
++
++The profile set (which apps to simulate, which keybox signs) is pushed from the control daemon
++over the `@teesim` abstract socket; nothing here is read from disk.
++
++## Files
++
++- [`keystore_entry.cpp`](keystore_entry.cpp) — `entry()`, what the injector calls. It starts the
++  control server, installs the `libbinder` `ioctl` hook, and registers the app-facing
++  `android.security.keystore` service so its transactions reach `teesim_ks_handle`. Awaits the
++  config push before simulating anything.
++- [`binder_interceptor.cpp`](binder_interceptor.cpp) — the server-side machinery: the `ioctl`
++  PLT hook, the `BR_TRANSACTION` watch, the target-to-stub rewrite, and the fall-through that
++  replays a declined transaction to the real service.
++- [`keystore_router.cpp`](keystore_router.cpp) — `teesim_ks_handle`, the per-method simulation
++  (key generation, `attestKey`, the begin/update/finish/abort operation lifecycle) against the
++  reference TA, plus the callback-binder result delivery and per-app routing.
++- [`aosp/`](aosp) — the minimal vendored AOSP `libbinder`/`libbase`/`libutils` headers and stubs
++  the interceptor compiles against; the device's real libraries resolve at runtime.
++
++## Building
++
++Built as part of the top-level Gradle graph into `libteesim_keystore.so`, shipped in the module
++and injected by the daemon on Android 10/11. The keymint interceptor
++([`../keymint`](../keymint)) is its Android 12+ counterpart, and both share the reference TA in
++[`../rust/teesim-km`](../rust/teesim-km) and the control channel in `control.*`.
+diff --git a/rust/teesim-km/README.md b/rust/teesim-km/README.md
+new file mode 100644
+index 0000000..07970c2
+--- /dev/null
++++ b/rust/teesim-km/README.md
+@@ -0,0 +1,208 @@
++# teesim-km
++
++The crypto engine. This is the trusted application — the Rust static library that
++actually generates keys, runs cryptographic operations, and signs attestation
++certificates. Both C++ interceptors (`keymint/` on Android 12+, `keystore/` on
++Android 10/11) are plumbing around it: they decode an intercepted KeyMint call,
++hand the pieces to this library, and encode whatever it returns back into the reply.
++There is one engine and two front ends.
++
++What makes the certificates hold up is that this is not a hand-rolled attestation
++faker. It embeds AOSP's own reference KeyMint TA, [`kmr-ta`](https://cs.android.com/android/platform/superproject/main/+/main:system/keymint/ta/src/lib.rs) — the software KeyMint the emulator itself runs — and drives the real KeyMint state machine:
++generateKey, begin/update/finish, key characteristics, the works. The attestation
++extension, the key-usage authorizations, the tag ordering in the record — all of it
++is produced by the same code a real TEE runs, so it is internally consistent by
++construction rather than by our getting a hundred fields right by hand. What we change is
++narrow: the crypto backend underneath it, where the attestation signature comes from, the
++per-request security level and version, and — in patch mode — re-signing a real hardware leaf
++rather than minting one.
++
++## `kmr-ta` wiring
++
++`KeyMintTa::new` (see `lib.rs::Ta::new_ex`) takes four things: `HardwareInfo`, an
++`RpcInfo`, a `crypto::Implementation`, and a device `Implementation`. The daemon resolves
++a profile — keybox, patch/OS levels, and optional device IDs — together with the harvested
++security level and device-wide boot info into a `TaConfig`, and the interceptor hands it to `Ta::new_ex`;
++`Ta::new` is a thin wrapper that supplies historical defaults for the pre-configuration
++state. The device `Implementation` is a bag of trait objects — `kmr-ta` calls back into
++these for anything that a real TA would get from its secure environment. We supply:
++
++- `keys: device::Keys` — `RetrieveKeyMaterial`. The root key material (below).
++- `sign_info: attest::CertSignInfo` — [`RetrieveCertSigningInfo`](https://cs.android.com/android/platform/superproject/main/+/main:system/keymint/ta/src/device.rs;l=112). The attestation
++  signing keys, loaded from the profile's keybox.
++- `attest_ids` — `RetrieveAttestationIds`. `Some(device::AttestIds(...))` when the
++  profile carries device-identity values, so ID attestation vouches for them; `None`
++  otherwise, which declines ID attestation.
++- `rpc: device::NoRpc` — `RetrieveRpcArtifacts`. Stubbed; RKP is never routed here.
++- `bootloader: BootloaderDone`, `tup: TrustedPresenceUnsupported` — stock kmr-ta
++  markers meaning "bootloader has finished" and "no trusted user presence."
++- `sdd_mgr: None`, `sk_wrapper: None`, `legacy_key: None` — no secure-deletion store
++  (so rollback-resistant keys are declined), no secure key wrapper, no legacy blob format.
++
++The crypto `Implementation` (`lib.rs::crypto_impls`) is every primitive wired to the
++BoringSSL backend — `BoringAes`, `BoringRsa`, `BoringEc`, `BoringHmac`, and so on —
++plus `device::Clock`, a `MonotonicClock` backed by `CLOCK_BOOTTIME`.
++
++## Stable key-encryption keys
++
++KeyMint does not store key blobs in the clear. It wraps each one under a
++key-encryption key that it [*derives*](https://cs.android.com/android/platform/superproject/main/+/main:system/keymint/common/src/keyblob.rs), and the derivation inputs are the root key
++material and the verified-boot root of trust. keystore2 persists those wrapped blobs
++in its SQLite database and hands them back on later boots for begin/finish.
++
++If a KEK-derivation input changes between the boot that created a blob and the boot
++that uses it, the derived KEK is different and the blob **fails to decrypt** — every
++key a targeted app made in a previous session becomes permanently unusable, with no
++error that points at the cause. So both inputs are held stable:
++
++- The root key material is constant: `device::Keys::root_kek` returns a fixed all-zero
++  HMAC key, `kak` a fixed all-zero AES-256 key, and `unique_id_hbk` a fixed literal.
++  They are the same on every device and must never be made random or device-derived.
++- The verified-boot root of trust is device-wide and **frozen**. `Ta::new_ex` passes the
++  `verified_boot_key`, `verified_boot_hash`, `device_boot_locked`, and
++  `verified_boot_state` from the `TaConfig` to `set_boot_info`; the daemon harvests these
++  from the device's real attestation once and never rewrites them. They are therefore the
++  same across reboots and identical for every profile, which is what makes a blob
++  cross-decryptable no matter which profile's TA created it.
++
++Because the root of trust is authentic and frozen rather than zeroed, the attested value
++matches a real locked, verified device *and* the KEK stays put. The remaining record
++fields — `boot_patchlevel` on `set_boot_info`, and the OS and patch levels on
++`set_hal_info` — also come from the `TaConfig` but do not feed the KEK, so a profile can
++carry its own patch levels without orphaning stored blobs. Before the daemon pushes a
++profile, `Ta::new`'s defaults stand in a zeroed root of trust as a placeholder.
++
++## Keybox
++
++[`attest.rs`](src/attest.rs) parses the `keybox.xml` (via `roxmltree`) into two `AlgoInfo`s: the
++`<Key algorithm="rsa">` and `<Key algorithm="ecdsa">` batch signing keys, each a
++PEM-decoded private key plus its full certificate chain. `CertSignInfo` implements
++`RetrieveCertSigningInfo`, so when `kmr-ta` needs to sign an attestation it asks for
++the RSA or EC key by `algo_hint` and gets the batch key and chain back. There is no
++built-in fallback key: if the keybox is missing, malformed, lacks either algorithm,
++or a chain has fewer than two certs, `Ta::new` returns `Err` and the interceptor
++declines to install its hook (a misconfigured module becomes a no-op, not a hazard).
++Two field facts baked in: the EC batch key is assumed NIST **P-256** (what real
++keyboxes ship), and each key must carry at least a leaf plus a root.
++
++## Patch-mode re-signing
++
++Generation mints a key and its attestation entirely here. **Patch mode** instead keeps a real
++hardware key and only re-roots its attestation: the interceptor forwards `generateKey` to the
++real HAL, then hands the real leaf to [`resign.rs`](src/resign.rs)
++(`teesim_km_patch_attestation`), which re-signs it under the keybox with the root of trust
++patched to the profile's locked/Verified value and returns `[patched leaf, keybox chain]`. The
++real key blob is kept untouched, so the key stays hardware-backed and its authentic KeyMint
++attestation content (challenge, versions, tee-enforced authorizations) survives — only the root
++of trust and the signing root change.
++
++`kmr-ta`'s certificate assembly is private, so this re-implements just the surgery it needs:
++`x509-cert` parses and rebuilds the leaf (new issuer, keybox signature algorithm, patched
++extension), a small hand-written DER splice replaces the `RootOfTrust` (which sits under a
++high-number `[704]` context tag `x509-cert` can't address), and the signature is produced by the
++same `BoringEc`/`BoringRsa` backend and keybox key generation uses. The target root of trust is
++built once in `Ta::new_ex` from the same boot info generation feeds `kmr-ta`, so both modes
++report an identical one. `Ta` therefore retains a clone of `CertSignInfo` (the batch key
++`kmr-ta` also owns but doesn't expose) alongside the precomputed `patch_rot`.
++
++## Per-request attestation identity
++
++One `Ta` serves both the TEE and StrongBox proxies, so the record's security level and KeyMint
++version are set per request rather than at construction. Each creation passes the requesting
++HAL's level; `ops.rs::override_attestation_identity` sets `hw_info.security_level` and
++`aidl_version` (the version harvested at that level, held on the `Ta`) for that one call and
++restores them after. The `security_level`/`aidl_version` getters and setters this needs are added
++to `kmr-ta` by [`patches/kmr-ta-seclevel.patch`](../patches/kmr-ta-seclevel.patch), applied the
++same idempotent way as the BoringSSL patch below.
++
++## BoringSSL backend
++
++The crypto backend is `kmr-crypto-boring`, the reference backend, but it normally
++builds under Soong against `bssl-sys`. We build under Cargo against `openssl-sys`,
++so [`build.sh`](../build.sh) applies [`patches/kmr-crypto-boring.patch`](../patches/kmr-crypto-boring.patch) to the submodule working
++tree (idempotently — it reverse-checks before applying) to drop the `#[cfg(soong)]`
++paths and the `i32` key-length narrowing that BoringSSL's `openssl-sys` binding
++doesn't need. `openssl-sys` with the `bindgen` feature generates the FFI straight
++from BoringSSL's headers at build time, which is why the build needs only
++`$BORINGSSL/include`, no `libcrypto` of any ABI.
++
++The output is `libteesim_km.a` — a **staticlib**, nothing more. It records a link
++directive for `libcrypto` but never links one. Resolving `libcrypto` is the
++interceptor's job, and it differs by platform:
++
++- **keystore2 (Android 12+):** `libcrypto.so` already lives in the host process, so
++  the interceptor links only a stub `.so` with the right SONAME and lets the host's
++  real BoringSSL satisfy the symbols at load time.
++- **Android 10/11:** the platform's `libcrypto` is too old to have the functions
++  this backend calls, so the interceptor bundles a modern **static** BoringSSL into
++  its own `.so` instead.
++
++Build one ABI with [`rust/build.sh`](../build.sh) (`ABI=arm64-v8a API=34 ./build.sh` by default);
++it drives `cargo ndk`.
++
++## C ABI
++
++The interceptors are C++; the TA is Rust; CBOR lives only on the Rust side. The
++boundary ([`include/teesim_km.h`](include/teesim_km.h), implemented in [`ffi.rs`](src/ffi.rs) + [`capi.rs`](src/capi.rs)) is therefore
++flat C with opaque handles, so the C++ never has to understand a `kmr_wire`
++encoding:
++
++- Handles it holds but can't inspect: `Ta` (the boxed TA), `TsCreationResult`
++  (generate/import output), `TsBeginResult`, `TsCharacteristics`.
++- `KmParam` — a KeyMint `KeyParameter` flattened to `{ tag, int_value, blob,
++  blob_len }`. The tag's top-nibble type bits decide which field is live, so C++
++  copies one union arm without knowing the tag catalog.
++- Per-method entry points (`teesim_km_generate_key`, `teesim_km_begin`,
++  `teesim_km_update`, `teesim_km_finish`, …), each returning `0` or a negative
++  KeyMint error code, plus accessor functions to walk the result handles field by
++  field. Output handles/buffers are written only on success and must be freed with
++  their matching `teesim_km_free_*`.
++- [`ffi.rs`](src/ffi.rs) also exposes `teesim_km_process`: feed it a raw serialized `kmr_wire`
++  request and get the raw response, for any method without a dedicated shim.
++
++**Every** entry point wraps its body in `catch_unwind`. Unwinding a Rust panic
++across an `extern "C"` boundary is undefined behavior, and this code runs *inside*
++keystore — a panic that escaped would take the daemon down. `catch_unwind` turns a
++panic into a null handle or an error code instead. `teesim_km_init` also installs a
++panic hook that logs to logcat under the `TEESimulator` tag.
++
++## Wire format and tag numbers
++
++`kmr_wire` is the CBOR request/response schema `kmr-ta` speaks. `Ta::process`
++([`lib.rs`](src/lib.rs)) takes a serialized request and returns a serialized response;
++`ops.rs::perform` builds those messages the way kmr-hal frames its channel — request
++is `[opcode, req]`, reply is `[error_code, [[op_type, rsp]]]` — so any new
++method must mirror that framing exactly or the response decode fails.
++
++Translation between `KmParam` and `kmr_wire::KeyParam` (`capi.rs::to_keyparam` and
++`owned_param`) is done through `kmr_wire`'s own `AsCborValue` codec, not by hand.
++`to_keyparam` builds the CBOR `[tag, value]` pair and lets `KeyParam::from_cbor_value`
++key off the tag to pick the value type; `owned_param` runs it back the other way.
++That's the reason the numeric tag values in `KmParam` must equal KeyMint's — the
++decoder dispatches on the tag, and a wrong number is silently the wrong type.
++
++Key blobs get a routing marker so the interceptor can tell ours apart from the real
++TEE's. `BLOB_MARKER` is `b"TEESIMkm\x00"`. [`ops.rs`](src/ops.rs) applies it to every blob the TA
++hands out (`marked_result`, `upgrade_key`) and strips it before every blob goes back
++in (`begin`, `delete_key`, `get_key_characteristics`, the attestation key). The
++marker must not collide with km_compat's reserved prefixes (`pKMblob\0`,
++`pKMblob\1`, `SoftKeyMintForV1Blob`); the interceptor checks a blob's prefix to
++decide simulate-vs-forward, so a stored key made by us is still served by us on the
++next boot.
++
++## Files
++
++- [`src/lib.rs`](src/lib.rs) — builds the `Ta`: crypto backend, device traits, fixed boot/HAL info;
++  the blob marker and CBOR helpers.
++- [`src/device.rs`](src/device.rs) — `RetrieveKeyMaterial` (fixed roots), the `CLOCK_BOOTTIME` clock,
++  stubbed `RetrieveRpcArtifacts`.
++- [`src/attest.rs`](src/attest.rs) — keybox parsing and `RetrieveCertSigningInfo`.
++- [`src/ops.rs`](src/ops.rs) — one function per KeyMint method: build the `kmr_wire` request, run
++  it, decode the typed response, apply/strip the marker; the per-request level/version override.
++- [`src/resign.rs`](src/resign.rs) — patch mode: re-sign a real hardware attestation leaf under
++  the keybox with a patched root of trust (`teesim_km_patch_attestation`).
++- [`src/capi.rs`](src/capi.rs) — the per-method C ABI and the result handles/accessors.
++- [`src/ffi.rs`](src/ffi.rs) — lifecycle (`init`/`destroy`), raw `process`, buffer free, marker
++  check.
++- [`include/teesim_km.h`](include/teesim_km.h) — the C header the interceptors compile against.
++- [`../build.sh`](../build.sh) — `cargo ndk` build for one ABI, plus the BoringSSL patch.
+diff --git a/third_party/README.md b/third_party/README.md
+new file mode 100644
+index 0000000..da33a93
+--- /dev/null
++++ b/third_party/README.md
+@@ -0,0 +1,47 @@
++# third_party
++
++Everything TEESimulator depends on but doesn't author. All of it is a git submodule
++(`git submodule update --init --recursive`), pinned to a specific upstream commit so a
++build is reproducible. Nothing here is edited in git — except one build-time patch,
++called out below.
++
++| Directory | Upstream | Why it's here |
++|---|---|---|
++| `keymint` | [platform/system/keymint](https://android.googlesource.com/platform/system/keymint) | AOSP's reference KeyMint TA (`kmr-ta`) and its BoringSSL crypto backend (`kmr-crypto-boring`). The Rust TA in `../rust/teesim-km` embeds this — it *is* the software KeyMint Cuttlefish runs. **Patched at build time** (see below). |
++| `boringssl` | [boringssl](https://boringssl.googlesource.com/boringssl) (shallow) | The crypto library. Its headers feed the Rust `openssl-sys` bindings on every platform; on Android 10/11 its static `crypto` target is built internally (`add_subdirectory` from the top-level `CMakeLists.txt`) and bundled into the keystore interceptor. |
++| `interfaces` | [platform/hardware/interfaces](https://android.googlesource.com/platform/hardware/interfaces) | The KeyMint / secureclock / sharedsecret **AIDL**. `CMakeLists.txt` runs `aidl --lang=ndk` over these to generate the `Bn…`/`Bp…` stubs the keymint interceptor is built from. |
++| `frameworks-native` | [platform/frameworks/native](https://android.googlesource.com/platform/frameworks/native) | libbinder. The keymint interceptor compiles the NDK binder headers from `libs/binder/ndk`; the C++ binder headers also live here (see the `keystore/aosp` note). |
++| `lsplt` | [JingMatrix/LSPlt](https://github.com/JingMatrix/LSPlt) | PLT/GOT hooking and `/proc/<pid>/maps` parsing — used by the injector and the keymint `AIBinder_transact` hook. |
++
++## Build-time patch
++
++`kmr-crypto-boring` is written to build under AOSP's **Soong** against `bssl-sys`
++(Soong's BoringSSL binding). We build under **Cargo** against `openssl-sys`, so the
++patch drops the `#[cfg(soong)]` paths and an `i32` key-length narrowing that the
++`openssl-sys` binding doesn't need. That's the whole delta — the crypto itself is
++unchanged.
++
++`rust/build.sh` applies it to the `keymint` submodule's **working tree** at build
++time, idempotently: it reverse-checks first (`git apply --reverse --check`) and only
++applies if it isn't already there. Consequence: after a build, `git status` shows
++`third_party/keymint` as *modified* — that's the applied patch, not a mistake, and it
++never gets committed. Reset it with `git -C third_party/keymint checkout .` if a clean
++submodule is needed.
++
++If the dirty-submodule friction ever gets annoying, the alternative is to fork
++`system/keymint`, commit the patch there, and repoint this submodule at the fork — then
++the build needs no patch step at all. This file (and the `.patch`) stay the record of
++exactly what changed.
++
++## `keystore/aosp`
++
++The Android 10/11 interceptor talks to the legacy keystore over the **C++** libbinder,
++which the NDK doesn't ship. It needs two sets of platform headers: binder (from
++`frameworks/native`, which *is* a submodule here) and libutils — `RefBase.h`,
++`String8.h`, `Vector.h`, … — which live in `system/core`, a large repo we don't want to
++submodule for a dozen headers. So `keystore/aosp/include` is a **curated, vendored**
++copy of just those headers, and `keystore/aosp/stub_{binder,utils}.cpp` are **ours** —
++empty definitions carrying the right C++ ABI/SONAMEs so the device's real libraries
++resolve them at runtime. Because it mixes a hand-picked vendoring with our own stubs and
++is tightly coupled to that one interceptor, it lives next to the code that uses it rather
++than under `third_party` (which is submodules only).
+-- 
+2.45.1.windows.1
+

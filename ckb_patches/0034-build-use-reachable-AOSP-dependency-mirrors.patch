@@ -1,0 +1,47 @@
+From fda2341ac100ce760ba57b0a9e7f2f0988d60979 Mon Sep 17 00:00:00 2001
+From: "Phase49.1-main-agent" <hugoxue@auto.ai>
+Date: Fri, 21 Aug 2026 19:49:44 +0800
+Subject: [PATCH 34/47] build: use reachable AOSP dependency mirrors
+
+---
+ .gitmodules                            | 6 +++---
+ docs/APatch_定制适配说明_2026-08-21.md | 2 ++
+ 2 files changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/.gitmodules b/.gitmodules
+index 0b9380f..1b99661 100644
+--- a/.gitmodules
++++ b/.gitmodules
+@@ -3,13 +3,13 @@
+ 	url = https://github.com/JingMatrix/LSPlt
+ [submodule "third_party/keymint"]
+ 	path = third_party/keymint
+-	url = https://android.googlesource.com/platform/system/keymint
++	url = https://mirrors.ustc.edu.cn/aosp/platform/system/keymint
+ [submodule "third_party/interfaces"]
+ 	path = third_party/interfaces
+-	url = https://android.googlesource.com/platform/hardware/interfaces
++	url = https://mirrors.ustc.edu.cn/aosp/platform/hardware/interfaces
+ [submodule "third_party/frameworks-native"]
+ 	path = third_party/frameworks-native
+-	url = https://android.googlesource.com/platform/frameworks/native
++	url = https://mirrors.ustc.edu.cn/aosp/platform/frameworks/native
+ [submodule "third_party/boringssl"]
+ 	path = third_party/boringssl
+ 	url = https://boringssl.googlesource.com/boringssl
+diff --git a/docs/APatch_定制适配说明_2026-08-21.md b/docs/APatch_定制适配说明_2026-08-21.md
+index b235d97..9629fc4 100644
+--- a/docs/APatch_定制适配说明_2026-08-21.md
++++ b/docs/APatch_定制适配说明_2026-08-21.md
+@@ -53,6 +53,8 @@ python build_projects.py --project TEESimulator --type release
+ 
+ Windows 首次编译需要下载 Gradle 9.7。项目 Wrapper 使用已验证可访问的腾讯 Gradle 镜像，并为首次下载保留 120 秒连接超时与 3 次重试，避免 `services.gradle.org` 的 10 秒连接超时。
+ 
++KeyMint、Android interfaces 和 frameworks/native 子模块使用中科大 AOSP 镜像；固定提交与上游 v4.0 完全相同，只替换下载入口，避免本机无法连接 `android.googlesource.com`。
++
+ 本次代码修改没有执行编译、刷入或设备测试；由使用者自行完成。
+ 
+ ## 不要重复踩的坑
+-- 
+2.45.1.windows.1
+

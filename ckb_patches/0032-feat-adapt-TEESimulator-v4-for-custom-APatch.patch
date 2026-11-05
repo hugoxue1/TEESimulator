@@ -1,0 +1,205 @@
+From fdc2daa2dbcda2cc718b12af3f84262f1a50e1df Mon Sep 17 00:00:00 2001
+From: "Phase49.1-main-agent" <hugoxue@auto.ai>
+Date: Fri, 21 Aug 2026 19:37:11 +0800
+Subject: [PATCH 32/47] feat: adapt TEESimulator v4 for custom APatch
+
+---
+ .gitattributes                         |  3 ++
+ app/build.gradle.kts                   | 15 ++++--
+ docs/APatch_定制适配说明_2026-08-21.md | 63 ++++++++++++++++++++++++++
+ module/daemon                          | 32 ++++++++++++-
+ module/module.prop                     |  3 +-
+ 5 files changed, 108 insertions(+), 8 deletions(-)
+ create mode 100644 .gitattributes
+ create mode 100644 docs/APatch_定制适配说明_2026-08-21.md
+
+diff --git a/.gitattributes b/.gitattributes
+new file mode 100644
+index 0000000..9e7a658
+--- /dev/null
++++ b/.gitattributes
+@@ -0,0 +1,3 @@
++*.sh text eol=lf
++gradlew text eol=lf
++module/daemon text eol=lf
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 4fcc3e4..9e182fd 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -37,7 +37,12 @@ abstract class GitExecutor @Inject constructor(private val execOperations: ExecO
+ val gitExecutor = objects.newInstance(GitExecutor::class.java)
+ val gitCommitCount = gitExecutor.execute("git rev-list HEAD --count", rootDir).toInt()
+ val gitCommitHash = gitExecutor.execute("git rev-parse --verify --short HEAD", rootDir)
+-val verName = "v4.0"
++// Keep the private APatch-compatible line visibly distinct from upstream and above
++// the official v4/canary module version codes. Each later commit still increments
++// monotonically, so a newly built ZIP is never reported as a downgrade.
++val customVersionCodeBase = 40_000
++val moduleVersionCode = customVersionCodeBase + gitCommitCount
++val verName = "v4.0-ckb-apatch1"
+ 
+ android {
+     namespace = "org.matrix.teesim"
+@@ -49,7 +54,7 @@ android {
+         applicationId = "org.matrix.teesim"
+         minSdk = 29
+         targetSdk = 36
+-        versionCode = gitCommitCount
++        versionCode = moduleVersionCode
+         versionName = verName
+         externalNativeBuild {
+             cmake {
+@@ -190,7 +195,7 @@ androidComponents {
+ 
+         // Stage per variant so debug and release never clobber each other.
+         val tempModuleDir = layout.buildDirectory.dir("module/${variant.name}")
+-        val zipFileName = "TEESimulator-$verName-$gitCommitCount-$gitCommitHash-$capitalized.zip"
++        val zipFileName = "TEESimulator-$verName-$moduleVersionCode-$gitCommitHash-$capitalized.zip"
+ 
+         // Where AGP leaves this variant's native build: stripped .so under
+         // stripped_native_libs, and the injector executable (never stripped or
+@@ -257,9 +262,9 @@ androidComponents {
+                 from(sourceModuleDir) {
+                     include("module.prop")
+                     expand(
+-                        "REPLACEMEVERCODE" to gitCommitCount.toString(),
++                        "REPLACEMEVERCODE" to moduleVersionCode.toString(),
+                         "REPLACEMEVER" to
+-                            "$verName ($gitCommitCount-$gitCommitHash-${variant.name})",
++                            "$verName ($moduleVersionCode-$gitCommitHash-${variant.name})",
+                     )
+                 }
+ 
+diff --git a/docs/APatch_定制适配说明_2026-08-21.md b/docs/APatch_定制适配说明_2026-08-21.md
+new file mode 100644
+index 0000000..ee9e0fa
+--- /dev/null
++++ b/docs/APatch_定制适配说明_2026-08-21.md
+@@ -0,0 +1,63 @@
++# TEESimulator v4.0 定制 APatch 适配说明
++
++## 基线与分支选择
++
++- 上游基线：`JingMatrix/TEESimulator` 的稳定标签 `v4.0`。
++- 定制分支：`ckb-apatch-v4.0`。
++- 没有直接合并 `dev`/canary。`dev` 在 v4.0 之后仍持续变化，包含控制 socket、WebUI、日志读取等大范围修改，和本次 APatch 启动问题不是同一个边界。
++- 后续如需上游功能，应按提交逐项审查、选择性移植，不能把整个 `dev` 直接覆盖到已验证的定制启动链。
++
++## 根因
++
++TEESimulator 的 shell 服务最终还会执行一次 `app_process`。在定制 APatch 的安全模型中，普通 root shell 跨过这次 exec 后不能自动保留长期 Java daemon 所需的权限。表现可能是 daemon 启动即退出、读取 `/data/adb` 失败，或后续注入/控制通道不完整。
++
++这与 Vendor Hook、IReZygisk 和 Zygisk Assistant 无关，也不应通过修改它们来绕过。
++
++## 最终方案
++
++`module/daemon` 按能力选择两条互不干扰的路径：
++
++1. 定制 APatch：检测 `su --help` 是否提供 `--exec-context-privileged` 能力，然后执行：
++
++   ```text
++   su --no-pty -p --exec-context-privileged u:r:system_server:s0 -- \
++       /system/bin/app_process64 -Djava.class.path=... ...
++   ```
++
++2. Magisk、KernelSU、未提供上述私有能力的上游 APatch：继续使用上游原生 `app_process` 启动方式。
++
++所有参数都以独立 argv 传递，不经过 `su -c` 或拼接 shell 命令。优先选用 `app_process64`，不存在时才回退到 `app_process`。
++
++## 隐藏与权限边界
++
++- 没有新增专用 SELinux 域；使用已有的 `system_server` 域作为精确过渡目标。
++- 没有设置 permissive。
++- 没有添加全局 SELinux allow、修改共享 AVC 缓存或放宽其他进程。
++- `--exec-context-privileged` 只把权限恢复给成功完成精确 exec 的 daemon 任务树。
++- TEESimulator 原有 `sepolicy.rule` 保持不变，用于其自身 keystore 注入以及 Magisk/KernelSU 兼容；没有借本次适配扩大规则范围。
++- APatch、KernelPatch、Vendor Hook、IReZygisk、Zygisk Assistant 的既有隐藏逻辑均未修改。
++
++## 版本策略
++
++- 定制版本名：`v4.0-ckb-apatch1`。
++- 定制版本码：`40000 + 当前 Git 提交数`。
++- 移除了指向上游 `dev` 的自动更新地址，防止 Root 管理器用官方包静默覆盖定制启动逻辑。
++
++## 编译与安装
++
++本项目的发布任务为 `zipRelease`，产物位于 `out/`，文件名包含定制版本名、版本码和 Git 短哈希。也可通过工作区统一脚本执行：
++
++```text
++python build_projects.py --project TEESimulator --type release
++```
++
++本次代码修改没有执行编译、刷入或设备测试；由使用者自行完成。
++
++## 不要重复踩的坑
++
++- 不要只判断 `/data/adb/apd` 是否存在；旧版/官方 APatch 可能没有私有 bounded-exec 参数。
++- 不要把整段 Java 命令塞进 `su -c`；这会多出 shell 解析层，破坏精确可执行文件与参数边界。
++- 不要为 daemon 新建显眼的 permissive SELinux 域。
++- 不要为了修 TEESimulator 去改 Vendor、IReZygisk 或全局模块脚本。
++- 不要重新启用 TrickyStore 与 TEESimulator 同时 Hook keystore；上游安装脚本主动禁用 TrickyStore 是有意的冲突保护。
++- 升级上游时必须重新核对 `module/daemon`，避免上游覆盖 APatch 专用分支。
+diff --git a/module/daemon b/module/daemon
+index 0636988..e9f8dfd 100644
+--- a/module/daemon
++++ b/module/daemon
+@@ -2,6 +2,13 @@
+ # Launches the Kotlin control daemon under app_process.
+ #
+ #   $1 = MODDIR (the module directory holding classes.dex and $ABI/inject + libs)
++#
++# APatch note:
++# A plain root shell is not enough for a long-lived Java daemon on the customised
++# APatch build.  app_process is another exec boundary, so the daemon must enter an
++# existing Android domain through APatch's bounded privileged-exec API.  Authority
++# is restored only to that successfully transitioned task tree; no permissive
++# domain or global allow rule is required.
+ 
+ MODDIR=$1
+ 
+@@ -14,7 +21,30 @@ else
+   exit 1
+ fi
+ 
++APP_PROCESS=/system/bin/app_process
++if [ -x /system/bin/app_process64 ]; then
++  APP_PROCESS=/system/bin/app_process64
++fi
++if [ ! -x "$APP_PROCESS" ]; then
++  echo "teesim: app_process is missing: $APP_PROCESS" >&2
++  exit 1
++fi
++
+ # The trailing "$MODDIR" is args[0] to App.main, telling the daemon where the inject
+ # binary and native libraries live.
+-exec /system/bin/app_process -Djava.class.path="$CLASSPATH" "$MODDIR" \
++#
++# Keep Magisk/KernelSU/upstream APatch behaviour unchanged.  Only the customised
++# APatch advertises the bounded privileged-exec option used below.  Capability
++# detection is intentional: checking only for /data/adb/apd would break upstream
++# APatch versions that do not implement this private interface.
++SU=/system/bin/su
++APATCH_DAEMON_CONTEXT=u:r:system_server:s0
++if [ -x "$SU" ] && "$SU" --help 2>&1 | grep -q -- '--exec-context-privileged'; then
++  exec "$SU" --no-pty -p \
++    --exec-context-privileged "$APATCH_DAEMON_CONTEXT" -- \
++    "$APP_PROCESS" "-Djava.class.path=$CLASSPATH" "$MODDIR" \
++    --nice-name=teesim org.matrix.teesim.App "$MODDIR"
++fi
++
++exec "$APP_PROCESS" "-Djava.class.path=$CLASSPATH" "$MODDIR" \
+   --nice-name=teesim org.matrix.teesim.App "$MODDIR"
+diff --git a/module/module.prop b/module/module.prop
+index f1c7632..418edb6 100644
+--- a/module/module.prop
++++ b/module/module.prop
+@@ -3,5 +3,4 @@ name=TEESimulator
+ version=${REPLACEMEVER}
+ versionCode=${REPLACEMEVERCODE}
+ author=JingMatrix
+-description=Redirects key attestation for selected apps to an in-process reference KeyMint trusted application.
+-updateJson=https://raw.githubusercontent.com/JingMatrix/TEESimulator/dev/module/update.json
++description=Redirects key attestation for selected apps to an in-process reference KeyMint trusted application. Custom APatch bounded-exec build.
+-- 
+2.45.1.windows.1
+

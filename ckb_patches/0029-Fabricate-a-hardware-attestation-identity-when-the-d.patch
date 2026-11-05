@@ -1,0 +1,552 @@
+From 9d7186f8844ad4f068382d2bcdf7fcc1e8894577 Mon Sep 17 00:00:00 2001
+From: JingMatrix <jingmatrix@gmail.com>
+Date: Tue, 11 Aug 2026 01:29:50 +0200
+Subject: [PATCH 29/47] Fabricate a hardware attestation identity when the
+ device has none
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A software-only device (an emulator with no TEE) or one whose TEE is broken
+captures only a Software-level attestation, which apps reject as not hardware-backed.
+Present a fabricated TrustedEnvironment identity in that case: the harvest keeps the
+real captured values but records a fabricated securityLevel and the OS-appropriate
+attestation/keymaster versions, and the resolver emits those to the TA. A device
+that really attested in hardware passes its captured values through unchanged.
+
+The reference TA tied attestationVersion to keymintVersion through the KeyMint HAL
+enum (100/200/300/400), so it could not emit the Keymaster versions a pre-KeyMint
+device reports. It now carries a raw attestationVersion and derives keymintVersion
+from it (Keymaster 3.0 = attestation 2 / keymaster 3, 4.0 = 3 / 4, 4.1 = 4 / 41;
+KeyMint N.0 = N*100 for both), matching what a real device of each OS release reports.
+
+The harvest panel presents both sides: the two hardware levels as chips
+(TrustedEnvironment by default, and StrongBox; never Software), the values actually
+captured — struck through in red where replaced — and, under Fabricated, the chip's
+security level and the versions handed to apps.
+---
+ .../main/java/org/matrix/teesim/Harvester.kt  |  61 +++++++++-
+ .../main/java/org/matrix/teesim/Resolver.kt   |  24 ++--
+ keymint/README.md                             |  17 +--
+ module/webroot/css/app.css                    |   3 +-
+ module/webroot/js/ui/system-view.js           | 109 ++++++++++--------
+ rust/patches/kmr-ta-seclevel.patch            |  99 +++++++++++++---
+ rust/teesim-km/README.md                      |  18 +--
+ rust/teesim-km/src/ops.rs                     |  19 +--
+ 8 files changed, 250 insertions(+), 100 deletions(-)
+
+diff --git a/app/src/main/java/org/matrix/teesim/Harvester.kt b/app/src/main/java/org/matrix/teesim/Harvester.kt
+index 2407219..db60171 100644
+--- a/app/src/main/java/org/matrix/teesim/Harvester.kt
++++ b/app/src/main/java/org/matrix/teesim/Harvester.kt
+@@ -122,6 +122,65 @@ object Harvester {
+         val harvestedAt: Long,
+     )
+ 
++    // --- Fabricated attestation identity (software-only / TEE-broken devices) --------------------
++    // When the device produces no working HARDWARE attestation — a software-only emulator, or a device
++    // whose TEE is broken (attestation falls back to Software, or the harvest failed) — we present a
++    // fabricated TrustedEnvironment identity to apps, since spoofing a hardware key is the whole point.
++    // On a device that really attested in hardware the captured values pass through unchanged.
++
++    private const val SEC_LEVEL_TEE = 1
++
++    /** True when the harvest captured no working hardware attestation, so the level/version must be
++     *  fabricated rather than reflected. */
++    fun noWorkingHardware(r: Record): Boolean =
++        r.harvestFailed || r.attestationSecurityLevel < SEC_LEVEL_TEE
++
++    /** The (securityLevel, attestationVersion) to actually present: fabricated TrustedEnvironment + the
++     *  OS-appropriate version when there is no working hardware, else the captured pair unchanged. */
++    fun effectiveAttestation(r: Record): Pair<Int, Int> =
++        if (noWorkingHardware(r)) SEC_LEVEL_TEE to fabricatedAttestationVersion()
++        else r.attestationSecurityLevel to r.attestationVersion
++
++    /** The `attestationVersion` a real hardware device of this OS release reports. Keymaster and KeyMint
++     *  disagree with `keymasterVersion` only up to Android 11 (mapped in keymasterVersionFor):
++     *  Keymaster 3.0 (<=8.1) = 2, 4.0 (9/10) = 3, 4.1 (11) = 4; KeyMint N.0 (12+) = N*100. */
++    fun fabricatedAttestationVersion(sdk: Int = Build.VERSION.SDK_INT): Int =
++        when {
++            sdk <= 27 -> 2 // <= Android 8.1 (Keymaster 3.0); below our floor, best effort
++            sdk <= 29 -> 3 // Android 9, 10 (Keymaster 4.0)
++            sdk == 30 -> 4 // Android 11 (Keymaster 4.1)
++            sdk <= 32 -> 100 // Android 12 / 12L (KeyMint 1.0)
++            sdk == 33 -> 200 // Android 13 (KeyMint 2.0)
++            sdk == 34 -> 300 // Android 14 (KeyMint 3.0)
++            else -> 400 // Android 15+ (KeyMint 4.0)
++        }
++
++    /** The `keymasterVersion` matching an `attestationVersion` (same derivation as the TA's cert.rs):
++     *  attestation 2 -> keymaster 3, 3 -> 4, 4 -> 41; KeyMint values (>= 100) are equal. */
++    fun keymasterVersionFor(attestationVersion: Int): Int =
++        when (attestationVersion) {
++            2 -> 3
++            3 -> 4
++            4 -> 41
++            else -> attestationVersion
++        }
++
++    private fun secLevelName(n: Int): String =
++        (arrayOf("Software", "TrustedEnvironment", "StrongBox").getOrNull(n) ?: "$n") + " ($n)"
++
++    /** When there is no working hardware, record the fabricated TrustedEnvironment level + versions in
++     *  the `fabricated` map so the WebUI presents what we hand apps. Raw captured fields stay untouched. */
++    private fun markFabricatedAttestation(r: Record): Record {
++        if (!noWorkingHardware(r)) return r
++        val (level, version) = effectiveAttestation(r)
++        val fab = r.fabricated.toMutableMap()
++        fab["attestationSecurityLevel"] = secLevelName(level)
++        fab["keymasterSecurityLevel"] = secLevelName(level)
++        fab["attestationVersion"] = version.toString()
++        fab["keymasterVersion"] = keymasterVersionFor(version).toString()
++        return r.copy(fabricated = fab)
++    }
++
+     /**
+      * Load the frozen record if present, attempt a fresh harvest, merge (preserving the frozen boot
+      * key/hash), persist, and return the effective record.
+@@ -161,7 +220,7 @@ object Harvester {
+                 else -> existing?.takeIf { !it.harvestFailed } ?: fallback()
+             }
+ 
+-        val enriched = supplementDeviceIds(effective)
++        val enriched = markFabricatedAttestation(supplementDeviceIds(effective))
+         persist(enriched)
+         SystemLogger.info(
+             "Harvest complete: failed=${enriched.harvestFailed} " +
+diff --git a/app/src/main/java/org/matrix/teesim/Resolver.kt b/app/src/main/java/org/matrix/teesim/Resolver.kt
+index 83ee1e9..7a47f8e 100644
+--- a/app/src/main/java/org/matrix/teesim/Resolver.kt
++++ b/app/src/main/java/org/matrix/teesim/Resolver.kt
+@@ -45,11 +45,16 @@ object Resolver {
+                 // (probed at harvest). It gates patch mode at the StrongBox level: when false, keys
+                 // requested at StrongBox fall back to generation even in a patch profile.
+                 put("strongBoxAvailable", harvest.strongBoxAvailable)
+-                // Harvested KeyMint HAL version at each level, so a generated key claims the real
+-                // device's attestation/keymint version rather than the TA's default. StrongBox reuses
+-                // the TEE value when it has no real hardware to harvest.
+-                put("attestVersionTee", harvest.attestationVersion)
+-                put("attestVersionStrongBox", harvest.strongBoxAttestationVersion)
++                // The attestationVersion each level reports: the real harvested value on a device that
++                // attested in hardware, or a fabricated OS-appropriate one when there is no working
++                // hardware (software-only / TEE-broken). StrongBox reuses it when it has no hardware.
++                val effVersion = Harvester.effectiveAttestation(harvest).second
++                put("attestVersionTee", effVersion)
++                put(
++                    "attestVersionStrongBox",
++                    if (Harvester.noWorkingHardware(harvest)) effVersion
++                    else harvest.strongBoxAttestationVersion,
++                )
+             },
+         )
+ 
+@@ -75,11 +80,10 @@ object Resolver {
+         // key in our TA. The router still forces generation for a level whose hardware is unavailable.
+         o.put("mode", p.mode)
+ 
+-        // Security level is not a profile choice: it is the device's real level, harvested
+-        // from the TEE (a key's actual level is what the app requested via its keystore
+-        // security-level service, bounded by what the device offers — which for the keys we
+-        // serve is this harvested TrustedEnvironment level).
+-        o.put("securityLevel", harvest.attestationSecurityLevel)
++        // Security level is not a profile choice: it is the device's real harvested level, except that
++        // a device with no working hardware attestation (software-only / TEE-broken) presents a
++        // fabricated TrustedEnvironment so a spoofed key still claims hardware (see effectiveAttestation).
++        o.put("securityLevel", Harvester.effectiveAttestation(harvest).first)
+ 
+         // osVersion: system_property -> the harvested device value, omitted when absent;
+         // else the parsed literal, omitted when it can't be parsed. A missing osVersion is
+diff --git a/keymint/README.md b/keymint/README.md
+index d3c5974..6876cfe 100644
+--- a/keymint/README.md
++++ b/keymint/README.md
+@@ -163,13 +163,16 @@ it is also ours — as does StrongBox:
+ 
+ ### Per-level attestation identity
+ 
+-The record's security level and KeyMint version must match the HAL the request came through:
+-a StrongBox key claims StrongBox and that HAL's version, a TEE key the TEE's. One TA serves
+-both proxies, so before each creation the router passes the proxy's level to the TA, which
+-overrides both `hw_info.security_level` and `aidl_version` for that one request
+-(`override_attestation_identity`) and restores them after. The two versions are harvested from
+-throwaway attested keys at each level and carried in the config; a broken StrongBox reuses the
+-TEE version. Patch mode gets this for free — it re-signs the real leaf, whose version fields are
++The record's security level and version must match the HAL the request came through: a StrongBox
++key claims StrongBox and that HAL's version, a TEE key the TEE's. One TA serves both proxies, so
++before each creation the router passes the proxy's level to the TA, which overrides
++`hw_info.security_level` and the raw `attestation_version` for that one request
++(`override_attestation_identity`) and restores them after. The versions are harvested from throwaway
++attested keys at each level and carried in the config — or fabricated (TrustedEnvironment and the
++OS-appropriate version) when the device has no working hardware attestation; the `keyMintVersion` is
++then derived from `attestationVersion` in the TA (Keymaster 4.0 is attestation 3 / keymaster 4, 4.1 is
++4 / 41; KeyMint versions are equal). A broken StrongBox reuses the TEE version. Patch mode gets this
++for free — it re-signs the real leaf, whose version fields are
+ already the hardware's.
+ 
+ ### Recursion guard
+diff --git a/module/webroot/css/app.css b/module/webroot/css/app.css
+index ec2565d..fc1a9cf 100644
+--- a/module/webroot/css/app.css
++++ b/module/webroot/css/app.css
+@@ -102,6 +102,7 @@
+ .chip.small { padding: 1px 7px; font-size: 11px; }
+ .chip.clickable { border: 0; font: inherit; font-size: 12px; color: var(--fg); cursor: pointer; min-height: 44px; }
+ .chip.clickable.selected { background: var(--accent); color: var(--accent-fg); font-weight: 600; }
++.chip.clickable:disabled { opacity: 0.45; cursor: default; color: var(--muted); }
+ .chip.clickable:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+ .chip.removable { padding-right: 4px; }
+ .chip-x { position: relative; border: 0; background: transparent; color: var(--muted); cursor: pointer; font-size: 14px; line-height: 1; padding: 4px 6px; border-radius: 999px; display: inline-flex; align-items: center; justify-content: center; }
+@@ -407,7 +408,7 @@ html, body { overscroll-behavior-y: contain; }
+ .kv-hex { font-family: ui-monospace, monospace; font-size: 12px; word-break: break-all; color: var(--fg); text-align: left; }
+ /* A captured value the simulation will override: dimmed + struck so it's clear it isn't
+  * what gets attested (the real value shows in the Fabricated group below). */
+-.kv-replaced .kv-val, .kv-replaced .kv-hex { color: var(--muted); text-decoration: line-through; }
++.kv-replaced .kv-val, .kv-replaced .kv-hex { color: var(--danger); text-decoration: line-through; }
+ .harvest-body { display: flex; flex-direction: column; gap: 12px; }
+ /* Level selector: the two chips split the line evenly, flat rather than pill-shaped. */
+ .harvest-modes { display: flex; gap: 6px; }
+diff --git a/module/webroot/js/ui/system-view.js b/module/webroot/js/ui/system-view.js
+index 0bac17d..1eb6585 100644
+--- a/module/webroot/js/ui/system-view.js
++++ b/module/webroot/js/ui/system-view.js
+@@ -104,30 +104,29 @@ function harvestCard(status) {
+   const fab = (h.fabricated && typeof h.fabricated === "object" && !Array.isArray(h.fabricated)) ? h.fabricated : {};
+   const fabKeys = Object.keys(fab);
+   const sbAvailable = !!h.strongBoxAvailable;
+-
+-  // A TrustedEnvironment exists only when a key was attestable; when harvest failed there is no real
+-  // level to show, so we drop the chips and render the (fabricated) values directly. When it exists,
+-  // StrongBox is always offered alongside it (the design pretends StrongBox is present even on a unit
+-  // whose StrongBox can't attest — its chip then reads "generated"). The chips switch the values below
+-  // between the levels: only the security level and attestation/keymint version differ.
+-  if (failed) harvestMode = "tee";
+-  const teeChip = el("button", { class: "chip clickable", type: "button", onclick: () => select("tee") }, [
+-    el("span", { class: "dot ok" }),
+-    el("span", { text: "TrustedEnvironment" }),
+-  ]);
+-  const sbChip = el("button", { class: "chip clickable", type: "button", onclick: () => select("strongbox") }, [
+-    el("span", { class: "dot " + (sbAvailable ? "ok" : "warn") }),
+-    el("span", { text: sbAvailable ? "StrongBox" : "StrongBox — generated" }),
+-  ]);
+-  if (!failed) card.appendChild(el("div", { class: "harvest-modes" }, [teeChip, sbChip]));
++  // The two hardware levels a spoofed key can present. We ASK for TrustedEnvironment (the default), and
++  // always offer StrongBox too; there is no Software chip because we never present Software — a device
++  // with no real TEE has its captured Software level fabricated up to TrustedEnvironment (shown struck
++  // in Captured, corrected in Fabricated). Selecting a chip switches the level-specific rows below.
++  const modes = [
++    { key: "tee", label: "TrustedEnvironment" },
++    { key: "strongbox", label: "StrongBox" },
++  ];
++  if (failed || !modes.some((m) => m.key === harvestMode)) harvestMode = "tee";
++  const chipEls = modes.map((m) =>
++    el("button", { class: "chip clickable", type: "button", onclick: () => select(m.key) }, [
++      el("span", { class: "dot ok" }),
++      el("span", { text: m.label }),
++    ]),
++  );
++  if (!failed) card.appendChild(el("div", { class: "harvest-modes" }, chipEls));
+ 
+   const body = el("div", { class: "harvest-body" });
+   card.appendChild(body);
+ 
+   function select(m) {
+     harvestMode = m;
+-    teeChip.classList.toggle("selected", m === "tee");
+-    sbChip.classList.toggle("selected", m === "strongbox");
++    modes.forEach((mode, i) => chipEls[i].classList.toggle("selected", mode.key === m));
+     renderBody();
+   }
+ 
+@@ -140,42 +139,54 @@ function harvestCard(status) {
+       body.appendChild(el("div", { class: "muted small", text: "StrongBox has no working hardware on this device; keys requested at StrongBox are generated (not patched) at the TEE version." }));
+     }
+ 
+-    // Captured: the raw values read at the selected level. Any we override for attestation (present
+-    // in `fab`) are shown greyed/struck to signal they'll be replaced. Only the security level and
+-    // version are level-specific; every other value is device-wide and identical across both.
+-    body.appendChild(el("h3", { text: "Captured" }));
+-    const rows = el("div", { class: "kv-list" });
+-    const add = (label, val) => rows.appendChild(kvRow(label, val, fab[label] !== undefined));
+-
+-    add("verifiedBootState", named(h.verifiedBootState) + " (" + show(h.verifiedBootState) + ")");
+-    add("deviceLocked", h.deviceLocked == null ? "—" : String(h.deviceLocked));
+-    hexRow(rows, "verifiedBootKey", h.verifiedBootKey, fab["verifiedBootKey"] !== undefined);
+-    hexRow(rows, "verifiedBootHash", h.verifiedBootHash, fab["verifiedBootHash"] !== undefined);
+-    add("osVersion", show(h.osVersion));
+-    add("osPatchLevel", show(h.osPatchLevel));
+-    add("vendorPatchLevel", show(h.vendorPatchLevel));
+-    add("bootPatchLevel", show(h.bootPatchLevel));
+-    const version = sb ? h.strongBoxAttestationVersion : h.attestationVersion;
+-    add("attestationSecurityLevel", secLevel(sb ? 2 : h.attestationSecurityLevel));
+-    add("keymasterSecurityLevel", secLevel(sb ? 2 : h.keymasterSecurityLevel));
+-    add("attestationVersion", show(version));
+-    add("keymasterVersion", show(sb ? version : h.keymasterVersion));
+-    hexRow(rows, "moduleHash", h.moduleHash, fab["moduleHash"] !== undefined);
+-    // Device identity captured for ID attestation (only the ids the TEE actually provided).
+-    for (const key of ["brand", "device", "product", "manufacturer", "model", "serial", "imei", "meid", "imei2"]) {
+-      if (h[key]) add(key, h[key]);
++    // Captured: the real values read from the device, shown honestly — only when actually captured (no
++    // placeholders), and nothing at all when the harvest failed (everything is then fabricated below).
++    // A value we override for attestation (present in `fab`) is shown struck, to signal it is replaced.
++    if (!failed) {
++      body.appendChild(el("h3", { text: "Captured" }));
++      const rows = el("div", { class: "kv-list" });
++      const add = (label, val) => {
++        if (val != null && val !== "" && val !== "—")
++          rows.appendChild(kvRow(label, val, fab[label] !== undefined));
++      };
++
++      add("verifiedBootState", h.verifiedBootState == null ? null : named(h.verifiedBootState) + " (" + h.verifiedBootState + ")");
++      add("deviceLocked", h.deviceLocked == null ? null : String(h.deviceLocked));
++      if (h.verifiedBootKey) hexRow(rows, "verifiedBootKey", h.verifiedBootKey, fab["verifiedBootKey"] !== undefined);
++      if (h.verifiedBootHash) hexRow(rows, "verifiedBootHash", h.verifiedBootHash, fab["verifiedBootHash"] !== undefined);
++      add("osVersion", show(h.osVersion));
++      add("osPatchLevel", show(h.osPatchLevel));
++      add("vendorPatchLevel", show(h.vendorPatchLevel));
++      add("bootPatchLevel", show(h.bootPatchLevel));
++      // The device has one real captured level. StrongBox reads level 2 only when it actually works;
++      // otherwise it falls back to the captured level (Software on a device with no secure element), so
++      // both chips honestly show that same captured value.
++      const sbReal = sb && sbAvailable;
++      add("attestationSecurityLevel", secLevel(sbReal ? 2 : h.attestationSecurityLevel));
++      add("keymasterSecurityLevel", secLevel(sbReal ? 2 : h.keymasterSecurityLevel));
++      add("attestationVersion", show(sbReal ? h.strongBoxAttestationVersion : h.attestationVersion));
++      add("keymasterVersion", show(h.keymasterVersion));
++      if (h.moduleHash) hexRow(rows, "moduleHash", h.moduleHash, fab["moduleHash"] !== undefined);
++      // Device identity captured for ID attestation (only the ids the TEE actually provided).
++      for (const key of ["brand", "device", "product", "manufacturer", "model", "serial", "imei", "meid", "imei2"]) {
++        if (h[key]) add(key, h[key]);
++      }
++      if (h.harvestedAt) add("harvestedAt", fmtTime(h.harvestedAt));
++      body.appendChild(rows);
+     }
+-    if (h.harvestedAt) add("harvestedAt", fmtTime(h.harvestedAt));
+-    body.appendChild(rows);
+ 
+-    // Fabricated: the values we override / synthesize for attestation, shown only when we actually
+-    // changed something (a genuinely locked, Verified device fabricates nothing). Device-wide, so
+-    // the same for both levels.
++    // Fabricated: the values we present to apps in place of the captured ones. The security level is the
++    // level of the chip being viewed — we present both TrustedEnvironment and StrongBox; the versions and
++    // the device ids are the same for both.
+     if (fabKeys.length) {
+       body.appendChild(el("h3", { text: "Fabricated" }));
+-      body.appendChild(el("div", { class: "muted small", text: "Values we override for attestation." }));
++      body.appendChild(el("div", { class: "muted small", text: "Values we present to apps in place of the captured ones." }));
+       const fabRows = el("div", { class: "kv-list" });
+-      for (const key of fabKeys) fabRows.appendChild(kvRow(key, show(fab[key])));
++      const fabLevel = secLevel(sb ? 2 : 1);
++      for (const key of fabKeys) {
++        const isLevel = key === "attestationSecurityLevel" || key === "keymasterSecurityLevel";
++        fabRows.appendChild(kvRow(key, isLevel ? fabLevel : show(fab[key])));
++      }
+       body.appendChild(fabRows);
+     }
+   }
+diff --git a/rust/patches/kmr-ta-seclevel.patch b/rust/patches/kmr-ta-seclevel.patch
+index db37017..f7e2b1f 100644
+--- a/rust/patches/kmr-ta-seclevel.patch
++++ b/rust/patches/kmr-ta-seclevel.patch
+@@ -1,8 +1,81 @@
++diff --git a/ta/src/cert.rs b/ta/src/cert.rs
++index 97b15b3..20d332d 100644
++--- a/ta/src/cert.rs
+++++ b/ta/src/cert.rs
++@@ -296,9 +296,21 @@ enum SecurityLevel {
++ }
++ 
++ /// Build an ASN.1 DER-encoded attestation extension.
+++/// The `keyMintVersion` that corresponds to an `attestationVersion`. They agree for KeyMint (>= 100)
+++/// but differ for pre-KeyMint Keymaster releases: attestation 2 -> keymaster 3 (Keymaster 3.0),
+++/// 3 -> 4 (Keymaster 4.0), 4 -> 41 (Keymaster 4.1). Any other value is passed through unchanged.
+++fn keymint_version_for(attestation_version: i32) -> i32 {
+++    match attestation_version {
+++        2 => 3,
+++        3 => 4,
+++        4 => 41,
+++        v => v,
+++    }
+++}
+++
++ #[allow(clippy::too_many_arguments)]
++ pub(crate) fn attestation_extension<'a>(
++-    keymint_version: i32,
+++    attestation_version: i32,
++     challenge: &'a [u8],
++     app_id: &'a [u8],
++     security_level: keymint::SecurityLevel,
++@@ -349,9 +361,9 @@ pub(crate) fn attestation_extension<'a>(
++     let sec_level = SecurityLevel::try_from(security_level as u32)
++         .map_err(|_| km_err!(InvalidArgument, "invalid security level {:?}", security_level))?;
++     let ext = AttestationExtension {
++-        attestation_version: keymint_version,
+++        attestation_version,
++         attestation_security_level: sec_level,
++-        keymint_version,
+++        keymint_version: keymint_version_for(attestation_version),
++         keymint_security_level: sec_level,
++         attestation_challenge: challenge,
++         unique_id,
++diff --git a/ta/src/keys.rs b/ta/src/keys.rs
++index 7323b01..85707d2 100644
++--- a/ta/src/keys.rs
+++++ b/ta/src/keys.rs
++@@ -173,7 +173,7 @@ impl crate::KeyMintTa {
++                 let unique_id = self.calculate_unique_id(app_id, params)?;
++                 let boot_info = self.boot_info_hashed_key()?;
++                 let attest_ext = cert::attestation_extension(
++-                    self.aidl_version as i32,
+++                    self.attestation_version,
++                     challenge,
++                     app_id,
++                     self.hw_info.security_level,
+ diff --git a/ta/src/lib.rs b/ta/src/lib.rs
+-index a0efe49..f2601f7 100644
++index a0efe49..ccbd543 100644
+ --- a/ta/src/lib.rs
+ +++ b/ta/src/lib.rs
+-@@ -353,6 +353,37 @@ impl KeyMintTa {
++@@ -125,6 +125,12 @@ pub struct KeyMintTa {
++     /// The version of the HAL AIDL interface specification that this TA acts as.
++     aidl_version: KeyMintHalVersion,
++ 
+++    /// The raw `attestationVersion` to report in attestation records. Kept separate from
+++    /// `aidl_version` (a KeyMint 100/200/300/400 enum used for HAL behaviour) because a pre-KeyMint
+++    /// device reports Keymaster attestation versions (2, 3, 4) that the enum cannot represent, and the
+++    /// matching `keyMintVersion` differs from it (e.g. Keymaster 4.0 is attestation 3, keymaster 4).
+++    attestation_version: i32,
+++
++     /**
++      * State that is set after the TA starts, but latched thereafter.
++      */
++@@ -330,6 +336,7 @@ impl KeyMintTa {
++             hw_info,
++             rpc_info,
++             aidl_version: KEYMINT_CURRENT_VERSION,
+++            attestation_version: KEYMINT_CURRENT_VERSION as i32,
++             boot_info: None,
++             rot_data: None,
++             hal_info: None,
++@@ -353,6 +360,31 @@ impl KeyMintTa {
+          self.hw_info.security_level == SecurityLevel::Strongbox
+      }
+  
+@@ -19,22 +92,16 @@ index a0efe49..f2601f7 100644
+ +        self.hw_info.security_level = security_level;
+ +    }
+ +
+-+    /// Return the KeyMint HAL version reported in attestation records
+-+    /// (attestationVersion / keymintVersion).
+-+    pub fn aidl_version(&self) -> i32 {
+-+        self.aidl_version as i32
+++    /// Return the raw `attestationVersion` reported in attestation records.
+++    pub fn attestation_version(&self) -> i32 {
+++        self.attestation_version
+ +    }
+ +
+-+    /// Override the KeyMint HAL version reported in attestation records, so a
+-+    /// generated key can claim the version of the real HAL at the level it was
+-+    /// requested through. Values map to the nearest HAL version (100/200/300/400).
+-+    pub fn set_aidl_version(&mut self, version: i32) {
+-+        self.aidl_version = match version {
+-+            v if v >= 400 => KeyMintHalVersion::V4,
+-+            v if v >= 300 => KeyMintHalVersion::V3,
+-+            v if v >= 200 => KeyMintHalVersion::V2,
+-+            _ => KeyMintHalVersion::V1,
+-+        };
+++    /// Override the `attestationVersion` reported in attestation records, so a generated key can claim
+++    /// the version of the real HAL at the level it was requested through. Stored raw (2/3/4/100/…) so
+++    /// pre-KeyMint (Keymaster) versions survive; the matching `keyMintVersion` is derived in cert.rs.
+++    pub fn set_attestation_version(&mut self, version: i32) {
+++        self.attestation_version = version;
+ +    }
+ +
+      /// Indicate whether the current device has secure storage available.
+diff --git a/rust/teesim-km/README.md b/rust/teesim-km/README.md
+index 07970c2..7851efa 100644
+--- a/rust/teesim-km/README.md
++++ b/rust/teesim-km/README.md
+@@ -107,13 +107,17 @@ report an identical one. `Ta` therefore retains a clone of `CertSignInfo` (the b
+ 
+ ## Per-request attestation identity
+ 
+-One `Ta` serves both the TEE and StrongBox proxies, so the record's security level and KeyMint
+-version are set per request rather than at construction. Each creation passes the requesting
+-HAL's level; `ops.rs::override_attestation_identity` sets `hw_info.security_level` and
+-`aidl_version` (the version harvested at that level, held on the `Ta`) for that one call and
+-restores them after. The `security_level`/`aidl_version` getters and setters this needs are added
+-to `kmr-ta` by [`patches/kmr-ta-seclevel.patch`](../patches/kmr-ta-seclevel.patch), applied the
+-same idempotent way as the BoringSSL patch below.
++One `Ta` serves both the TEE and StrongBox proxies, so the record's security level and version are
++set per request rather than at construction. Each creation passes the requesting HAL's level;
++`ops.rs::override_attestation_identity` sets `hw_info.security_level` and a raw `attestation_version`
++for that one call and restores them after. The version is stored raw (2/3/4/100/…) so a pre-KeyMint
++device's Keymaster versions survive, and `cert.rs` derives the matching `keyMintVersion` from it
++(Keymaster 4.0 is attestation 3 / keymaster 4, 4.1 is 4 / 41; KeyMint versions are equal). The level
++and version come from the harvest, or are fabricated (TrustedEnvironment and the OS-appropriate
++version) when the device produced no working hardware attestation. The `security_level` /
++`attestation_version` getters and setters this needs are added to `kmr-ta` by
++[`patches/kmr-ta-seclevel.patch`](../patches/kmr-ta-seclevel.patch), applied the same idempotent way
++as the BoringSSL patch below.
+ 
+ ## BoringSSL backend
+ 
+diff --git a/rust/teesim-km/src/ops.rs b/rust/teesim-km/src/ops.rs
+index 6ce53e5..6f87020 100644
+--- a/rust/teesim-km/src/ops.rs
++++ b/rust/teesim-km/src/ops.rs
+@@ -65,11 +65,12 @@ impl Ta {
+     /// Apply a per-request attestation identity — security level and KeyMint HAL version — to the
+     /// inner TA for the duration of one generateKey/importKey, returning the previous pair to restore
+     /// afterwards. The record's `attestationSecurityLevel` / `keymasterSecurityLevel` and the
+-    /// KeyCharacteristics `securityLevel` follow `hw_info.security_level`; its `attestationVersion` /
+-    /// `keymintVersion` follow the TA's `aidl_version`. Overriding both makes the record reflect the
+-    /// real HAL the request came through: `security_level` picks the level (0 Software, 1
+-    /// TrustedEnvironment, 2 StrongBox) and the version harvested at that level (StrongBox falling
+-    /// back to the TEE version). A level outside the known set leaves the TA's defaults in place.
++    /// KeyCharacteristics `securityLevel` follow `hw_info.security_level`; its `attestationVersion`
++    /// follows the TA's raw `attestation_version` (and `keyMintVersion` is derived from it in cert.rs).
++    /// Overriding both makes the record reflect the real HAL the request came through: `security_level`
++    /// picks the level (0 Software, 1 TrustedEnvironment, 2 StrongBox) and the version harvested (or
++    /// fabricated) at that level (StrongBox falling back to the TEE version). A level outside the known
++    /// set leaves the TA's defaults in place.
+     fn override_attestation_identity(&mut self, security_level: i32) -> Option<(SecurityLevel, i32)> {
+         let level = match security_level {
+             0 => SecurityLevel::Software,
+@@ -77,13 +78,13 @@ impl Ta {
+             2 => SecurityLevel::Strongbox,
+             _ => return None,
+         };
+-        let prev = (self.inner.security_level(), self.inner.aidl_version());
++        let prev = (self.inner.security_level(), self.inner.attestation_version());
+         self.inner.set_security_level(level);
+         let version = match level {
+             SecurityLevel::Strongbox => self.attest_version_strongbox,
+             _ => self.attest_version_tee,
+         };
+-        self.inner.set_aidl_version(version);
++        self.inner.set_attestation_version(version);
+         Some(prev)
+     }
+ 
+@@ -107,7 +108,7 @@ impl Ta {
+             self.perform(GenerateKeyRequest { key_params, attestation_key });
+         if let Some((level, version)) = restore {
+             self.inner.set_security_level(level);
+-            self.inner.set_aidl_version(version);
++            self.inner.set_attestation_version(version);
+         }
+         let ret = resp?.ret;
+         crate::resign::log_chain("teesim_km: generate_key result", &ret.certificate_chain);
+@@ -138,7 +139,7 @@ impl Ta {
+             self.perform(ImportKeyRequest { key_params, key_format, key_data, attestation_key });
+         if let Some((level, version)) = restore {
+             self.inner.set_security_level(level);
+-            self.inner.set_aidl_version(version);
++            self.inner.set_attestation_version(version);
+         }
+         let ret = resp?.ret;
+         crate::resign::log_chain("teesim_km: import_key result", &ret.certificate_chain);
+-- 
+2.45.1.windows.1
+

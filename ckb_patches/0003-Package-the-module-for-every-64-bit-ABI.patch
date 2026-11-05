@@ -1,0 +1,206 @@
+From ea42d1068ea0be0fe9f3fc278a4a2560b796a65d Mon Sep 17 00:00:00 2001
+From: JingMatrix <jingmatrix@gmail.com>
+Date: Sun, 9 Aug 2026 13:32:39 +0200
+Subject: [PATCH 03/47] Package the module for every 64-bit ABI
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Build the interceptor for each 64-bit ABI — keystore2 is 64-bit on every supported
+device — and lay the binaries out per ABI; service.sh injects the set matching the
+running device. package.sh builds the ABIs and zips them, needing only the NDK.
+
+At boot service.sh injects into keystore2 and re-injects on every restart. keystore2
+is unprivileged, so it also opens traversal of /data/adb and makes the keybox
+world-readable; the keybox stays a user-supplied file and is never shipped. The
+injector passes keystore2 the library as a file descriptor over a unix socket, which
+its SELinux domain cannot do by default, so sepolicy.rule grants just those accesses
+between the keystore and injector domains, keeping keystore enforcing.
+---
+ .gitignore           |  1 +
+ module/customize.sh  | 25 ++++++++++++++++++++++
+ module/module.prop   |  6 ++++++
+ module/sepolicy.rule |  7 ++++++
+ module/service.sh    | 34 +++++++++++++++++++++++++++++
+ module/target.txt    |  1 +
+ package.sh           | 51 ++++++++++++++++++++++++++++++++++++++++++++
+ 7 files changed, 125 insertions(+)
+ create mode 100644 module/customize.sh
+ create mode 100644 module/module.prop
+ create mode 100644 module/sepolicy.rule
+ create mode 100644 module/service.sh
+ create mode 100644 module/target.txt
+ create mode 100644 package.sh
+
+diff --git a/.gitignore b/.gitignore
+index 02b2c7d..f2d8cb4 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -4,3 +4,4 @@
+ Cargo.lock
+ compile_commands.json
+ .cxx/
++/dist/
+diff --git a/module/customize.sh b/module/customize.sh
+new file mode 100644
+index 0000000..fa34536
+--- /dev/null
++++ b/module/customize.sh
+@@ -0,0 +1,25 @@
++# Runs at install time under both Magisk and KernelSU.
++
++# The interceptor is a 64-bit library injected into keystore2, which is 64-bit on
++# every supported device; refuse 32-bit-only devices rather than fail silently.
++if [ "$ARCH" != "arm64" ] && [ "$ARCH" != "x64" ]; then
++  abort "! TEESimulator requires a 64-bit device"
++fi
++
++# Seed the configuration on first install without clobbering an existing keybox.
++mkdir -p /data/adb/teesim
++if [ ! -f /data/adb/teesim/keybox.xml ] && [ -f "$MODPATH/keybox.xml" ]; then
++  cp "$MODPATH/keybox.xml" /data/adb/teesim/keybox.xml
++fi
++if [ ! -f /data/adb/teesim/target.txt ]; then
++  cp "$MODPATH/target.txt" /data/adb/teesim/target.txt
++fi
++
++# The keybox is shipped as a template only; the module dir is world-readable, so
++# do not leave a real one lying in it.
++rm -f "$MODPATH/keybox.xml"
++
++set_perm_recursive "$MODPATH" 0 0 0755 0644
++for abi in arm64-v8a x86_64; do
++  [ -f "$MODPATH/$abi/inject" ] && set_perm "$MODPATH/$abi/inject" 0 0 0755
++done
+diff --git a/module/module.prop b/module/module.prop
+new file mode 100644
+index 0000000..c169f09
+--- /dev/null
++++ b/module/module.prop
+@@ -0,0 +1,6 @@
++id=teesim
++name=TEESimulator
++version=v0.1.0
++versionCode=1
++author=JingMatrix
++description=Redirects key attestation for selected apps to an in-process reference KeyMint trusted application.
+diff --git a/module/sepolicy.rule b/module/sepolicy.rule
+new file mode 100644
+index 0000000..cc9565e
+--- /dev/null
++++ b/module/sepolicy.rule
+@@ -0,0 +1,7 @@
++allow keystore adb_data_file dir search
++allow keystore adb_data_file file { read open getattr map }
++allow keystore ksu fd use
++allow ksu keystore fd use
++allow keystore ksu unix_dgram_socket { read write sendto }
++allow ksu keystore unix_dgram_socket { read write sendto connectto }
++allow keystore self unix_dgram_socket { create bind connect getopt setopt read write }
+diff --git a/module/service.sh b/module/service.sh
+new file mode 100644
+index 0000000..5b9a461
+--- /dev/null
++++ b/module/service.sh
+@@ -0,0 +1,34 @@
++#!/system/bin/sh
++# Started late at boot. Injects the interceptor into keystore2 and keeps it
++# injected across keystore2 restarts.
++MODDIR=${0%/*}
++
++# keystore2 is 64-bit; pick the binaries built for this device's primary ABI.
++ABI=$(getprop ro.product.cpu.abi)
++INJECT="$MODDIR/$ABI/inject"
++LIB="$MODDIR/$ABI/libteesim_keymint.so"
++[ -x "$INJECT" ] || chmod 0755 "$INJECT" 2>/dev/null
++[ -f "$LIB" ] || exit 0
++
++# keystore2 runs unprivileged and cannot traverse /data/adb (0700). Open the
++# traversal (not the listing) so it can read its configuration, and make the
++# configuration itself world-readable.
++chmod 0711 /data/adb 2>/dev/null
++chmod 0755 /data/adb/teesim 2>/dev/null
++chmod 0644 /data/adb/teesim/keybox.xml /data/adb/teesim/target.txt 2>/dev/null
++
++# keystore2's pid changes whenever it restarts; re-inject each time a new one
++# appears. A fresh keystore2 has no interceptor, so this also recovers the module
++# if it is ever killed.
++(
++  last=""
++  while true; do
++    pid="$(pidof keystore2)"
++    if [ -n "$pid" ] && [ "$pid" != "$last" ]; then
++      if "$INJECT" "$pid" "$LIB" entry; then
++        last="$pid"
++      fi
++    fi
++    sleep 2
++  done
++) &
+diff --git a/module/target.txt b/module/target.txt
+new file mode 100644
+index 0000000..c1112f1
+--- /dev/null
++++ b/module/target.txt
+@@ -0,0 +1 @@
++io.github.vvb2060.keyattestation
+diff --git a/package.sh b/package.sh
+new file mode 100644
+index 0000000..c32d11f
+--- /dev/null
++++ b/package.sh
+@@ -0,0 +1,51 @@
++#!/usr/bin/env bash
++# Build the interceptor for each ABI and assemble a flashable module zip.
++#
++#   ANDROID_HOME / ANDROID_NDK_HOME   SDK / NDK location
++#   ABIS="arm64-v8a x86_64"           ABIs to build (keystore2 is 64-bit)
++#   API=29                            min platform level
++#
++# The build depends on no device — libbinder_ndk/liblog come from the NDK and
++# BoringSSL is resolved at runtime — so every ABI cross-builds here.
++set -euo pipefail
++HERE=$(cd "$(dirname "$0")" && pwd)
++cd "$HERE"
++
++ABIS=${ABIS:-"arm64-v8a x86_64"}
++API=${API:-29}
++
++NDK=${ANDROID_NDK_HOME:-${ANDROID_NDK:-}}
++if [ -z "$NDK" ]; then
++  NDK=$(ls -d "${ANDROID_HOME:?set ANDROID_HOME or ANDROID_NDK_HOME}"/ndk/* 2>/dev/null | sort -V | tail -1)
++fi
++[ -d "$NDK" ] || { echo "NDK not found: $NDK" >&2; exit 1; }
++
++git submodule update --init --recursive --depth 1 >/dev/null 2>&1 || true
++
++BUILD=${BUILD:-$HERE/build}
++DIST=${DIST:-$HERE/dist}
++
++# Assemble the flashable module: the scripts and config template plus the built
++# binaries under a per-ABI directory. The keybox is a user secret and is never shipped.
++STAGE=$BUILD/module
++rm -rf "$STAGE"; mkdir -p "$STAGE"
++cp module/module.prop module/service.sh module/customize.sh \
++   module/sepolicy.rule module/target.txt "$STAGE/"
++
++for ABI in $ABIS; do
++  B=$BUILD/$ABI
++  cmake -B "$B" -G Ninja \
++    -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
++    -DANDROID_ABI="$ABI" -DANDROID_PLATFORM="android-$API"
++  cmake --build "$B" --target inject teesim_keymint
++  mkdir -p "$STAGE/$ABI"
++  cp "$B/inject" "$STAGE/$ABI/inject"
++  cp "$B/libteesim_keymint.so" "$STAGE/$ABI/libteesim_keymint.so"
++done
++
++VER=$(sed -n 's/^version=//p' module/module.prop)
++mkdir -p "$DIST"
++OUT=$DIST/teesim-$VER.zip
++rm -f "$OUT"
++( cd "$STAGE" && zip -qr "$OUT" . )
++echo "packaged: $OUT ($ABIS)"
+-- 
+2.45.1.windows.1
+

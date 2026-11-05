@@ -1,0 +1,82 @@
+From f63eaaedfc0a932125b7bb38db695b1e9a90238f Mon Sep 17 00:00:00 2001
+From: JingMatrix <jingmatrix@gmail.com>
+Date: Tue, 11 Aug 2026 09:22:47 +0200
+Subject: [PATCH 31/47] Release TEESimulator v4.0
+
+module.prop's updateJson points the module manager at the committed
+module/update.json (served over raw.githubusercontent), which pins the
+release version, its zip asset, and the changelog URL. changelog.md is both
+that linked changelog and the release body.
+
+Bump update.json's versionCode and zipUrl to match the tag before cutting a
+release.
+---
+ module/changelog.md | 32 ++++++++++++++++++++++++++++++++
+ module/module.prop  |  1 +
+ module/update.json  |  6 ++++++
+ 3 files changed, 39 insertions(+)
+ create mode 100644 module/changelog.md
+ create mode 100644 module/update.json
+
+diff --git a/module/changelog.md b/module/changelog.md
+new file mode 100644
+index 0000000..006a153
+--- /dev/null
++++ b/module/changelog.md
+@@ -0,0 +1,32 @@
++## 🎉 TEESimulator 4.0 — a new foundation
++
++Ever since TEESimulator began, the community has watched me pour real effort into closing
++pre-existing detection points, release after release. But as AI-driven conformance scanners multiply
++and quick "harness fix" commits go viral, it has grown exhausting to fold in a stream of unproven,
++poorly-explained external patches — innovation stalled, and code quality slipped noticeably. 😮‍💨
++
++So here is **TEESimulator 4.0**. 🚀 Instead of faking a hardware backend, it runs AOSP's own KeyMint
++reference implementation — the very trusted application that normally lives *inside* the TEE —
++**in-process**. This single change sweeps away countless detection points at once and, for the first
++time, brings first-class permanent key storage. 🔐
++
++## ✨ Highlights
++
++- **🧠 Reference KeyMint TA, in-process.** Attestations come straight from AOSP's `kmr-ta`, not
++  hand-rolled certificates — so every emitted record matches a real device field-for-field.
++- **🎛️ Profiles and a WebUI.** Bundle a keybox, operation mode, patch/OS levels, and device identity
++  into a named profile, assign it to your apps, and edit it all from the manager's WebUI — no text
++  editor, no reboot.
++- **📱 Android 10 → 17.** Both the legacy `keystore` daemon (Android 10/11) and `keystore2` / KeyMint
++  (Android 12+) are intercepted, and every key is attested at — and reports — its real security level
++  and the version its OS release uses.
++- **🩹 Patch mode by default.** The real hardware still generates the key; only its attestation is
++  re-signed under your keybox, keeping the genuine hardware-backed blob and its true contents.
++
++## 💬 Feedback
++
++To get started, drop a keybox at `/data/adb/teesim/keybox.xml`, then assign your apps to a profile in
++the WebUI. 🗝️
++
++Please open an issue for any device-support or compatibility problems — it helps enormously. 🙏 This
++release has been tested on **Android 17 (Pixel 6)** and **Android 10 (the Android emulator)**.
+diff --git a/module/module.prop b/module/module.prop
+index ba0d97f..f1c7632 100644
+--- a/module/module.prop
++++ b/module/module.prop
+@@ -4,3 +4,4 @@ version=${REPLACEMEVER}
+ versionCode=${REPLACEMEVERCODE}
+ author=JingMatrix
+ description=Redirects key attestation for selected apps to an in-process reference KeyMint trusted application.
++updateJson=https://raw.githubusercontent.com/JingMatrix/TEESimulator/dev/module/update.json
+diff --git a/module/update.json b/module/update.json
+new file mode 100644
+index 0000000..9e4a080
+--- /dev/null
++++ b/module/update.json
+@@ -0,0 +1,6 @@
++{
++	"version": "v4.0",
++	"versionCode": 34,
++	"zipUrl": "https://github.com/JingMatrix/TEESimulator/releases/download/v4.0/TEESimulator-v4.0-34-Release.zip",
++	"changelog": "https://raw.githubusercontent.com/JingMatrix/TEESimulator/dev/module/changelog.md"
++}
+-- 
+2.45.1.windows.1
+

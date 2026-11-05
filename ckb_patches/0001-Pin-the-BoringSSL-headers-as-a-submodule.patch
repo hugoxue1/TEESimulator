@@ -1,0 +1,51 @@
+From 621a1f9c792d4de2838bd393a10bc8ac4bd5a885 Mon Sep 17 00:00:00 2001
+From: JingMatrix <jingmatrix@gmail.com>
+Date: Sun, 9 Aug 2026 12:44:32 +0200
+Subject: [PATCH 01/47] Pin the BoringSSL headers as a submodule
+
+The Rust TA links the platform's BoringSSL (resolved at runtime inside keystore2)
+and generates its bindings from BoringSSL's headers at build time. Vendor those
+headers as a pinned submodule and default the build to them, so a checkout builds
+without a separately supplied BoringSSL tree.
+---
+ .gitmodules           | 4 ++++
+ CMakeLists.txt        | 2 +-
+ third_party/boringssl | 1 +
+ 3 files changed, 6 insertions(+), 1 deletion(-)
+ create mode 160000 third_party/boringssl
+
+diff --git a/.gitmodules b/.gitmodules
+index f1bf99b..0b9380f 100644
+--- a/.gitmodules
++++ b/.gitmodules
+@@ -10,3 +10,7 @@
+ [submodule "third_party/frameworks-native"]
+ 	path = third_party/frameworks-native
+ 	url = https://android.googlesource.com/platform/frameworks/native
++[submodule "third_party/boringssl"]
++	path = third_party/boringssl
++	url = https://boringssl.googlesource.com/boringssl
++	shallow = true
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 01d22c7..ef87345 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -13,7 +13,7 @@ add_compile_definitions(__ANDROID_UNAVAILABLE_SYMBOLS_ARE_WEAK__)
+ # resolved at runtime inside keystore2; at build time it links copies for the
+ # target ABI (pulled from a device) and BoringSSL headers for the Rust bindings.
+ set(DEVICE_LIB_DIR "" CACHE PATH "Directory holding the target ABI's libbinder_ndk.so and libcrypto.so")
+-set(BORINGSSL_DIR "" CACHE PATH "BoringSSL source directory containing include/")
++set(BORINGSSL_DIR "${CMAKE_SOURCE_DIR}/third_party/boringssl" CACHE PATH "BoringSSL source directory containing include/")
+ set(ANDROID_API_LEVEL "34" CACHE STRING "Android platform level for the Rust build")
+ 
+ # --- LSPlt: memory-map scanning and PLT/GOT hooking -------------------------
+diff --git a/third_party/boringssl b/third_party/boringssl
+new file mode 160000
+index 0000000..922245a
+--- /dev/null
++++ b/third_party/boringssl
+@@ -0,0 +1 @@
++Subproject commit 922245af6eda11b3f101ab5f542093eb5e7d1a74
+-- 
+2.45.1.windows.1
+

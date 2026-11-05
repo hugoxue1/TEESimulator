@@ -1,0 +1,119 @@
+From 8423de1aac8ac5b8b2863d51ff1ae3e6e382f9c3 Mon Sep 17 00:00:00 2001
+From: JingMatrix <jingmatrix@gmail.com>
+Date: Mon, 10 Aug 2026 12:46:46 +0200
+Subject: [PATCH 14/47] Add a per-profile operation mode (patch/generation)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Introduce a profile 'mode' field — patch (re-sign the real hardware attestation)
+or generation (mint the whole key) — validated in ConfigStore and the WebUI
+schema (rendered as a selector via the existing FIELDS machinery), defaulting to
+patch. This is the configuration foundation; wiring the mode to the native
+router and the patch re-sign path follows.
+---
+ app/src/main/java/org/matrix/teesim/ConfigStore.kt |  9 +++++++++
+ module/config.default.json                         |  1 +
+ module/webroot/js/domain/schema.js                 | 11 +++++++++++
+ module/webroot/tests/domain.test.mjs               |  3 ++-
+ 4 files changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/app/src/main/java/org/matrix/teesim/ConfigStore.kt b/app/src/main/java/org/matrix/teesim/ConfigStore.kt
+index 97d17a6..ff19a6a 100644
+--- a/app/src/main/java/org/matrix/teesim/ConfigStore.kt
++++ b/app/src/main/java/org/matrix/teesim/ConfigStore.kt
+@@ -17,6 +17,7 @@ object ConfigStore {
+     data class ProfileConfig(
+         val id: String,
+         val keybox: String, // relative to Const.DATA_DIR
++        val mode: String, // "patch" | "generation"
+         val patchSystem: String,
+         val patchVendor: String,
+         val patchBoot: String,
+@@ -69,6 +70,13 @@ object ConfigStore {
+             if (!keyboxFile.isFile)
+                 throw ConfigException("profile '$id' keybox not found: ${keyboxFile.absolutePath}")
+ 
++            // Operation mode: patch (re-sign the real hardware attestation) or generation (mint the
++            // whole key). Defaults to patch; a level whose hardware is unavailable still falls back to
++            // generation at resolve time.
++            val mode = p.optString("mode", "patch").trim().lowercase()
++            if (mode != "patch" && mode != "generation")
++                throw ConfigException("profile '$id' has invalid mode '$mode' (patch | generation)")
++
+             val patch = p.optJSONObject("patchLevel") ?: JSONObject()
+             val apps =
+                 p.optJSONArray("apps")?.let { arr ->
+@@ -88,6 +96,7 @@ object ConfigStore {
+                 ProfileConfig(
+                     id = id,
+                     keybox = keybox,
++                    mode = mode,
+                     // Defaults for an omitted field mirror the shipped config: a current-month system
+                     // patch and the conventional YYYY-MM-05 vendor/boot patch; an absent osVersion is
+                     // left empty (reuse the harvested value).
+diff --git a/module/config.default.json b/module/config.default.json
+index 2a4af79..0367b28 100644
+--- a/module/config.default.json
++++ b/module/config.default.json
+@@ -3,6 +3,7 @@
+   "profiles": {
+     "default": {
+       "keybox": "keybox.xml",
++      "mode": "patch",
+       "patchLevel": { "system": "today", "vendor": "YYYY-MM-05", "boot": "YYYY-MM-05" },
+       "osVersion": "",
+       "brand": "",
+diff --git a/module/webroot/js/domain/schema.js b/module/webroot/js/domain/schema.js
+index 3276e42..1235e93 100644
+--- a/module/webroot/js/domain/schema.js
++++ b/module/webroot/js/domain/schema.js
+@@ -26,6 +26,8 @@ export const KEYBOX_RE = /^[A-Za-z0-9._-]+\.xml$/;
+ export const PATCH_RE = /^(today|no|harvested|system_property|(\d{4}|YYYY)-(0[1-9]|1[0-2]|MM)(-(0[1-9]|[12]\d|3[01]|DD))?)$/;
+ // harvested | system_property | "16" | "16.0.0" | packed integer like "160000"
+ export const OSVER_RE = /^(harvested|system_property|\d+(\.\d+){0,2})$/;
++// Per-profile operation mode.
++export const MODE_RE = /^(patch|generation)$/;
+ 
+ // Field descriptors, in render order. Each one is:
+ //   key      unique id, also the inline-error key
+@@ -47,6 +49,15 @@ export const FIELDS = [
+     type: "keybox", re: KEYBOX_RE, required: true, default: "keybox.xml",
+     help: "An *.xml keybox under /data/adb/teesim to sign attestations with.",
+   },
++  {
++    key: "mode", path: ["mode"], label: "Operation mode", group: "attestation",
++    type: "select", options: ["patch", "generation"], required: true, default: "patch",
++    re: MODE_RE,
++    help:
++      "patch: keep the real hardware key and re-sign only its attestation with the keybox " +
++      "(fewer detection points; needs a working hardware level). generation: mint the whole key " +
++      "in software. A level whose hardware is unavailable always falls back to generation.",
++  },
+   // --- patch & OS levels (folded away in the editor to keep it concise). Empty means
+   //     "use the harvested value" — so these are optional, not required. ---
+   {
+diff --git a/module/webroot/tests/domain.test.mjs b/module/webroot/tests/domain.test.mjs
+index c135f86..25aa3d4 100644
+--- a/module/webroot/tests/domain.test.mjs
++++ b/module/webroot/tests/domain.test.mjs
+@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
+ 
+ import {
+   emptyProfile, emptyConfig,
+-  PKG_RE, PROFILE_RE, KEYBOX_RE, PATCH_RE, OSVER_RE,
++  PKG_RE, PROFILE_RE, KEYBOX_RE, PATCH_RE, OSVER_RE, MODE_RE,
+ } from "../js/domain/schema.js";
+ import { validateConfig, validateProfile } from "../js/domain/validate.js";
+ 
+@@ -131,6 +131,7 @@ const cases = [
+   [KEYBOX_RE, ["keybox.xml", "a-b_c.1.xml"], ["keybox", "keybox.XML", "../x.xml", "a b.xml", "keybox.xml.bak"]],
+   [PATCH_RE, ["today", "no", "harvested", "system_property", "2024-01", "2024-12", "2024-01-15", "2024-12-31", "YYYY-MM", "YYYY-MM-05", "YYYY-MM-DD"], ["2024", "2024-1", "2024-1-1", "yesterday", "", "2024-00", "2024-13", "2024-01-00", "2024-01-32", "2024-13-01", "MM-05", "YYYY-13-01"]],
+   [OSVER_RE, ["harvested", "system_property", "16", "16.0", "16.0.0", "160000"], ["16.0.0.0", "v16", "", "16."]],
++  [MODE_RE, ["patch", "generation"], ["", "Patch", "GENERATION", "patched", "gen", "auto"]],
+ ];
+ for (const [re, good, bad] of cases) {
+   test(`regex ${re} accepts its allowed set`, () => {
+-- 
+2.45.1.windows.1
+

@@ -1,0 +1,32 @@
+From 4ff9293ab1e4eadda04fed8f55b3099caaf91d04 Mon Sep 17 00:00:00 2001
+From: JingMatrix <jingmatrix@gmail.com>
+Date: Mon, 10 Aug 2026 13:06:02 +0200
+Subject: [PATCH 15/47] Log each intercepted KeyMint device's security level
+
+keystore2 resolves a separate IKeyMintDevice for TrustedEnvironment and, when the
+hardware exists, StrongBox; the hook already wraps each proxy in its own local
+device at the level its getHardwareInfo reports. Log that level at creation so a
+capture confirms which HALs (TEE=1, StrongBox=2) we intercept on a given device.
+---
+ keymint/keymint_router.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/keymint/keymint_router.cpp b/keymint/keymint_router.cpp
+index 5f386d2..cb42fbc 100644
+--- a/keymint/keymint_router.cpp
++++ b/keymint/keymint_router.cpp
+@@ -665,6 +665,11 @@ extern "C" AIBinder* teesim_router_new_device(int32_t security_level, AIBinder*
+       security_level = static_cast<int32_t>(hw.securityLevel);
+     }
+   }
++  // Confirms which KeyMint HALs we intercept: keystore2 resolves a distinct IKeyMintDevice for
++  // TrustedEnvironment (level 1) and, when present, StrongBox (level 2) — both are hooked, each
++  // wrapped by its own local device at its real level.
++  LOGI("teesim_router_new_device: local KeyMint device at security_level=%d (real=%p)",
++       security_level, real_binder);
+   auto dev = ndk::SharedRefBase::make<TeesimKeyMintDevice>(
+       static_cast<SecurityLevel>(security_level), std::move(real));
+   ndk::SpAIBinder b = dev->asBinder();
+-- 
+2.45.1.windows.1
+

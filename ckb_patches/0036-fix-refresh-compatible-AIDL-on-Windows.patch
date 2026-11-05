@@ -1,0 +1,58 @@
+From 34cb427604f5e5cac226bc7e5765d23cc76caeb1 Mon Sep 17 00:00:00 2001
+From: "Phase49.1-main-agent" <hugoxue@auto.ai>
+Date: Fri, 21 Aug 2026 19:56:09 +0800
+Subject: [PATCH 36/47] fix: refresh compatible AIDL on Windows
+
+---
+ CMakeLists.txt                         | 16 +++++++++++++---
+ docs/APatch_定制适配说明_2026-08-21.md |  2 ++
+ 2 files changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 544046f..139cd5d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -31,14 +31,24 @@ target_link_options(inject PRIVATE -static-libstdc++)
+ # fromBinder's local-binder fallback (checked below) only exists in aidl from build-tools >= 35, so
+ # prefer the newest installed build-tools over whatever aidl happens to be first on PATH or first in
+ # the (alphabetically sorted) glob -- e.g. a leftover 34.0.0 sorts before 36.0.0 and silently wins.
++# Drop a stale pre-fix cache entry when it points at an aidl too old for the required option.
++if(AIDL_BIN)
++  execute_process(COMMAND ${AIDL_BIN} --help OUTPUT_VARIABLE _aidl_help ERROR_VARIABLE _aidl_help)
++  if(NOT _aidl_help MATCHES "--min_sdk_version")
++    unset(AIDL_BIN CACHE)
++    unset(AIDL_BIN)
++  endif()
++endif()
+ # AIDL_BIN is a plain variable, not a find_program cache entry, so it is recomputed on every configure
+-# and never sticks to a stale detection; an explicit -DAIDL_BIN=... on the command line still wins.
++# and never sticks to a stale detection; an explicit compatible -DAIDL_BIN=... still wins.
+ if(NOT AIDL_BIN AND DEFINED ENV{ANDROID_HOME})
+   file(GLOB _bt $ENV{ANDROID_HOME}/build-tools/*)
+   list(SORT _bt COMPARE NATURAL ORDER DESCENDING)
+   foreach(_d ${_bt})
+-    if(EXISTS ${_d}/aidl)
+-      set(AIDL_BIN ${_d}/aidl)
++    # find_program handles the .exe suffix on Windows; EXISTS ".../aidl" does not.
++    find_program(_sdk_aidl NAMES aidl PATHS ${_d} NO_DEFAULT_PATH NO_CACHE)
++    if(_sdk_aidl)
++      set(AIDL_BIN ${_sdk_aidl})
+       break()
+     endif()
+   endforeach()
+diff --git a/docs/APatch_定制适配说明_2026-08-21.md b/docs/APatch_定制适配说明_2026-08-21.md
+index 9629fc4..81974e5 100644
+--- a/docs/APatch_定制适配说明_2026-08-21.md
++++ b/docs/APatch_定制适配说明_2026-08-21.md
+@@ -55,6 +55,8 @@ Windows 首次编译需要下载 Gradle 9.7。项目 Wrapper 使用已验证可
+ 
+ KeyMint、Android interfaces 和 frameworks/native 子模块使用中科大 AOSP 镜像；固定提交与上游 v4.0 完全相同，只替换下载入口，避免本机无法连接 `android.googlesource.com`。
+ 
++CMake 选择 AIDL 时优先使用 Android SDK 中最新的 Build Tools，并识别 Windows 的 `aidl.exe`。若旧构建缓存仍记录不支持 `--min_sdk_version` 的 AIDL，会自动丢弃该缓存后重新选择，避免 Build Tools 30.0.3 抢在已安装的 36.x 前面。
++
+ 本次代码修改没有执行编译、刷入或设备测试；由使用者自行完成。
+ 
+ ## 不要重复踩的坑
+-- 
+2.45.1.windows.1
+

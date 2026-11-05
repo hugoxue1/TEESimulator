@@ -1,0 +1,56 @@
+From 3dd06f3c6ce1c1bd77365277f591ac4b9610eb07 Mon Sep 17 00:00:00 2001
+From: JingMatrix <jingmatrix@gmail.com>
+Date: Wed, 12 Aug 2026 17:35:12 +0200
+Subject: [PATCH 35/47] Select the newest build-tools aidl for the KeyMint
+ fallback
+
+The fromBinder local-binder fallback that the km_compat interception relies
+on is only emitted by aidl from build-tools >= 35. Discovery globbed
+build-tools/* and let find_program take the first match, but GLOB sorts
+alphabetically so a leftover 34.0.0 won over an installed 36.0.0 and
+generated IKeyMintDevice.cpp without the fallback, failing the configure
+check (and, where its stale output was cached, silently shipping a
+non-working interceptor).
+
+Sort build-tools newest-first and pick the highest one that has aidl.
+Hold the result in a plain variable rather than a find_program cache
+entry so it is recomputed on every configure and never sticks to a stale
+detection; an explicit -DAIDL_BIN=... still overrides.
+---
+ CMakeLists.txt | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b8ace88..544046f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -28,10 +28,24 @@ target_link_libraries(inject PRIVATE lsplt log)
+ target_link_options(inject PRIVATE -static-libstdc++)
+ 
+ # --- KeyMint AIDL, generated with the NDK backend ---------------------------
+-find_program(AIDL_BIN aidl)
++# fromBinder's local-binder fallback (checked below) only exists in aidl from build-tools >= 35, so
++# prefer the newest installed build-tools over whatever aidl happens to be first on PATH or first in
++# the (alphabetically sorted) glob -- e.g. a leftover 34.0.0 sorts before 36.0.0 and silently wins.
++# AIDL_BIN is a plain variable, not a find_program cache entry, so it is recomputed on every configure
++# and never sticks to a stale detection; an explicit -DAIDL_BIN=... on the command line still wins.
+ if(NOT AIDL_BIN AND DEFINED ENV{ANDROID_HOME})
+   file(GLOB _bt $ENV{ANDROID_HOME}/build-tools/*)
+-  find_program(AIDL_BIN aidl PATHS ${_bt} NO_DEFAULT_PATH)
++  list(SORT _bt COMPARE NATURAL ORDER DESCENDING)
++  foreach(_d ${_bt})
++    if(EXISTS ${_d}/aidl)
++      set(AIDL_BIN ${_d}/aidl)
++      break()
++    endif()
++  endforeach()
++endif()
++if(NOT AIDL_BIN)
++  find_program(_aidl_on_path aidl)
++  set(AIDL_BIN ${_aidl_on_path})
+ endif()
+ if(NOT AIDL_BIN)
+   message(FATAL_ERROR "aidl not found; set -DAIDL_BIN=/path/to/aidl")
+-- 
+2.45.1.windows.1
+

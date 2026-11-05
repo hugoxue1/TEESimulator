@@ -1,0 +1,231 @@
+From 0fcd909866f8979e7bfe5e0ad8389d16f51a6fac Mon Sep 17 00:00:00 2001
+From: JingMatrix <jingmatrix@gmail.com>
+Date: Sun, 9 Aug 2026 21:20:57 +0200
+Subject: [PATCH 10/47] Drive the module from the control daemon
+
+service.sh now just launches and respawns the daemon, which owns injection, harvest, and config resolution; customize.sh seeds config.json; sepolicy drops the KernelSU-specific rules for a manager-agnostic stream socket. target.txt is retired.
+---
+ module/config.default.json | 24 ++++++++++++++++
+ module/customize.sh        |  9 +++---
+ module/daemon              | 20 +++++++++++++
+ module/module.prop         |  4 +--
+ module/sepolicy.rule       | 26 ++++++++++++-----
+ module/service.sh          | 58 ++++++++------------------------------
+ module/target.txt          |  1 -
+ 7 files changed, 81 insertions(+), 61 deletions(-)
+ create mode 100644 module/config.default.json
+ create mode 100644 module/daemon
+ delete mode 100644 module/target.txt
+
+diff --git a/module/config.default.json b/module/config.default.json
+new file mode 100644
+index 0000000..2a4af79
+--- /dev/null
++++ b/module/config.default.json
+@@ -0,0 +1,24 @@
++{
++  "version": 1,
++  "profiles": {
++    "default": {
++      "keybox": "keybox.xml",
++      "patchLevel": { "system": "today", "vendor": "YYYY-MM-05", "boot": "YYYY-MM-05" },
++      "osVersion": "",
++      "brand": "",
++      "device": "",
++      "product": "",
++      "manufacturer": "",
++      "model": "",
++      "serial": "",
++      "imei": "",
++      "meid": "",
++      "imei2": "",
++      "apps": [
++        "com.google.android.gms",
++        "com.android.vending",
++        "io.github.vvb2060.keyattestation"
++      ]
++    }
++  }
++}
+diff --git a/module/customize.sh b/module/customize.sh
+index fa34536..347ba19 100644
+--- a/module/customize.sh
++++ b/module/customize.sh
+@@ -1,4 +1,4 @@
+-# Runs at install time under both Magisk and KernelSU.
++# Runs at install time under Magisk, KernelSU, or APatch.
+ 
+ # The interceptor is a 64-bit library injected into keystore2, which is 64-bit on
+ # every supported device; refuse 32-bit-only devices rather than fail silently.
+@@ -6,13 +6,13 @@ if [ "$ARCH" != "arm64" ] && [ "$ARCH" != "x64" ]; then
+   abort "! TEESimulator requires a 64-bit device"
+ fi
+ 
+-# Seed the configuration on first install without clobbering an existing keybox.
++# Seed the configuration on first install without clobbering existing files.
+ mkdir -p /data/adb/teesim
+ if [ ! -f /data/adb/teesim/keybox.xml ] && [ -f "$MODPATH/keybox.xml" ]; then
+   cp "$MODPATH/keybox.xml" /data/adb/teesim/keybox.xml
+ fi
+-if [ ! -f /data/adb/teesim/target.txt ]; then
+-  cp "$MODPATH/target.txt" /data/adb/teesim/target.txt
++if [ ! -f /data/adb/teesim/config.json ]; then
++  cp "$MODPATH/config.default.json" /data/adb/teesim/config.json
+ fi
+ 
+ # The keybox is shipped as a template only; the module dir is world-readable, so
+@@ -20,6 +20,7 @@ fi
+ rm -f "$MODPATH/keybox.xml"
+ 
+ set_perm_recursive "$MODPATH" 0 0 0755 0644
++set_perm "$MODPATH/daemon" 0 0 0755
+ for abi in arm64-v8a x86_64; do
+   [ -f "$MODPATH/$abi/inject" ] && set_perm "$MODPATH/$abi/inject" 0 0 0755
+ done
+diff --git a/module/daemon b/module/daemon
+new file mode 100644
+index 0000000..0636988
+--- /dev/null
++++ b/module/daemon
+@@ -0,0 +1,20 @@
++#!/system/bin/sh
++# Launches the Kotlin control daemon under app_process.
++#
++#   $1 = MODDIR (the module directory holding classes.dex and $ABI/inject + libs)
++
++MODDIR=$1
++
++if [ -f "$MODDIR/classes.dex" ]; then
++  CLASSPATH="$MODDIR/classes.dex"
++elif [ -f "$MODDIR/service.apk" ]; then
++  CLASSPATH="$MODDIR/service.apk"
++else
++  echo "teesim: neither classes.dex nor service.apk in $MODDIR" >&2
++  exit 1
++fi
++
++# The trailing "$MODDIR" is args[0] to App.main, telling the daemon where the inject
++# binary and native libraries live.
++exec /system/bin/app_process -Djava.class.path="$CLASSPATH" "$MODDIR" \
++  --nice-name=teesim org.matrix.teesim.App "$MODDIR"
+diff --git a/module/module.prop b/module/module.prop
+index c169f09..ba0d97f 100644
+--- a/module/module.prop
++++ b/module/module.prop
+@@ -1,6 +1,6 @@
+ id=teesim
+ name=TEESimulator
+-version=v0.1.0
+-versionCode=1
++version=${REPLACEMEVER}
++versionCode=${REPLACEMEVERCODE}
+ author=JingMatrix
+ description=Redirects key attestation for selected apps to an in-process reference KeyMint trusted application.
+diff --git a/module/sepolicy.rule b/module/sepolicy.rule
+index cc9565e..7aa1622 100644
+--- a/module/sepolicy.rule
++++ b/module/sepolicy.rule
+@@ -1,7 +1,19 @@
+-allow keystore adb_data_file dir search
+-allow keystore adb_data_file file { read open getattr map }
+-allow keystore ksu fd use
+-allow ksu keystore fd use
+-allow keystore ksu unix_dgram_socket { read write sendto }
+-allow ksu keystore unix_dgram_socket { read write sendto connectto }
+-allow keystore self unix_dgram_socket { create bind connect getopt setopt read write }
++# The interceptor runs in the keystore domain (keystore on Android 10/11, keystore2
++# on 12+) and binds an abstract unix socket; the root control daemon connects to it
++# to push the resolved config. Grant the keystore side the socket-server permissions.
++#
++# The daemon runs in the root manager's own already-privileged domain, which carries
++# connectto, but that domain name differs per manager — so the connectto rules below
++# are best-effort and may need adjustment on a given setup (DESIGN open question Q1).
++# If the socket path proves unworkable on some manager, the daemon can fall back to a
++# file the lib watches instead.
++allow keystore self unix_stream_socket { create bind listen accept getopt setopt read write shutdown }
++allow su keystore unix_stream_socket connectto
++allow magisk keystore unix_stream_socket connectto
++
++# The `inject` binary attaches to the keystore process with PTRACE_ATTACH (it runs
++# in the crash_dump domain), and keystore then dlopen()s the interceptor .so that
++# lives under /data/adb (adb_data_file). Both are required for injection to work on
++# an enforcing-SELinux device.
++allow crash_dump keystore process *
++allow keystore adb_data_file file *
+diff --git a/module/service.sh b/module/service.sh
+index be94689..12e75a0 100644
+--- a/module/service.sh
++++ b/module/service.sh
+@@ -1,51 +1,15 @@
+ #!/system/bin/sh
+-# Started late at boot. Injects the interceptor into the keystore daemon and keeps
+-# it injected across restarts. Android 12+ uses keystore2 (KeyMint); Android 10/11
+-# use the legacy keystore, which needs the other library and a different hook.
++# Started late at boot. The Kotlin control daemon does the real work — it harvests
++# the device's attestation parameters, resolves config.json into per-profile
++# settings, injects the interceptor into keystore/keystore2, and pushes the resolved
++# config over the control socket, re-injecting and re-pushing as things change. This
++# script only launches the daemon and respawns it if it ever exits.
+ MODDIR=${0%/*}
+ 
+-# keystore runs unprivileged and cannot traverse /data/adb (0700). Open the
+-# traversal (not the listing) so it can read its configuration.
+-chmod 0711 /data/adb 2>/dev/null
+-chmod 0755 /data/adb/teesim 2>/dev/null
+-chmod 0644 /data/adb/teesim/keybox.xml /data/adb/teesim/target.txt 2>/dev/null
++# admin.token is the WebUI's key-management credential; keep it root-only.
++chmod 0600 /data/adb/teesim/admin.token 2>/dev/null
+ 
+-ABI=$(getprop ro.product.cpu.abi)
+-API=$(getprop ro.build.version.sdk)
+-INJECT="$MODDIR/$ABI/inject"
+-[ -x "$INJECT" ] || chmod 0755 "$INJECT" 2>/dev/null
+-
+-if [ "$API" -ge 31 ]; then
+-  PROC=keystore2
+-  LIB="$MODDIR/$ABI/libteesim_keymint.so"
+-else
+-  PROC=keystore
+-  LIB="$MODDIR/$ABI/libteesim_keystore.so"
+-  # The legacy hook targets by uid, but keystore cannot read the package list, so
+-  # resolve the target packages to uids here and hand them over.
+-  : > /data/adb/teesim/targets.uid
+-  while IFS= read -r pkg || [ -n "$pkg" ]; do
+-    case "$pkg" in '' | '#'* | '['*) continue ;; esac
+-    pkg=${pkg%[?!]}
+-    uid=$(grep -m1 "^$pkg " /data/system/packages.list | cut -d' ' -f2)
+-    [ -n "$uid" ] && echo "$uid $pkg" >> /data/adb/teesim/targets.uid
+-  done < /data/adb/teesim/target.txt
+-  chmod 0644 /data/adb/teesim/targets.uid
+-fi
+-
+-[ -f "$LIB" ] || exit 0
+-
+-# The daemon's pid changes whenever it restarts; re-inject each time a new one
+-# appears, which also recovers the module if the daemon is ever killed.
+-(
+-  last=""
+-  while true; do
+-    pid="$(pidof "$PROC")"
+-    if [ -n "$pid" ] && [ "$pid" != "$last" ]; then
+-      if "$INJECT" "$pid" "$LIB" entry; then
+-        last="$pid"
+-      fi
+-    fi
+-    sleep 2
+-  done
+-) &
++while true; do
++  "$MODDIR/daemon" "$MODDIR"
++  sleep 2
++done &
+diff --git a/module/target.txt b/module/target.txt
+deleted file mode 100644
+index c1112f1..0000000
+--- a/module/target.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-io.github.vvb2060.keyattestation
+-- 
+2.45.1.windows.1
+

@@ -1,0 +1,54 @@
+From bc57e7159cfe861e7d4be2cf77fbfb6b5585a86e Mon Sep 17 00:00:00 2001
+From: "Phase49.1-main-agent" <hugoxue@auto.ai>
+Date: Fri, 21 Aug 2026 20:05:22 +0800
+Subject: [PATCH 38/47] fix: normalize Windows AIDL import roots
+
+---
+ CMakeLists.txt                         | 10 +++++++++-
+ docs/APatch_定制适配说明_2026-08-21.md |  2 +-
+ 2 files changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 698ce86..84c44d5 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -66,6 +66,14 @@ set(KM_AIDL ${SEC}/keymint/aidl)
+ set(SC_AIDL ${SEC}/secureclock/aidl)
+ set(SS_AIDL ${SEC}/sharedsecret/aidl)
+ set(AIDL_GEN ${CMAKE_BINARY_DIR}/aidl-gen)
++set(KM_AIDL_ARG ${KM_AIDL})
++set(SC_AIDL_ARG ${SC_AIDL})
++set(SS_AIDL_ARG ${SS_AIDL})
++if(CMAKE_HOST_WIN32)
++  file(TO_NATIVE_PATH "${KM_AIDL}" KM_AIDL_ARG)
++  file(TO_NATIVE_PATH "${SC_AIDL}" SC_AIDL_ARG)
++  file(TO_NATIVE_PATH "${SS_AIDL}" SS_AIDL_ARG)
++endif()
+ 
+ if(NOT EXISTS ${AIDL_GEN}/.done)
+   file(MAKE_DIRECTORY ${AIDL_GEN}/src ${AIDL_GEN}/include)
+@@ -83,7 +91,7 @@ if(NOT EXISTS ${AIDL_GEN}/.done)
+     endif()
+     execute_process(
+       COMMAND ${AIDL_BIN} --lang=ndk --structured --stability=vintf --min_sdk_version=29
+-              -I ${KM_AIDL} -I ${SC_AIDL} -I ${SS_AIDL}
++              -I ${KM_AIDL_ARG} -I ${SC_AIDL_ARG} -I ${SS_AIDL_ARG}
+               -o ${AIDL_GEN}/src -h ${AIDL_GEN}/include ${_aidl_inputs}
+       RESULT_VARIABLE _rc)
+     if(NOT _rc EQUAL 0)
+diff --git a/docs/APatch_定制适配说明_2026-08-21.md b/docs/APatch_定制适配说明_2026-08-21.md
+index eb8fa92..ace8892 100644
+--- a/docs/APatch_定制适配说明_2026-08-21.md
++++ b/docs/APatch_定制适配说明_2026-08-21.md
+@@ -57,7 +57,7 @@ KeyMint、Android interfaces 和 frameworks/native 子模块使用中科大 AOSP
+ 
+ CMake 选择 AIDL 时优先使用 Android SDK 中最新的 Build Tools，并识别 Windows 的 `aidl.exe`。若旧构建缓存仍记录不支持 `--min_sdk_version` 的 AIDL，会自动丢弃该缓存后重新选择，避免 Build Tools 30.0.3 抢在已安装的 36.x 前面。
+ 
+-Windows 版 AIDL 会把 `-I` 目录规范化为反斜杠，但不会同步规范化 CMake 传入的源文件路径，从而把同一目录误判为“不在 import paths”。配置阶段仅在 Windows 主机上把 AIDL 的输入、导入和输出路径统一转换为原生格式；Android/Linux 构建参数保持不变。
++Windows 版 AIDL 不会统一规范化 CMake 传入的输入文件与 `-I` 导入根，从而把同一目录误判为“不在 import paths”。配置阶段仅在 Windows 主机上把 AIDL 的输入文件和三个导入根全部转换为原生格式；Android/Linux 构建参数保持不变。
+ 
+ 本次代码修改没有执行编译、刷入或设备测试；由使用者自行完成。
+ 
+-- 
+2.45.1.windows.1
+
