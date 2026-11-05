@@ -59,14 +59,24 @@ target_link_options(teesim_logcat PRIVATE
 # fromBinder's local-binder fallback (checked below) only exists in aidl from build-tools >= 35, so
 # prefer the newest installed build-tools over whatever aidl happens to be first on PATH or first in
 # the (alphabetically sorted) glob -- e.g. a leftover 34.0.0 sorts before 36.0.0 and silently wins.
+# Drop a stale pre-fix cache entry when it points at an aidl too old for the required option.
+if(AIDL_BIN)
+  execute_process(COMMAND ${AIDL_BIN} --help OUTPUT_VARIABLE _aidl_help ERROR_VARIABLE _aidl_help)
+  if(NOT _aidl_help MATCHES "--min_sdk_version")
+    unset(AIDL_BIN CACHE)
+    unset(AIDL_BIN)
+  endif()
+endif()
 # AIDL_BIN is a plain variable, not a find_program cache entry, so it is recomputed on every configure
-# and never sticks to a stale detection; an explicit -DAIDL_BIN=... on the command line still wins.
+# and never sticks to a stale detection; an explicit compatible -DAIDL_BIN=... still wins.
 if(NOT AIDL_BIN AND DEFINED ENV{ANDROID_HOME})
   file(GLOB _bt $ENV{ANDROID_HOME}/build-tools/*)
   list(SORT _bt COMPARE NATURAL ORDER DESCENDING)
   foreach(_d ${_bt})
-    if(EXISTS ${_d}/aidl)
-      set(AIDL_BIN ${_d}/aidl)
+    # find_program handles the .exe suffix on Windows; EXISTS ".../aidl" does not.
+    find_program(_sdk_aidl NAMES aidl PATHS ${_d} NO_DEFAULT_PATH NO_CACHE)
+    if(_sdk_aidl)
+      set(AIDL_BIN ${_sdk_aidl})
       break()
     endif()
   endforeach()
@@ -84,15 +94,33 @@ set(KM_AIDL ${SEC}/keymint/aidl)
 set(SC_AIDL ${SEC}/secureclock/aidl)
 set(SS_AIDL ${SEC}/sharedsecret/aidl)
 set(AIDL_GEN ${CMAKE_BINARY_DIR}/aidl-gen)
+set(KM_AIDL_ARG ${KM_AIDL})
+set(SC_AIDL_ARG ${SC_AIDL})
+set(SS_AIDL_ARG ${SS_AIDL})
+if(CMAKE_HOST_WIN32)
+  file(TO_NATIVE_PATH "${KM_AIDL}" KM_AIDL_ARG)
+  file(TO_NATIVE_PATH "${SC_AIDL}" SC_AIDL_ARG)
+  file(TO_NATIVE_PATH "${SS_AIDL}" SS_AIDL_ARG)
+endif()
 
 if(NOT EXISTS ${AIDL_GEN}/.done)
   file(MAKE_DIRECTORY ${AIDL_GEN}/src ${AIDL_GEN}/include)
   foreach(pkg keymint secureclock sharedsecret)
     file(GLOB _aidls ${SEC}/${pkg}/aidl/android/hardware/security/${pkg}/*.aidl)
+    set(_aidl_inputs ${_aidls})
+    # Windows aidl normalizes import roots to backslashes but not forward-slash input paths; make
+    # the inputs native too so it recognizes that each file is under its own import root.
+    if(CMAKE_HOST_WIN32)
+      set(_aidl_inputs)
+      foreach(_aidl IN LISTS _aidls)
+        file(TO_NATIVE_PATH "${_aidl}" _aidl_native)
+        list(APPEND _aidl_inputs "${_aidl_native}")
+      endforeach()
+    endif()
     execute_process(
       COMMAND ${AIDL_BIN} --lang=ndk --structured --stability=vintf --min_sdk_version=29
-              -I ${KM_AIDL} -I ${SC_AIDL} -I ${SS_AIDL}
-              -o ${AIDL_GEN}/src -h ${AIDL_GEN}/include ${_aidls}
+              -I ${KM_AIDL_ARG} -I ${SC_AIDL_ARG} -I ${SS_AIDL_ARG}
+              -o ${AIDL_GEN}/src -h ${AIDL_GEN}/include ${_aidl_inputs}
       RESULT_VARIABLE _rc)
     if(NOT _rc EQUAL 0)
       message(FATAL_ERROR "aidl generation failed for ${pkg}")
@@ -145,6 +173,21 @@ elseif(ANDROID_ABI STREQUAL "x86")
 endif()
 
 set(RUST_A ${CMAKE_SOURCE_DIR}/rust/target/${RUST_TRIPLE}/release/libteesim_km.a)
+# Windows ships a WSL launcher as system32/bash.exe, but it cannot open the E:/ path passed by the
+# native CMake process. Use Git for Windows Bash explicitly; Unix hosts keep normal PATH discovery.
+if(CMAKE_HOST_WIN32)
+  find_program(BASH_EXECUTABLE NAMES bash.exe
+      PATHS "$ENV{ProgramFiles}/Git/bin" "$ENV{LOCALAPPDATA}/Programs/Git/bin"
+      NO_DEFAULT_PATH NO_CACHE)
+else()
+  find_program(BASH_EXECUTABLE NAMES bash NO_CACHE)
+endif()
+if(NOT BASH_EXECUTABLE)
+  message(FATAL_ERROR "bash not found; install Git for Windows or add bash to PATH")
+endif()
+if(CMAKE_HOST_WIN32 AND "$ENV{LIBCLANG_PATH}" STREQUAL "")
+  message(FATAL_ERROR "LIBCLANG_PATH is missing; run through ckb_workspace/build_projects.py")
+endif()
 # ALWAYS invoke build.sh and let cargo decide incrementally what to rebuild. An OUTPUT custom command
 # with no source DEPENDS only runs when the .a is missing, so once built it was never refreshed on a
 # Rust source change — that once linked a stale 14-argument teesim_km_init_ex against a 16-argument C++
@@ -155,7 +198,8 @@ add_custom_target(rust_ta
     COMMAND ${CMAKE_COMMAND} -E env
             ABI=${ANDROID_ABI} API=${ANDROID_API_LEVEL} NDK_HOME=${ANDROID_NDK}
             BORINGSSL=${BORINGSSL_DIR}
-            bash ${CMAKE_SOURCE_DIR}/rust/build.sh
+            "LIBCLANG_PATH=$ENV{LIBCLANG_PATH}"
+            ${BASH_EXECUTABLE} ${CMAKE_SOURCE_DIR}/rust/build.sh
     VERBATIM USES_TERMINAL)
 
 # --- How the TAs reach BoringSSL --------------------------------------------
