@@ -3,42 +3,59 @@
 # That socket is now a FILESYSTEM socket inside keystore's OWN 0700 data dir (keystore_data_file), not
 # an abstract name — an abstract name is probeable by any app (bound -> EACCES, unbound -> ECONNREFUSED,
 # an existence oracle for the hook), whereas a node under a 0700 dir an app cannot traverse gives a
-# uniform EACCES and is undetectable. Grant keystore the sock_file create/bind, and the root-manager
-# domain (ksu on KernelSU, su on APatch, magisk on Magisk) the connectto + dir-traversal + sock_file
-# access to reach it. Best-effort: the exact daemon domain differs per manager (and these root domains
-# are commonly permissive).
+# uniform EACCES and is undetectable. Grant keystore the sock_file create/bind, and the daemon's
+# actual domain the connectto + dir-traversal + sock_file access to reach it.
+#
+# The daemon's domain depends on the manager:
+#   - Magisk/KernelSU/upstream APatch launch it from a root-manager domain (su on KernelSU and
+#     upstream APatch), so those domains stay granted below;
+#   - the customised APatch moves the daemon into system_server via its bounded privileged-exec
+#     (--exec-context-privileged) before app_process starts, so system_server is the actual peer
+#     there and is granted alongside.
+# This file must never reference the legacy `magisk` type: the customised APatch treats any active
+# module's `magisk` reference as a legacy-root dependency and downgrades IReZygisk's hidden
+# minimal-v1 mode to minimal-v0, which stops the domainless early loader from arming. On that build
+# customize.sh normally deletes the installed copy of this file entirely; dropping the magisk rules
+# here keeps even a fallback install (exact-injection detection failed at install time) downgrade-free.
 allow keystore self unix_stream_socket { create bind listen accept getopt setopt read write shutdown }
 allow keystore keystore_data_file sock_file { create bind unlink read write open getattr setattr }
 allow ksu keystore unix_stream_socket connectto
 allow su keystore unix_stream_socket connectto
-allow magisk keystore unix_stream_socket connectto
+allow system_server keystore unix_stream_socket connectto
 allow ksu keystore_data_file dir search
 allow su keystore_data_file dir search
-allow magisk keystore_data_file dir search
+allow system_server keystore_data_file dir search
 allow ksu keystore_data_file sock_file { read write open getattr }
 allow su keystore_data_file sock_file { read write open getattr }
-allow magisk keystore_data_file sock_file { read write open getattr }
+allow system_server keystore_data_file sock_file { read write open getattr }
 
 # The control daemon serves its WebUI admin endpoint on a FILESYSTEM unix socket under /data/adb
-# (adb_data_file), which the WebUI reaches via its root shell and the teesim-uds client. The daemon and
-# that shell both run in a root-manager domain — su on KernelSU/APatch, magisk on Magisk — so grant both
-# the listening-socket, connectto, and sock_file permissions. Best-effort: the exact domain differs per
-# manager (and these root domains are commonly permissive), mirroring the control-socket note above.
+# (adb_data_file), which the WebUI reaches via its root shell and the teesim-uds client. The daemon
+# and that shell run in a root-manager domain on Magisk/KernelSU/upstream APatch (su/ksu), or in
+# system_server behind the customised APatch launcher, so grant each listener side the
+# listening-socket, connectto, and sock_file permissions (root shells connect to a system_server
+# listener; system_server binds its own node). Best-effort, mirroring the control-socket note above.
+allow ksu self unix_stream_socket { create bind listen accept getopt setopt read write shutdown connectto }
 allow su self unix_stream_socket { create bind listen accept getopt setopt read write shutdown connectto }
-allow magisk self unix_stream_socket { create bind listen accept getopt setopt read write shutdown connectto }
-allow su magisk unix_stream_socket connectto
-allow magisk su unix_stream_socket connectto
+allow system_server self unix_stream_socket { create bind listen accept getopt setopt read write shutdown connectto }
+allow ksu su unix_stream_socket connectto
+allow su ksu unix_stream_socket connectto
+allow ksu system_server unix_stream_socket connectto
+allow su system_server unix_stream_socket connectto
+allow ksu adb_data_file sock_file { create unlink read write open getattr setattr }
 allow su adb_data_file sock_file { create unlink read write open getattr setattr }
-allow magisk adb_data_file sock_file { create unlink read write open getattr setattr }
+allow system_server adb_data_file sock_file { create unlink read write open getattr setattr }
 
 # The daemon now reads logd DIRECTLY, in-process, through liblog's reader API (libteesim_logcat.so),
 # instead of spawning a `logcat` child. Reading the log stream means connecting to logd's reader
-# socket, so grant the daemon's root-manager domain (su on KernelSU/APatch, magisk on Magisk) that
-# access. Best-effort per manager, as above; these root domains are commonly permissive.
+# socket, so grant the daemon's actual domain (ksu/su as above, or system_server behind the customised
+# APatch launcher) that access. Best-effort per manager, as above.
+allow ksu logd unix_stream_socket connectto
 allow su logd unix_stream_socket connectto
-allow magisk logd unix_stream_socket connectto
+allow system_server logd unix_stream_socket connectto
+allow ksu logdr_socket sock_file write
 allow su logdr_socket sock_file write
-allow magisk logdr_socket sock_file write
+allow system_server logdr_socket sock_file write
 
 # The `inject` binary attaches to the keystore process with PTRACE_ATTACH (it runs
 # in the crash_dump domain), and keystore then dlopen()s the interceptor .so that
@@ -50,6 +67,8 @@ allow keystore adb_data_file file *
 # The injector's staging fallback copies the interceptor .so to /data/local/tmp and
 # remote-dlopen()s it when the fd-passing primary path fails (e.g. seccomp blocks
 # recvmsg/SCM_RIGHTS).  The keystore daemon needs to traverse and read from
-# /data/local/tmp (shell_data_file) for that dlopen to succeed.
+# /data/local/tmp (shell_data_file) for that dlopen to succeed. The APatch exact
+# injection path never stages, so these rules are inert on that install (the whole
+# file is removed by customize.sh there anyway).
 allow keystore shell_data_file dir { search read open getattr }
 allow keystore shell_data_file file { read open getattr map execute }

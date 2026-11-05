@@ -41,7 +41,9 @@ Once `dlopen` succeeds the transferred fd has done its job; `RemoteLibraryHandle
 
 ### Staging fallback
 
-If the fd transfer fails — a seccomp filter blocks `recvmsg`/`SCM_RIGHTS`, or the functions won't resolve — `inject_via_staging` copies the library to `/data/local/tmp/lib<magic>.so`, `chmod`s it `0644`, and remote-calls plain `dlopen(path, RTLD_NOW)`. `ScopedFileDeleter` `unlink`s the file immediately after; the inode stays alive because the target has it mapped. This only works where the daemon's namespace is loose enough to `dlopen` a `/data/local/tmp` path — true on Android 10/11's `keystore`, **not** on `keystore2`, whose namespace rejects it. On keystore2, fd passing is the only path that works.
+For the legacy root-manager path, an fd-transfer failure may use `inject_via_staging`: it copies the library to `/data/local/tmp/lib<magic>.so`, `chmod`s it `0644`, and remote-calls plain `dlopen(path, RTLD_NOW)`. `ScopedFileDeleter` unlinks the file immediately after. This is only a compatibility fallback for managers that still load `sepolicy.rule`.
+
+The customised APatch path sets `APATCH_INJECT_LIBRARY_FD` to an inherited, APD-validated descriptor. In that mode `argv[2]` is display-only: the injector validates the inherited fd as a regular ELF DSO and never resolves or reopens the path. Failure of fd transfer or `android_dlopen_ext` fails closed; plain `dlopen(path)` and `/data/local/tmp` staging are forbidden.
 
 ## Loading order and the entry contract
 
@@ -62,7 +64,7 @@ LSPlt is linked in, but only `lsplt::MapInfo::Scan()` is used — it parses `/pr
 
 ## Files
 
-- [`main.cpp`](main.cpp) — the injection orchestration: `transfer_fd_to_remote`, `remote_dlopen`, `remote_find_entry`, `remote_call_entry`, `inject_via_staging`, and the RAII guards, plus `main`'s argument validation (`realpath` the library, check readability, parse pid).
+- [`main.cpp`](main.cpp) — the injection orchestration: `transfer_fd_to_remote`, `remote_dlopen`, `remote_find_entry`, `remote_call_entry`, `inject_via_staging`, and the RAII guards, plus `main`'s legacy path validation or exact-mode inherited-fd validation.
 - [`utils.cpp`](utils.cpp) / [`include/utils.hpp`](include/utils.hpp) — the ptrace primitives: register get/set, remote memory read/write, stack pushing, `remote_call`, symbol/base/return-address resolution, `UniqueFd`, magic-string generation, and status/signal parsing. The header also declares helpers (`remote_mmap`, `switch_mnt_ns`, `do_syscall`, …) that aren't on the injection path — don't assume everything declared is exercised by `inject`.
 - [`include/logging.hpp`](include/logging.hpp) — pulls in the shared [`logging.hpp`](include/logging.hpp) and sets `LOG_TAG`.
 

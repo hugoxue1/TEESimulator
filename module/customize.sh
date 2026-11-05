@@ -26,6 +26,26 @@ if [ ! -f /data/adb/teesim/config.json ]; then
   cp "$MODPATH/config.default.json" /data/adb/teesim/config.json
 fi
 
+# The customised APatch can authorize one exact injector/keystore transaction
+# without loading a persistent SELinux policy.  Record that install-time choice
+# in the module directory and remove only the installed copy of sepolicy.rule.
+# Every other root manager keeps the compatibility policy unchanged.
+#
+# Removing the rule here also keeps the custom APatch's module scan from ever
+# seeing the `magisk` type references the upstream compatibility rule needs:
+# that build treats any active `magisk` reference as a legacy-root dependency
+# and downgrades IReZygisk's minimal-v1 hidden mode (see the APatch adaptation
+# doc under docs/).
+APATCH_INJECT_MARKER="$MODPATH/.apatch_exact_inject_v1"
+SU=/system/bin/su
+if [ -x "$SU" ] && "$SU" --no-pty --inject-capable >/dev/null 2>&1; then
+  rm -f "$MODPATH/sepolicy.rule"
+  : > "$APATCH_INJECT_MARKER"
+  ui_print "- Using APatch exact injection (no persistent SELinux policy)"
+else
+  rm -f "$APATCH_INJECT_MARKER"
+fi
+
 # Ship only the ABI this device runs; the other ABI's native libraries are dead weight here.
 case "$ARCH" in
   arm64) rm -rf "$MODPATH/x86_64" ;;

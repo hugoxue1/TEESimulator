@@ -21,6 +21,28 @@ for f in "$MODDIR"/*/teesim-uds; do
   fi
 done
 
+# MIUI/HyperOS ThemeCompatibility crash guard (seen on MI9 / MIUI Android 11): the MIUI resource
+# layer hardcodes /data/system/theme_config/theme_compatibility.xml, and when that file is missing
+# the daemon's first Resources.getSystem() call (ConfigManager.openDb -> SQLiteGlobal ->
+# MiuiResources -> ThemeCompatibility.<clinit>) dies with FileNotFoundException: ENOENT, so the
+# daemon crash-loops before it ever injects. The file ships in the system theme dir; stage a copy
+# into /data/system/theme_config before the daemon starts.
+THEME_CONFIG_DIR=/data/system/theme_config
+THEME_CONFIG_XML=$THEME_CONFIG_DIR/theme_compatibility.xml
+if [ ! -f "$THEME_CONFIG_XML" ]; then
+  for THEME_SRC in /system/media/theme/theme_compatibility.xml /product/media/theme/theme_compatibility.xml; do
+    if [ -f "$THEME_SRC" ]; then
+      mkdir -p "$THEME_CONFIG_DIR" 2>/dev/null
+      cp "$THEME_SRC" "$THEME_CONFIG_XML" 2>/dev/null &&
+        chown system:system "$THEME_CONFIG_DIR" "$THEME_CONFIG_XML" 2>/dev/null
+      chmod 770 "$THEME_CONFIG_DIR" 2>/dev/null
+      chmod 660 "$THEME_CONFIG_XML" 2>/dev/null
+      echo "teesim: staged theme_compatibility.xml from $THEME_SRC"
+      break
+    fi
+  done
+fi
+
 while true; do
   "$MODDIR/daemon" "$MODDIR"
   sleep 2
